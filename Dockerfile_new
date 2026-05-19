@@ -36,6 +36,12 @@ RUN ARCH=$(dpkg --print-architecture) \
     && ln -sf /opt/rtk/rtk /usr/local/bin/rtk \
     && rtk --version
 
+# --- 新增：RTK 初始化配置 ---
+# 在所有工具安装完毕后，执行 RTK 的初始化，为后续应用运行做好准备
+RUN echo "Initializing RTK with Hermes Agent..." \
+    && rtk init --agent hermes
+
+
 # 5. 安装 Bun (优化版)
 # 使用 dpkg 获取架构信息以保持与 Node.js 步骤一致，并增加 set -e 确保出错即停
 RUN set -e; \
