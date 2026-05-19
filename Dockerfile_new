@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     make \
     g++ \
+    unzip \
     pandoc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,17 +30,22 @@ RUN curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/r
     # 验证安装
     && rtk --version
 
-# 5. 安装 Bun (Docker 适配方案)
-# 自动检测架构并下载最新版本的二进制包
-RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then BUN_ARCH="x64"; elif [ "$ARCH" = "aarch64" ]; then BUN_ARCH="aarch64"; else BUN_ARCH="$ARCH"; fi \
-    && mkdir -p /opt/bun \
-    && curl -fsSL "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-${BUN_ARCH}.zip" -o /tmp/bun.zip \
-    && unzip /tmp/bun.zip -d /opt/bun \
-    && rm -f /tmp/bun.zip \
-    && chmod +x /opt/bun/bun-linux-${BUN_ARCH}/bun \
-    && ln -s /opt/bun/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun \
-    && bun --version
+# 5. 安装 Bun (优化版)
+# 使用 dpkg 获取架构信息以保持与 Node.js 步骤一致，并增加 set -e 确保出错即停
+RUN set -e; \
+    ARCH=$(dpkg --print-architecture); \
+    if [ "$ARCH" = "amd64" ]; then BUN_ARCH="x64"; \
+    elif [ "$ARCH" = "arm64" ]; then BUN_ARCH="aarch64"; \
+    else BUN_ARCH="$ARCH"; fi; \
+    echo "Downloading Bun for ${BUN_ARCH}"; \
+    mkdir -p /opt/bun; \
+    curl -fsSL "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-${BUN_ARCH}.zip" -o /tmp/bun.zip; \
+    unzip /tmp/bun.zip -d /opt/bun; \
+    rm -f /tmp/bun.zip; \
+    # 解压后的文件夹名通常为 bun-linux-x64 等，直接指向里面的 bun 二进制文件
+    chmod +x /opt/bun/bun-linux-${BUN_ARCH}/bun; \
+    ln -sf /opt/bun/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun; \
+    bun --version
 
 WORKDIR /app
 
