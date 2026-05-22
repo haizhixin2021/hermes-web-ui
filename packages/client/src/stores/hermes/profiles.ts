@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import * as profilesApi from '@/api/hermes/profiles'
 import type { HermesProfile, HermesProfileDetail } from '@/api/hermes/profiles'
+import { useAppStore } from './app'
 
 const ACTIVE_PROFILE_STORAGE_KEY = 'hermes_active_profile_name'
 
@@ -41,6 +42,33 @@ export const useProfilesStore = defineStore('profiles', () => {
       return detail
     } catch {
       return null
+    }
+  }
+
+  async function updateAvatar(name: string, avatar: profilesApi.ProfileAvatar) {
+    const saved = await profilesApi.updateProfileAvatar(name, avatar)
+    profiles.value = profiles.value.map(profile => (
+      profile.name === name ? { ...profile, avatar: saved } : profile
+    ))
+    if (detailMap.value[name]) {
+      detailMap.value[name] = { ...detailMap.value[name], avatar: saved }
+    }
+    if (activeProfile.value?.name === name) {
+      activeProfile.value = { ...activeProfile.value, avatar: saved }
+    }
+    return saved
+  }
+
+  async function deleteAvatar(name: string) {
+    await profilesApi.deleteProfileAvatar(name)
+    profiles.value = profiles.value.map(profile => (
+      profile.name === name ? { ...profile, avatar: null } : profile
+    ))
+    if (detailMap.value[name]) {
+      detailMap.value[name] = { ...detailMap.value[name], avatar: null }
+    }
+    if (activeProfile.value?.name === name) {
+      activeProfile.value = { ...activeProfile.value, avatar: null }
     }
   }
 
@@ -114,6 +142,7 @@ export const useProfilesStore = defineStore('profiles', () => {
           // 假设切换成功（API 返回了 200），保持已设置的状态
           console.warn('Failed to refresh profiles list after switch, assuming switch succeeded:', err)
         }
+        await useAppStore().reloadModels()
       }
       return ok
     } finally {
@@ -146,6 +175,8 @@ export const useProfilesStore = defineStore('profiles', () => {
     switchProfile,
     exportProfile,
     importProfile,
+    updateAvatar,
+    deleteAvatar,
     clearAllSessionCaches,
   }
 })

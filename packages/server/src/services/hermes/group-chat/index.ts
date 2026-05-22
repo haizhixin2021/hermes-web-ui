@@ -3,7 +3,8 @@ import type { Server as HttpServer } from 'http'
 import { getToken } from '../../../services/auth'
 import { logger } from '../../../services/logger'
 import { getDb } from '../../../db'
-import { AgentClients } from './agent-clients'
+import { normalizeMessageContentForStorage, normalizeMessageContentForStorageRole } from '../../../db/hermes/message-content'
+import { AgentClients, GROUP_CHAT_AGENT_SOCKET_SECRET } from './agent-clients'
 import { ContextEngine } from '../context-engine/compressor'
 import { SessionDeleter } from '../session-deleter'
 import { countTokens, SUMMARY_PREFIX } from '../../../lib/context-compressor'
@@ -32,6 +33,10 @@ interface ChatMessage {
 function contentToStorageString(content: unknown): string {
     if (typeof content === 'string') return content
     return JSON.stringify(content ?? '')
+}
+
+function messageContentForStorage(role: string | undefined, content: string): string {
+    return normalizeMessageContentForStorageRole(role, content)
 }
 
 function contentToText(content: unknown): string {
@@ -75,6 +80,7 @@ interface Member {
     joinedAt: number
     online: boolean
     socketId: string
+    source?: 'human' | 'agent'
 }
 
 let _tablesEnsured = false
@@ -405,7 +411,7 @@ class ChatStorage {
                 reasoning_details = excluded.reasoning_details,
                 reasoning_content = excluded.reasoning_content`
         ).run(
-            msg.id, msg.roomId, msg.senderId, msg.senderName, msg.content, msg.timestamp,
+            msg.id, msg.roomId, msg.senderId, msg.senderName, messageContentForStorage(msg.role, msg.content), msg.timestamp,
             msg.role || 'user',
             msg.tool_call_id ?? null,
             toolCallsJson,
@@ -476,8 +482,20 @@ class ChatStorage {
         return { id, roomId, agentId, profile, name, description, invited }
     }
 
-    removeRoomAgent(agentId: string): void {
-        this.db()?.prepare('DELETE FROM gc_room_agents WHERE id = ?').run(agentId)
+    getRoomAgent(roomId: string, agentRef: string): RoomAgent | null {
+        return (this.db()?.prepare(
+            'SELECT id, roomId, agentId, profile, name, description, invited FROM gc_room_agents WHERE roomId = ? AND (id = ? OR agentId = ?)'
+        ).get(roomId, agentRef, agentRef) as any) ?? null
+    }
+
+    getRoomAgentByAgentId(roomId: string, agentId: string): RoomAgent | null {
+        return (this.db()?.prepare(
+            'SELECT id, roomId, agentId, profile, name, description, invited FROM gc_room_agents WHERE roomId = ? AND agentId = ?'
+        ).get(roomId, agentId) as any) ?? null
+    }
+
+    removeRoomAgent(roomId: string, agentRef: string): void {
+        this.db()?.prepare('DELETE FROM gc_room_agents WHERE roomId = ? AND (id = ? OR agentId = ?)').run(roomId, agentRef, agentRef)
     }
 
     // ─── Context Snapshots ──────────────────────────────────
@@ -512,8 +530,24 @@ class ChatStorage {
 
     getRoomMembers(roomId: string): { id: string; userId: string; name: string; description: string; joinedAt: number }[] {
         return (this.db()?.prepare(
-            'SELECT id, userId, userName as name, description, joinedAt FROM gc_room_members WHERE roomId = ? ORDER BY joinedAt'
+            `SELECT m.id, m.userId, m.userName as name, m.description, m.joinedAt
+             FROM gc_room_members m
+             WHERE m.roomId = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM gc_room_agents a
+                 WHERE a.roomId = m.roomId
+                   AND (a.agentId = m.userId OR (m.userId NOT GLOB '????????-????-????-????-????????????' AND COALESCE(m.description, '') = '' AND a.name = m.userName))
+               )
+             ORDER BY m.joinedAt`
         ).all(roomId) || []) as unknown as { id: string; userId: string; name: string; description: string; joinedAt: number }[]
+    }
+
+    removeRoomMembersForAgent(roomId: string, agent: Pick<RoomAgent, 'agentId' | 'name'>): void {
+        this.db()?.prepare(
+            `DELETE FROM gc_room_members
+             WHERE roomId = ?
+               AND (userId = ? OR (userId NOT GLOB '????????-????-????-????-????????????' AND COALESCE(description, '') = '' AND userName = ?))`
+        ).run(roomId, agent.agentId, agent.name)
     }
 
     addRoomMember(roomId: string, userId: string, userName: string, description: string): void {
@@ -565,16 +599,17 @@ class ChatRoom {
         this.name = name || id
     }
 
-    addOrUpdateMember(socketId: string, userId: string, name: string, description: string): Member {
+    addOrUpdateMember(socketId: string, userId: string, name: string, description: string, source: 'human' | 'agent' = 'human'): Member {
         const existing = this.members.get(userId)
         if (existing) {
             existing.name = name
             existing.description = description
             existing.online = true
             existing.socketId = socketId
+            existing.source = source
             return existing
         }
-        const member: Member = { id: socketId, userId, name, description, joinedAt: Date.now(), online: true, socketId }
+        const member: Member = { id: socketId, userId, name, description, joinedAt: Date.now(), online: true, socketId, source }
         this.members.set(userId, member)
         return member
     }
@@ -589,7 +624,7 @@ class ChatRoom {
     }
 
     getMembersList(): Member[] {
-        return Array.from(this.members.values())
+        return Array.from(this.members.values()).filter(member => member.source !== 'agent')
     }
 
     getOnlineMemberBySocketId(socketId: string): Member | undefined {
@@ -615,6 +650,8 @@ export class GroupChatServer {
     private socketUserMap = new Map<string, string>()
     /** Map: userId → { name, description } (from auth) */
     private userInfoMap = new Map<string, { name: string; description: string }>()
+    /** Map: socket.id → requested participant source from handshake */
+    private socketRequestedSourceMap = new Map<string, 'human' | 'agent'>()
     readonly agentClients = new AgentClients()
     private _contextEngine: ContextEngine | null = null
     private _restoreScheduled = false
@@ -721,6 +758,7 @@ export class GroupChatServer {
             for (const agent of agents) {
                 try {
                     const client = await this.agentClients.createAgent({
+                        agentId: agent.agentId,
                         profile: agent.profile,
                         name: agent.name,
                         description: agent.description,
@@ -755,12 +793,14 @@ export class GroupChatServer {
     // ─── Connection ─────────────────────────────────────────────
 
     private onConnection(socket: Socket): void {
-        const auth = socket.handshake.auth as { userId?: string; name?: string; description?: string }
+        const auth = socket.handshake.auth as { userId?: string; name?: string; description?: string; source?: string; agentSocketSecret?: string }
         const userId = auth.userId || socket.id
         const userName = auth.name || `User-${userId.slice(0, 6)}`
         const description = auth.description || ''
+        const requestedSource = auth.source === 'agent' && auth.agentSocketSecret === GROUP_CHAT_AGENT_SOCKET_SECRET ? 'agent' : 'human'
 
         this.socketUserMap.set(socket.id, userId)
+        this.socketRequestedSourceMap.set(socket.id, requestedSource)
         this.userInfoMap.set(userId, { name: userName, description })
 
         logger.debug(`[GroupChat] Connected: ${userName} (socket=${socket.id}, user=${userId})`)
@@ -786,7 +826,14 @@ export class GroupChatServer {
     private handleJoin(socket: Socket, data: { roomId?: string; name?: string; description?: string }, ack?: (res: any) => void): void {
         const socketId = socket.id
         const userId = this.socketUserMap.get(socketId) || socketId
+        const requestedSource = this.socketRequestedSourceMap.get(socketId) || 'human'
         const roomId = data.roomId || 'general'
+        const roomAgent = this.storage.getRoomAgentByAgentId(roomId, userId)
+        const source = requestedSource === 'agent' && roomAgent ? 'agent' : 'human'
+        if (source === 'human' && roomAgent) {
+            ack?.({ error: 'Reserved member identity' })
+            return
+        }
         const existingMember = this.storage.getMemberByUserId(roomId, userId)
         const userInfo = this.userInfoMap.get(userId) || {
             name: existingMember?.name || `User-${userId.slice(0, 6)}`,
@@ -805,19 +852,25 @@ export class GroupChatServer {
             this.storage.saveRoom(roomId, roomId)
         }
 
-        // Persist member to SQLite
-        this.storage.addRoomMember(roomId, userId, userName, description)
+        // Persist only human members. Agent sockets are runtime participants
+        // tracked through gc_room_agents and AgentClients; storing them in
+        // gc_room_members makes member counts grow on reconnect/restore.
+        if (source !== 'agent') {
+            this.storage.addRoomMember(roomId, userId, userName, description)
+        }
 
-        // Add to in-memory online members (keyed by userId)
-        room.addOrUpdateMember(socketId, userId, userName, description)
+        // Add to in-memory online participants (keyed by userId)
+        room.addOrUpdateMember(socketId, userId, userName, description, source)
         socket.join(roomId)
 
-        socket.to(roomId).emit('member_joined', {
-            roomId,
-            memberId: userId,
-            memberName: userName,
-            members: room.getMembersList(),
-        })
+        if (source !== 'agent') {
+            socket.to(roomId).emit('member_joined', {
+                roomId,
+                memberId: userId,
+                memberName: userName,
+                members: room.getMembersList(),
+            })
+        }
 
         // Load history from SQLite
         const messages = this.storage.getMessages(roomId)
@@ -877,9 +930,7 @@ export class GroupChatServer {
         ack?.({ id: savedMsg.id })
 
         const mentionDepth = normalizeMentionDepth(data.mentionDepth)
-        const shouldRouteMentions =
-            savedMsg.role === 'user' ||
-            (savedMsg.role === 'assistant' && mentionDepth < 2)
+        const shouldRouteMentions = savedMsg.role === 'user'
 
         if (shouldRouteMentions) {
             // Server-side @mention routing — parse user mentions and invoke agents directly.
@@ -998,7 +1049,7 @@ export class GroupChatServer {
         })
     }
 
-    private handleContextStatus(socket: Socket, data: { roomId?: string; agentName?: string; status?: string }): void {
+    private handleContextStatus(socket: Socket, data: { roomId?: string; agentName?: string; status?: string; totalTokens?: number }): void {
         const roomId = data.roomId || 'general'
         const agentName = data.agentName || ''
         const status = data.status || ''
@@ -1024,6 +1075,11 @@ export class GroupChatServer {
             agentName,
             status,
         })
+
+        if (typeof data.totalTokens === 'number' && Number.isFinite(data.totalTokens) && data.totalTokens >= 0) {
+            this.storage.updateRoomTotalTokens(roomId, Math.floor(data.totalTokens))
+            this.nsp.to(roomId).emit('room_updated', { roomId, totalTokens: Math.floor(data.totalTokens) })
+        }
     }
 
     private async handleInterruptAgent(socket: Socket, data: { roomId?: string; agentName?: string }, ack?: (response?: unknown) => void): Promise<void> {
@@ -1114,6 +1170,7 @@ export class GroupChatServer {
 
         this.leaveAllRooms(socket, socketId)
         this.socketUserMap.delete(socketId)
+        this.socketRequestedSourceMap.delete(socketId)
         // Don't delete userInfoMap — it persists across reconnects
     }
 
@@ -1137,12 +1194,14 @@ export class GroupChatServer {
                 const member = room.getOnlineMemberBySocketId(socketId)
                 room.removeMember(socketId)
                 socket.leave(rid)
-                this.nsp.to(rid).emit('member_left', {
-                    roomId: rid,
-                    memberId: member?.userId || socketId,
-                    memberName: member?.name || `User-${socketId.slice(0, 6)}`,
-                    members: room.getMembersList(),
-                })
+                if (member?.source !== 'agent') {
+                    this.nsp.to(rid).emit('member_left', {
+                        roomId: rid,
+                        memberId: member?.userId || socketId,
+                        memberName: member?.name || `User-${socketId.slice(0, 6)}`,
+                        members: room.getMembersList(),
+                    })
+                }
             }
         })
     }

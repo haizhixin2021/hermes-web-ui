@@ -2,8 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
-import multiavatar from '@multiavatar/multiavatar'
 import MarkdownRenderer from '../chat/MarkdownRenderer.vue'
+import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
+import { useProfilesStore } from '@/stores/hermes/profiles'
 import {
     copyTextToClipboard,
     handleCodeBlockCopyClick,
@@ -32,11 +33,18 @@ const props = defineProps<{
 
 const { t } = useI18n()
 const toast = useMessage()
+const profilesStore = useProfilesStore()
 const speech = useGlobalSpeech()
 const voiceSettings = useVoiceSettings()
 const previewUrl = ref<string | null>(null)
 const isAgent = computed(() => {
     return props.agents.some(a => a.agentId === props.message.senderId || a.name === props.message.senderName)
+})
+
+const isAgentError = computed(() => {
+    if (props.message.role !== 'assistant') return false
+    if (props.message.finish_reason === 'error') return true
+    return /^Error:\s*/i.test(props.message.content || '')
 })
 
 const isSelf = computed(() => {
@@ -52,11 +60,10 @@ const timeStr = computed(() => {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 })
 
-const avatarSvg = computed(() => {
-    return multiavatar(props.message.senderName || props.message.senderId)
-})
+const avatarProfileName = computed(() => agentInfo.value?.profile || props.message.senderName || props.message.senderId)
+const avatarProfile = computed(() => profilesStore.profiles.find(profile => profile.name === agentInfo.value?.profile))
 
-const mentionNames = computed(() => props.agents.map(a => a.name).filter(Boolean))
+const mentionNames = computed(() => ['all', ...props.agents.map(a => a.name).filter(Boolean)])
 const parsedThinking = computed(() => parseThinking(props.message.content || '', { streaming: !!props.message.isStreaming }))
 const hasReasoningField = computed(() => !!(props.message.reasoning && props.message.reasoning.length > 0))
 const hasThinking = computed(() => hasReasoningField.value || parsedThinking.value.hasThinking)
@@ -384,7 +391,7 @@ onBeforeUnmount(() => {
 <template>
     <div v-if="isToolMessage" class="group-message tool-message">
         <div class="avatar">
-            <span v-html="avatarSvg" />
+            <ProfileAvatar :name="avatarProfileName" :avatar="avatarProfile?.avatar" :size="36" />
         </div>
 
         <div class="msg-body">
@@ -430,7 +437,7 @@ onBeforeUnmount(() => {
     <div v-else class="group-message" :class="{ agent: isAgent, self: isSelf }">
         <!-- Avatar -->
         <div class="avatar">
-            <span v-html="avatarSvg" />
+            <ProfileAvatar :name="avatarProfileName" :avatar="avatarProfile?.avatar" :size="36" />
         </div>
 
         <div class="msg-body">
@@ -442,6 +449,7 @@ onBeforeUnmount(() => {
                 class="msg-content"
                 :class="{
                     'agent-content': isAgent,
+                    'agent-error': isAgentError,
                     'speech-playing': isPlayingThisMessage && !isPausedThisMessage,
                 }"
             >
@@ -545,6 +553,20 @@ onBeforeUnmount(() => {
 
     &.agent .msg-content.agent-content {
         background-color: rgba(var(--accent-primary-rgb), 0.06);
+    }
+
+    &.agent .msg-content.agent-error {
+        color: $error;
+        background-color: rgba(var(--error-rgb), 0.06);
+        border: 1px solid rgba(var(--error-rgb), 0.2);
+
+        :deep(.markdown-body),
+        :deep(.markdown-body p),
+        :deep(.markdown-body li),
+        :deep(.markdown-body strong),
+        :deep(.markdown-body code) {
+            color: $error;
+        }
     }
 
     &.self .msg-content {
@@ -674,11 +696,6 @@ onBeforeUnmount(() => {
     margin-top: 2px;
     overflow: hidden;
     border-radius: 8px;
-
-    :deep(svg) {
-        width: 36px;
-        height: 36px;
-    }
 }
 
 .msg-body {
@@ -836,6 +853,20 @@ onBeforeUnmount(() => {
             0 0 10px rgba(255, 107, 107, 0.4),
             0 0 20px rgba(255, 107, 107, 0.2);
         animation: rainbow-glow 4s linear infinite;
+    }
+
+    &.agent-error {
+        color: $error;
+        background-color: rgba(var(--error-rgb), 0.06);
+        border: 1px solid rgba(var(--error-rgb), 0.2);
+
+        :deep(.markdown-body),
+        :deep(.markdown-body p),
+        :deep(.markdown-body li),
+        :deep(.markdown-body strong),
+        :deep(.markdown-body code) {
+            color: $error;
+        }
     }
 
     :deep(.mention-highlight) {

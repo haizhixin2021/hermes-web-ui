@@ -1,14 +1,24 @@
 import { io, Socket } from 'socket.io-client'
+import { randomBytes } from 'crypto'
 import { getToken } from '../../../services/auth'
 import { logger } from '../../../services/logger'
 import { updateUsage } from '../../../db/hermes/usage-store'
-import { AgentBridgeClient, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
+import { countTokens } from '../../../lib/context-compressor'
+import { AgentBridgeClient, type AgentBridgeContextEstimate, type AgentBridgeMessage, type AgentBridgeOutput } from '../agent-bridge'
 import { convertContentBlocksForAgent, isContentBlockArray } from '../run-chat/content-blocks'
 import type { ContentBlock } from '../run-chat/types'
+import {
+    isAllAgentsMentioned,
+    resolveMentionTargets,
+    stripMentionRoutingTokens,
+} from './mention-routing'
+
+export const GROUP_CHAT_AGENT_SOCKET_SECRET = randomBytes(32).toString('hex')
 
 // ─── Types ────────────────────────────────────────────────────
 
 interface AgentConfig {
+    agentId?: string
     profile: string
     name: string
     description: string
@@ -31,6 +41,35 @@ type MentionMessage = {
     timestamp: number
     input?: string | ContentBlock[]
     mentionDepth?: number
+}
+
+type GroupEstimateMessage = { role: 'user' | 'assistant'; content: string }
+
+interface BridgeContextCache {
+    fixedContextTokens: number
+    instructions?: string
+    systemPromptTokens?: number
+    toolTokens?: number
+    systemPromptChars?: number
+    toolCount?: number
+    toolNames?: string[]
+    profile?: string
+    model?: string
+    provider?: string
+}
+
+export function estimateGroupHistoryMessageTokens(history: Array<{ content?: unknown }>): number {
+    return history.reduce((sum, message) => sum + countTokens(String(message.content || '')), 0)
+}
+
+export function groupContextTokensWithFixedOverhead(
+    fixedContextTokens: number | null | undefined,
+    history: Array<{ content?: unknown }>,
+): number | undefined {
+    if (typeof fixedContextTokens !== 'number' || !Number.isFinite(fixedContextTokens) || fixedContextTokens < 0) {
+        return undefined
+    }
+    return Math.floor(fixedContextTokens) + estimateGroupHistoryMessageTokens(history)
 }
 
 interface MemberData {
@@ -70,9 +109,10 @@ class AgentClient {
     private storage: any = null
     private pendingToolCallIds = new Map<string, string[]>()
     private pendingToolBaseIds = new Map<string, string>()
+    private bridgeContextCache = new Map<string, BridgeContextCache>()
 
     constructor(config: AgentConfig, handlers: AgentEventHandler = {}) {
-        this.agentId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+        this.agentId = config.agentId || Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
         this.profile = config.profile
         this.name = config.name
         this.description = config.description
@@ -102,7 +142,11 @@ class AgentClient {
         this.socket = io(`http://127.0.0.1:${actualPort}/group-chat`, {
             auth: {
                 token: token || undefined,
+                userId: this.agentId,
                 name: this.name,
+                description: this.description,
+                source: 'agent',
+                agentSocketSecret: GROUP_CHAT_AGENT_SOCKET_SECRET,
             },
             transports: ['websocket'],
             reconnection: true,
@@ -137,6 +181,7 @@ class AgentClient {
             this.socket.disconnect()
             this.socket = null
             this.joinedRooms.clear()
+            this.bridgeContextCache.clear()
         }
     }
 
@@ -177,9 +222,9 @@ class AgentClient {
         this.socket!.emit('stop_typing', { roomId })
     }
 
-    emitContextStatus(roomId: string, status: 'compressing' | 'replying' | 'ready'): void {
+    emitContextStatus(roomId: string, status: 'compressing' | 'replying' | 'ready', extra?: Record<string, unknown>): void {
         this.ensureConnected()
-        this.socket!.emit('context_status', { roomId, agentName: this.name, status })
+        this.socket!.emit('context_status', { roomId, agentName: this.name, status, ...extra })
     }
 
     emitApprovalRequested(roomId: string, payload: Record<string, unknown>): void {
@@ -232,13 +277,96 @@ class AgentClient {
         return Array.from(this.joinedRooms)
     }
 
+    private finiteToken(value: unknown): number | undefined {
+        return typeof value === 'number' && Number.isFinite(value) && value >= 0
+            ? Math.floor(value)
+            : undefined
+    }
+
+    private cacheBridgeContext(sessionId: string, data: Record<string, unknown> | AgentBridgeContextEstimate, instructions?: string): void {
+        const fixedContextTokens = this.finiteToken(data.fixed_context_tokens)
+        if (fixedContextTokens == null) return
+        this.bridgeContextCache.set(sessionId, {
+            fixedContextTokens,
+            instructions,
+            systemPromptTokens: this.finiteToken(data.system_prompt_tokens),
+            toolTokens: this.finiteToken(data.tool_tokens),
+            systemPromptChars: this.finiteToken(data.system_prompt_chars),
+            toolCount: this.finiteToken(data.tool_count),
+            toolNames: Array.isArray(data.tool_names) ? data.tool_names.map(String) : undefined,
+            profile: typeof data.profile === 'string' ? data.profile : undefined,
+            model: typeof data.model === 'string' ? data.model : undefined,
+            provider: typeof data.provider === 'string' ? data.provider : undefined,
+        })
+    }
+
+    private estimateHistoryMessageTokens(history: GroupEstimateMessage[]): number {
+        return estimateGroupHistoryMessageTokens(history)
+    }
+
+    private estimateWithCachedBridgeContext(sessionId: string, history: GroupEstimateMessage[], instructions?: string): number | undefined {
+        const cache = this.bridgeContextCache.get(sessionId)
+        if (!cache) return undefined
+        if (cache.instructions !== instructions) return undefined
+        return groupContextTokensWithFixedOverhead(cache.fixedContextTokens, history)
+    }
+
+    private async estimateGroupContextTokens(
+        roomId: string,
+        sessionId: string,
+        bridge: AgentBridgeClient,
+        history: GroupEstimateMessage[],
+        instructions: string | undefined,
+        phase: string,
+    ): Promise<number | undefined> {
+        const cachedTokens = this.estimateWithCachedBridgeContext(sessionId, history, instructions)
+        if (cachedTokens != null) {
+            logger.info({
+                roomId,
+                agentName: this.name,
+                profile: this.profile,
+                sessionId,
+                messages: history.length,
+                fixedContextTokens: this.bridgeContextCache.get(sessionId)?.fixedContextTokens,
+                messageTokens: cachedTokens - (this.bridgeContextCache.get(sessionId)?.fixedContextTokens || 0),
+                fullContextTokens: cachedTokens,
+                phase,
+                source: 'cache',
+            }, '[GroupChat] full context estimate')
+            return cachedTokens
+        }
+
+        const estimate = await bridge.contextEstimate(
+            sessionId,
+            history,
+            instructions,
+            this.profile,
+        )
+        this.cacheBridgeContext(sessionId, estimate, instructions)
+        const totalTokens = Number(estimate.token_count || 0)
+        logger.info({
+            roomId,
+            agentName: this.name,
+            profile: this.profile,
+            sessionId,
+            messages: estimate.message_count,
+            toolCount: estimate.tool_count,
+            systemPromptChars: estimate.system_prompt_chars,
+            fixedContextTokens: estimate.fixed_context_tokens,
+            fullContextTokens: estimate.token_count,
+            phase,
+            source: 'bridge',
+        }, '[GroupChat] full context estimate')
+        return Number.isFinite(totalTokens) && totalTokens > 0 ? Math.floor(totalTokens) : undefined
+    }
+
     private ensureConnected(): void {
         if (!this.socket?.connected) {
             throw new Error(`Agent "${this.name}" is not connected`)
         }
     }
 
-    // ─── Hermes Gateway Integration ────────────────────────────
+    // ─── Hermes Agent Bridge Integration ───────────────────────
 
     /**
      * Handle an @mention from the server side.
@@ -248,9 +376,16 @@ class AgentClient {
     async replyToMention(
         roomId: string,
         msg: MentionMessage,
-        onStatus?: (status: 'compressing' | 'replying' | 'ready') => void,
+        onStatus?: (status: 'compressing' | 'replying' | 'ready', extra?: Record<string, unknown>) => void,
     ): Promise<void> {
         logger.debug(`[AgentClients] ${this.name} mentioned by ${msg.senderName}: "${msg.content.slice(0, 50)}"`)
+        const runMessageId = groupMessageId(roomId, this.profile, this.name)
+        let partIndex = 0
+        let streamMessageId = groupMessagePartId(runMessageId, partIndex)
+        let currentContent = ''
+        let totalContent = ''
+        let reasoningContent = ''
+        let streamStarted = false
         try {
             // Notify room that agent is typing
             this.startTyping(roomId)
@@ -258,11 +393,13 @@ class AgentClient {
             // Build compressed context if context engine is available
             let conversationHistory: Array<{ role: string; content: string }> = []
             let instructions: string | undefined
+            const bridge = new AgentBridgeClient()
+            const sessionSeed = String(this.storage?.getRoom?.(roomId)?.sessionSeed || '0')
+            const sessionId = groupBridgeSessionId(roomId, this.profile, this.name, sessionSeed)
 
             if (this.contextEngine && this.storage) {
                 try {
                     logger.debug(`[AgentClients] ${this.name}: building context...`)
-                    onStatus?.('compressing')
                     // Get room members with descriptions for context
                     const roomMembers: Array<{ userId: string; name: string; description: string }> = this.storage.getRoomMembers(roomId) || []
                     const memberNames = roomMembers.map((m: any) => m.name)
@@ -290,9 +427,29 @@ class AgentClient {
                         currentMessage: msg,
                         compression,
                         profile: this.profile,
+                        onProgress: (event: { status: 'compressing'; messageCount: number; tokenCount: number }) => {
+                            onStatus?.('compressing', {
+                                messageCount: event.messageCount,
+                                totalTokens: event.tokenCount,
+                            })
+                        },
+                        contextTokenEstimator: async (history: Array<{ role: 'user' | 'assistant'; content: string }>, estimateInstructions: string) => {
+                            return this.estimateGroupContextTokens(
+                                roomId,
+                                sessionId,
+                                bridge,
+                                history,
+                                estimateInstructions,
+                                'build',
+                            )
+                        },
                     })
                     conversationHistory = ctx.conversationHistory
                     instructions = ctx.instructions
+                    if (typeof ctx.meta.contextTokenEstimate === 'number' && Number.isFinite(ctx.meta.contextTokenEstimate)) {
+                        this.storage.updateRoomTotalTokens?.(roomId, ctx.meta.contextTokenEstimate)
+                        onStatus?.('replying', { totalTokens: ctx.meta.contextTokenEstimate })
+                    }
                     logger.debug(`[AgentClients] ${this.name}: context built — historyLen=${conversationHistory.length}, meta=%j`, ctx.meta)
                     onStatus?.('replying')
                 } catch (err: any) {
@@ -302,32 +459,23 @@ class AgentClient {
                 }
             }
 
-            // Keep the original mentions visible and add an explicit routing note.
-            // When a user mentions multiple agents, stripping only this agent's
-            // name can make the remaining input look like it was meant for
-            // someone else.
-            const routedPrefix = `群聊系统：这条消息已经提及你（${this.name}），请直接回复；即使消息同时提及其他成员，也不要因此输出空回复。`
-            const ownMentionPattern = new RegExp(`@${this.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'gi')
+            // Keep routing explicit while removing only the mention tokens that
+            // selected this agent. This avoids making @all look like an
+            // instruction for the model to fan out another routing cycle.
+            const routedPrefix = isAllAgentsMentioned(msg.content)
+                ? `群聊系统：这条消息通过 @all 提及所有 agent，你是其中之一，请直接回复。`
+                : `群聊系统：这条消息已经提及你（${this.name}），请直接回复；即使消息同时提及其他成员，也不要因此输出空回复。`
             const rawInput = msg.input || msg.content
             const input = isContentBlockArray(rawInput)
                 ? rawInput.map((block) => {
                     if (block.type !== 'text') return block
-                    const text = String(block.text || msg.content).replace(ownMentionPattern, '').trim()
+                    const text = stripMentionRoutingTokens(String(block.text || msg.content), this.name)
                     return { ...block, text: `${routedPrefix}\n\n原始消息：${text || msg.content}` }
                 })
-                : `${routedPrefix}\n\n原始消息：${msg.content.replace(ownMentionPattern, '').trim() || msg.content}`
+                : `${routedPrefix}\n\n原始消息：${stripMentionRoutingTokens(msg.content, this.name) || msg.content}`
             const bridgeInput: AgentBridgeMessage = isContentBlockArray(input)
                 ? await convertContentBlocksForAgent(input)
                 : input
-            const bridge = new AgentBridgeClient()
-            const sessionSeed = String(this.storage?.getRoom?.(roomId)?.sessionSeed || '0')
-            const sessionId = groupBridgeSessionId(roomId, this.profile, this.name, sessionSeed)
-            const runMessageId = groupMessageId(roomId, this.profile, this.name)
-            let partIndex = 0
-            let streamMessageId = groupMessagePartId(runMessageId, partIndex)
-            let currentContent = ''
-            let totalContent = ''
-            let reasoningContent = ''
             const flushedAssistantParts = new Set<string>()
             let lastChunk: AgentBridgeOutput | null = null
             const started = await bridge.chat(
@@ -342,9 +490,10 @@ class AgentClient {
             )
 
             this.emitMessageStreamStart(roomId, streamMessageId)
+            streamStarted = true
             for await (const chunk of bridge.streamOutput(started.run_id, { timeoutMs: 120000 })) {
                 lastChunk = chunk
-                reasoningContent += await this.recordBridgeEvents(roomId, chunk, () => streamMessageId, async () => {
+                reasoningContent += await this.recordBridgeEvents(roomId, sessionId, instructions, chunk, () => streamMessageId, async () => {
                     const toolBaseId = streamMessageId
                     if (currentContent.trim()) {
                         await this.sendMessage(roomId, currentContent, streamMessageId, {
@@ -360,6 +509,7 @@ class AgentClient {
                     partIndex += 1
                     streamMessageId = groupMessagePartId(runMessageId, partIndex)
                     this.emitMessageStreamStart(roomId, streamMessageId)
+                    streamStarted = true
                     return toolBaseId
                 })
                 if (chunk.delta) {
@@ -371,6 +521,7 @@ class AgentClient {
 
             if (lastChunk?.status === 'error') {
                 logger.error(`[AgentClients] ${this.name}: bridge response failed: ${lastChunk.error || 'unknown error'}`)
+                await this.sendAgentErrorMessage(roomId, streamMessageId, lastChunk.error || 'Run failed', msg, reasoningContent)
                 this.emitMessageStreamEnd(roomId, streamMessageId)
                 this.stopTyping(roomId)
                 onStatus?.('ready')
@@ -392,6 +543,7 @@ class AgentClient {
                     reasoning_content: reasoningContent || null,
                 })
                 this.emitMessageStreamEnd(roomId, streamMessageId)
+                await this.refreshRoomFullContextEstimate(roomId, sessionId, bridge, instructions)
                 onStatus?.('ready')
                 return
             }
@@ -401,13 +553,117 @@ class AgentClient {
             onStatus?.('ready')
         } catch (err: any) {
             logger.error(`[AgentClients] ${this.name}: error handling message: ${err.message}`)
+            try {
+                await this.sendAgentErrorMessage(roomId, streamMessageId, err, msg, reasoningContent)
+                if (streamStarted) this.emitMessageStreamEnd(roomId, streamMessageId)
+            } catch (sendErr: any) {
+                logger.warn(`[AgentClients] ${this.name}: failed to send error message: ${sendErr.message}`)
+            }
             this.stopTyping(roomId)
             onStatus?.('ready')
         }
     }
 
+    private async refreshRoomFullContextEstimate(
+        roomId: string,
+        sessionId: string,
+        bridge: AgentBridgeClient,
+        instructions?: string,
+    ): Promise<void> {
+        if (!this.storage?.getMessages) return
+        try {
+            const history = this.buildRoomEstimateHistory(roomId)
+            const cachedTokens = await this.estimateGroupContextTokens(
+                roomId,
+                sessionId,
+                bridge,
+                history,
+                instructions,
+                'final',
+            )
+            if (cachedTokens == null || cachedTokens <= 0) return
+            const rounded = Math.floor(cachedTokens)
+            this.storage.updateRoomTotalTokens?.(roomId, rounded)
+            this.emitContextStatus(roomId, 'replying', { totalTokens: rounded })
+        } catch (err: any) {
+            logger.warn(`[GroupChat] failed to refresh final context estimate room=${roomId} agent=${this.name}: ${err.message}`)
+        }
+    }
+
+    private buildRoomEstimateHistory(roomId: string): Array<{ role: 'user' | 'assistant'; content: string }> {
+        const messages = this.storage?.getMessages?.(roomId) || []
+        return messages.map((message: any) => this.mapRoomMessageForEstimate(message))
+    }
+
+    private mapRoomMessageForEstimate(message: any): { role: 'user' | 'assistant'; content: string } {
+        const senderName = String(message?.senderName || 'unknown')
+        const role = String(message?.role || 'user')
+        const isOwnAgent = message?.senderId === this.socket?.id || senderName === this.name
+
+        if (role === 'tool') {
+            const label = message?.tool_name ? `Tool result: ${message.tool_name}` : 'Tool result'
+            return { role: 'user', content: `[${senderName}] [${label}]\n${message?.content || ''}` }
+        }
+
+        if (role === 'assistant' && Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+            const toolsInfo = message.tool_calls.map((toolCall: any) => {
+                const name = toolCall?.function?.name || 'unknown'
+                let args = String(toolCall?.function?.arguments || '{}')
+                if (args.length > 4000) args = `${args.slice(0, 4000)}...`
+                return `[Calling tool: ${name} with arguments: ${args}]`
+            }).join('\n')
+            const content = String(message?.content || '').trim()
+            return {
+                role: isOwnAgent ? 'assistant' : 'user',
+                content: content
+                    ? `${this.formatAttributedContent(senderName, content)}\n${this.formatAttributionPrefix(senderName)}${toolsInfo}`
+                    : `${this.formatAttributionPrefix(senderName)}${toolsInfo}`,
+            }
+        }
+
+        return {
+            role: isOwnAgent ? 'assistant' : 'user',
+            content: this.formatAttributedContent(senderName, String(message?.content || '')),
+        }
+    }
+
+    private formatAttributedContent(senderName: string, content: string): string {
+        return `${this.formatAttributionPrefix(senderName)}${this.stripMentions(content)}`
+    }
+
+    private formatAttributionPrefix(senderName: string): string {
+        return `[${senderName}]: `
+    }
+
+    private stripMentions(content: string): string {
+        return String(content || '')
+            .replace(/@([^\s@]+)/g, '')
+            .replace(/[ \t]{2,}/g, ' ')
+            .replace(/^\s+/, '')
+    }
+
+    private async sendAgentErrorMessage(
+        roomId: string,
+        messageId: string,
+        error: unknown,
+        sourceMsg: MentionMessage,
+        reasoningContent = '',
+    ): Promise<void> {
+        const detail = error instanceof Error ? error.message : String(error || 'Run failed')
+        const content = detail.startsWith('Error:') ? detail : `Error: ${detail}`
+        await this.sendMessage(roomId, content, messageId, {
+            role: 'assistant',
+            mentionDepth: nextMentionDepth(sourceMsg),
+            finish_reason: 'error',
+            reasoning: reasoningContent || null,
+            reasoning_content: reasoningContent || null,
+        })
+    }
+
     private async recordBridgeEvents(
         roomId: string,
+        sessionId: string,
+        instructions: string | undefined,
         chunk: AgentBridgeOutput,
         getCurrentMessageId: () => string,
         beforeToolStarted: () => Promise<string>,
@@ -415,7 +671,9 @@ class AgentClient {
         let reasoning = ''
         for (const ev of chunk.events || []) {
             const eventType = String((ev as any)?.event || '')
-            if (eventType === 'tool.started') {
+            if (eventType === 'bridge.context.ready') {
+                this.cacheBridgeContext(sessionId, ev as Record<string, unknown>, instructions)
+            } else if (eventType === 'tool.started') {
                 const toolBaseId = await beforeToolStarted()
                 this.recordToolStarted(roomId, ev as Record<string, unknown>, toolBaseId)
             } else if (eventType === 'tool.completed') {
@@ -670,9 +928,16 @@ export class AgentClients {
         }
 
         room.set(client.agentId, client)
-        const result = await client.joinRoom(roomId)
-        logger.info(`[AgentClients] ${client.name} joined room: ${roomId}`)
-        return result
+        try {
+            const result = await client.joinRoom(roomId)
+            logger.info(`[AgentClients] ${client.name} joined room: ${roomId}`)
+            return result
+        } catch (err) {
+            room.delete(client.agentId)
+            if (room.size === 0) this.rooms.delete(roomId)
+            client.disconnect()
+            throw err
+        }
     }
 
     /**
@@ -815,12 +1080,7 @@ export class AgentClients {
      */
     async processMentions(roomId: string, msg: MentionMessage): Promise<void> {
         const agents = this.getAgents(roomId)
-        const senderName = msg.senderName.toLowerCase()
-
-        const mentioned = agents.filter(a => (
-            a.name.toLowerCase() !== senderName &&
-            isAgentMentioned(msg.content, a.name)
-        ))
+        const mentioned = resolveMentionTargets(agents, msg.content, msg.senderId)
         if (mentioned.length === 0) return
 
         logger.debug(`[AgentClients] ${mentioned.map(a => a.name).join(', ')} mentioned by ${msg.senderName}`)
@@ -854,8 +1114,8 @@ export class AgentClients {
         }
 
         this._processingRooms.add(agentKey)
-        const onStatus = (status: 'compressing' | 'replying' | 'ready') => {
-            agent.emitContextStatus(roomId, status)
+        const onStatus = (status: 'compressing' | 'replying' | 'ready', extra?: Record<string, unknown>) => {
+            agent.emitContextStatus(roomId, status, extra)
             logger.debug(`[AgentClients] room ${roomId} agent ${agent.name} status: ${status}`)
         }
 
@@ -885,10 +1145,4 @@ export class AgentClients {
 
 function nextMentionDepth(msg: MentionMessage): number {
     return Math.max(0, msg.mentionDepth || 0) + 1
-}
-
-function isAgentMentioned(content: string, agentName: string): boolean {
-    const escaped = agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(`@${escaped}(?=$|\\s|[.,!?;:，。！？；：])`, 'i')
-    return pattern.test(content)
 }

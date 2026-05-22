@@ -39,10 +39,9 @@ process.on('uncaughtException', (err) => {
 })
 
 process.on('unhandledRejection', (reason) => {
-  console.error('FATAL: Unhandled rejection')
+  console.error('Unhandled rejection')
   console.error(reason)
   logger.error(reason, 'Unhandled rejection')
-  process.exit(1)
 })
 
 let server: any = null
@@ -93,10 +92,16 @@ export async function bootstrap() {
     const skillInjector = new HermesSkillInjector()
     const injectionResult = await skillInjector.injectMissingSkills()
     if (injectionResult.injected.length > 0) {
-      console.log('[bootstrap] bundled skills injected:', injectionResult.injected.join(', '))
+      logger.info({
+        injected: [...new Set(injectionResult.injected)],
+        targetCount: injectionResult.targets.length,
+      }, '[bootstrap] bundled skills injected')
     }
     if (injectionResult.updated.length > 0) {
-      console.log('[bootstrap] bundled skills updated:', injectionResult.updated.join(', '))
+      logger.info({
+        updated: [...new Set(injectionResult.updated)],
+        targetCount: injectionResult.targets.length,
+      }, '[bootstrap] bundled skills updated')
     }
   } catch (err) {
     logger.warn(err, '[bootstrap] failed to inject bundled skills')

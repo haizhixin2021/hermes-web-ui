@@ -86,7 +86,7 @@ const showRenameModal = ref(false);
 const renameValue = ref("");
 const renameSessionId = ref<string | null>(null);
 const renameInputRef = ref<InstanceType<typeof NInput> | null>(null);
-const sessionProfileFilter = ref<string | null>(null);
+const sessionProfileFilter = computed(() => chatStore.sessionProfileFilter);
 const profileFilterOptions = computed(() => [
   { label: t("chat.allProfiles"), value: "__all__" },
   ...profilesStore.profiles.map((profile) => ({
@@ -96,8 +96,8 @@ const profileFilterOptions = computed(() => [
 ]);
 
 async function handleProfileFilterChange(value: string) {
-  sessionProfileFilter.value = value === "__all__" ? null : value;
-  await chatStore.loadSessions(sessionProfileFilter.value);
+  chatStore.sessionProfileFilter = value === "__all__" ? null : value;
+  await chatStore.loadSessions(chatStore.sessionProfileFilter);
 }
 
 function sortSessionsWithActiveFirst(items: Session[]): Session[] {
@@ -157,7 +157,7 @@ function getModelGroupsForProfile(profile: string) {
   const profileModels = appStore.profileModelGroups.find(
     (entry) => entry.profile === profile,
   );
-  return profileModels?.groups?.length ? profileModels.groups : appStore.modelGroups;
+  return profileModels?.groups || [];
 }
 
 function getDefaultModelForProfile(profile: string) {
@@ -311,7 +311,7 @@ async function handleBatchDelete() {
 
       // Remove deleted sessions from local store (without calling API again)
       // Use loadSessions to refresh from server instead of manual filtering
-      await chatStore.loadSessions();
+      await chatStore.loadSessions(chatStore.sessionProfileFilter);
 
       message.success(t("chat.batchDeleteSuccess", { count: result.deleted }));
       if (result.failed > 0) {
@@ -449,7 +449,7 @@ async function handleContextMenuSelect(key: string) {
     workspaceValue.value = session?.workspace || "";
     showWorkspaceModal.value = true;
   } else if (key === "model") {
-    openSessionModelModal(contextSessionId.value);
+    await openSessionModelModal(contextSessionId.value);
   } else if (key === "rename") {
     const session = chatStore.sessions.find(
       (s) => s.id === contextSessionId.value,
@@ -522,13 +522,13 @@ const sessionModelProvider = ref("");
 const sessionModelCustomInput = ref("");
 const sessionModelCustomProvider = ref("");
 
-const sessionModelProfile = computed(() => {
+const sessionModelProfile = computed<string | null>(() => {
   const session = chatStore.sessions.find((s) => s.id === sessionModelSessionId.value);
-  return session?.profile || profilesStore.activeProfileName || "default";
+  return session?.profile || null;
 });
 
 const sessionModelBaseGroups = computed(() =>
-  getModelGroupsForProfile(sessionModelProfile.value),
+  sessionModelProfile.value ? getModelGroupsForProfile(sessionModelProfile.value) : [],
 );
 
 const sessionModelProviderOptions = computed(() =>
@@ -561,9 +561,14 @@ const filteredSessionModelGroups = computed(() => {
     .filter((group) => group.models.length > 0 || group.label.toLowerCase().includes(query));
 });
 
-function openSessionModelModal(sessionId: string) {
+async function openSessionModelModal(sessionId: string) {
+  if (appStore.modelGroups.length === 0 && appStore.profileModelGroups.length === 0) {
+    await appStore.loadModels();
+  }
   const session = chatStore.sessions.find((s) => s.id === sessionId);
-  const defaults = getDefaultModelForProfile(session?.profile || profilesStore.activeProfileName || "default");
+  const defaults = session?.profile
+    ? getDefaultModelForProfile(session.profile)
+    : { provider: "", model: "" };
   sessionModelSessionId.value = sessionId;
   sessionModelValue.value = session?.model || defaults.model || "";
   sessionModelProvider.value = session?.provider || defaults.provider || "";
@@ -1430,7 +1435,7 @@ async function handleSessionModelCustomSubmit() {
     left: 0;
     top: 0;
     height: 100%;
-    z-index: 10;
+    z-index: 120;
     background: $bg-card;
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.1);
     width: 280px;
@@ -1451,7 +1456,7 @@ async function handleSessionModelCustomSubmit() {
     position: absolute;
     inset: 0;
     background: rgba(0, 0, 0, 0.4);
-    z-index: 9;
+    z-index: 110;
     opacity: 0;
     pointer-events: none;
     transition: opacity $transition-fast;
@@ -1625,6 +1630,26 @@ async function handleSessionModelCustomSubmit() {
 
   &.active .session-item-title {
     color: $accent-primary;
+  }
+
+  &.missing-models {
+    color: #b42318;
+    background: rgba(220, 38, 38, 0.08);
+
+    .session-item-title,
+    .session-item-profile-name,
+    .session-item-time {
+      color: #b42318;
+    }
+
+    .session-item-model {
+      color: #b42318;
+      background: rgba(220, 38, 38, 0.12);
+    }
+
+    &:hover {
+      background: rgba(220, 38, 38, 0.12);
+    }
   }
 }
 

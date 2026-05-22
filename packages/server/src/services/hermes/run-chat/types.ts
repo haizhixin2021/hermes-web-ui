@@ -46,6 +46,8 @@ export interface SessionState {
   profile?: string
   inputTokens?: number
   outputTokens?: number
+  contextTokens?: number
+  bridgeContext?: BridgeContextState
   isAborting?: boolean
   queue: QueuedRun[]
   responseRun?: ResponseRunState
@@ -69,6 +71,18 @@ export interface ResponseRunState {
   responseId?: string
   insertedKeys: Set<string>
   toolCalls: Map<string, any>
+}
+
+export interface BridgeContextState {
+  fixedContextTokens?: number
+  systemPromptTokens?: number
+  toolTokens?: number
+  systemPromptChars?: number
+  toolCount?: number
+  toolNames?: string[]
+  profile?: string
+  model?: string
+  provider?: string
 }
 
 export type ChatRunSource = 'api_server' | 'cli'
