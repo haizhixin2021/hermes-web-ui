@@ -1,4 +1,4 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, onPeerUserMessage, respondClarify, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, onPeerUserMessage, respondClarify, type RunEvent, type ResumeSessionPayload, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, setSessionModel, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getActiveProfileName } from '@/api/client'
 import { getDownloadUrl } from '@/api/hermes/download'
@@ -967,12 +967,14 @@ export const useChatStore = defineStore('chat', () => {
       const timestamp = typeof peer?.timestamp === 'number' && Number.isFinite(peer.timestamp)
         ? Math.round(peer.timestamp * 1000)
         : Date.now()
+      const role = peer?.role === 'command' ? 'command' : 'user'
       return [{
         id: messageId,
-        role: 'user' as const,
+        role,
         content,
         timestamp,
         queued: true,
+        systemType: role === 'command' ? 'command' as const : undefined,
       }]
     })
   }
@@ -1028,11 +1030,12 @@ export const useChatStore = defineStore('chat', () => {
     enqueueUserMessage(sessionId, {
       ...(existing || {}),
       id: messageId,
-      role: 'user',
+      role: peer?.role === 'command' ? 'command' : 'user',
       content,
       timestamp: existing?.timestamp || timestamp,
       attachments: existing?.attachments,
       queued: true,
+      systemType: peer?.role === 'command' ? 'command' : existing?.systemType,
     })
   }
 
@@ -1091,6 +1094,22 @@ export const useChatStore = defineStore('chat', () => {
     if (clarifyId && current.clarifyId !== clarifyId) return
     pendingClarifies.value.delete(sid)
     pendingClarifies.value = new Map(pendingClarifies.value)
+  }
+
+  function clearPendingInteractions(sessionId: string) {
+    let changed = false
+    if (pendingApprovals.value.has(sessionId)) {
+      pendingApprovals.value.delete(sessionId)
+      changed = true
+    }
+    if (pendingClarifies.value.has(sessionId)) {
+      pendingClarifies.value.delete(sessionId)
+      changed = true
+    }
+    if (changed) {
+      pendingApprovals.value = new Map(pendingApprovals.value)
+      pendingClarifies.value = new Map(pendingClarifies.value)
+    }
   }
 
   function respondToClarify(response: string) {
@@ -1169,8 +1188,9 @@ export const useChatStore = defineStore('chat', () => {
       : false
     const isBridgeSlashCommand = content.trim().startsWith('/')
     const isBridgeCompressCommand = isBridgeSlashCommand && /^\/compress(?:\s|$)/i.test(content.trim())
+    const isBridgePlanCommand = isBridgeSlashCommand && /^\/plan(?:\s|$)/i.test(content.trim())
     const wasLiveBeforeSend = isSessionLive(sid)
-    const shouldQueue = wasLiveBeforeSend && !isBridgeSlashCommand
+    const shouldQueue = wasLiveBeforeSend && (!isBridgeSlashCommand || isBridgePlanCommand)
 
     const userMsg: Message = {
       id: uid(),
@@ -1277,6 +1297,107 @@ export const useChatStore = defineStore('chat', () => {
         activeAssistantMessageId = null
       }
 
+      const applyReconnectResume = (data: ResumeSessionPayload) => {
+        if (data.session_id !== sid) return
+        const target = sessions.value.find(s => s.id === sid)
+        if (!target) return
+
+        if (data.isWorking) serverWorking.value.add(sid)
+        else serverWorking.value.delete(sid)
+
+        if (data.queueLength && data.queueLength > 0) {
+          queueLengths.value.set(sid, data.queueLength)
+        } else {
+          queueLengths.value.delete(sid)
+        }
+
+        if (Array.isArray(data.queueMessages)) {
+          replaceQueuedUserMessages(sid, normalizeQueuedUserMessages(data.queueMessages))
+        } else if (!data.queueLength) {
+          replaceQueuedUserMessages(sid, [])
+        }
+
+        if (data.isAborting) {
+          setAbortState({ aborting: true, synced: null })
+        } else if (!data.isWorking) {
+          setAbortState(null)
+        }
+
+        if (data.inputTokens != null) target.inputTokens = data.inputTokens
+        if (data.outputTokens != null) target.outputTokens = data.outputTokens
+        if (data.contextTokens != null) target.contextTokens = data.contextTokens
+
+        if (Array.isArray(data.messages)) {
+          target.messages = mapHermesMessages(data.messages as any[])
+          const lastAssistant = [...target.messages].reverse().find(m => m.role === 'assistant')
+          if (data.isWorking && lastAssistant) {
+            lastAssistant.isStreaming = true
+            activeAssistantMessageId = lastAssistant.id
+            if (lastAssistant.reasoning) noteReasoningStart(lastAssistant.id)
+          } else {
+            activeAssistantMessageId = null
+          }
+        }
+
+        if (data.events?.length) {
+          for (const evt of data.events) {
+            const e = evt.data as RunEvent
+            switch (e.event) {
+              case 'compression.started':
+                setCompressionState({
+                  compressing: true,
+                  messageCount: (e as any).message_count || 0,
+                  beforeTokens: (e as any).token_count || 0,
+                  afterTokens: 0,
+                  compressed: null,
+                })
+                break
+              case 'compression.completed': {
+                const afterTokens = (e as any).contextTokens || (e as any).afterTokens || 0
+                setCompressionState({
+                  compressing: false,
+                  messageCount: (e as any).totalMessages || 0,
+                  beforeTokens: (e as any).beforeTokens || 0,
+                  afterTokens,
+                  compressed: (e as any).compressed ?? false,
+                  error: (e as any).error,
+                })
+                if ((e as any).contextTokens != null) target.contextTokens = (e as any).contextTokens
+                break
+              }
+              case 'abort.started':
+                setAbortState({ aborting: true, synced: null })
+                break
+              case 'abort.completed':
+                setAbortState({ aborting: false, synced: (e as any).synced ?? false })
+                break
+              case 'approval.requested':
+                setPendingApproval({ ...e, session_id: sid })
+                break
+              case 'approval.resolved':
+                clearPendingApproval({ ...e, session_id: sid })
+                break
+              case 'clarify.requested':
+                setPendingClarify({ ...e, session_id: sid })
+                break
+              case 'clarify.resolved':
+                clearPendingClarify({ ...e, session_id: sid })
+                break
+              case 'run.failed':
+                addAgentErrorMessage(sid, e.error)
+                break
+            }
+          }
+        }
+
+        if (activeSessionId.value === sid) activeSession.value = target
+        if (!data.isWorking && !(data.queueLength && data.queueLength > 0)) {
+          cleanup()
+          activeAssistantMessageId = null
+          updateSessionTitle(sid)
+        }
+      }
+
       // Send run via Socket.IO and listen to streamed events — all closures capture `sid`
       const ctrl = startRunViaSocket(
         runPayload,
@@ -1348,6 +1469,7 @@ export const useChatStore = defineStore('chat', () => {
 
             case 'abort.completed': {
               setAbortState({ aborting: false, synced: (evt as any).synced ?? false })
+              clearPendingInteractions(sid)
               if ((evt as any).queue_length > 0) {
                 queueLengths.value.set(sid, (evt as any).queue_length)
                 setAbortState(null)
@@ -1694,9 +1816,10 @@ export const useChatStore = defineStore('chat', () => {
           cleanup()
         },
         undefined,
+        { onReconnectResume: applyReconnectResume },
       )
 
-      if (!isBridgeSlashCommand || isBridgeCompressCommand) {
+      if (!isBridgeSlashCommand || isBridgeCompressCommand || isBridgePlanCommand) {
         streamStates.value.set(sid, ctrl)
       }
     } catch (err: any) {
@@ -1818,6 +1941,7 @@ export const useChatStore = defineStore('chat', () => {
 
         case 'abort.completed': {
           setAbortState({ aborting: false, synced: (evt as any).synced ?? false })
+          clearPendingInteractions(sid)
           if ((evt as any).queue_length > 0) {
             queueLengths.value.set(sid, (evt as any).queue_length)
             setAbortState(null)
@@ -2184,10 +2308,11 @@ export const useChatStore = defineStore('chat', () => {
 
     const message: Message = {
       id: messageId || uid(),
-      role: 'user',
+      role: peer?.role === 'command' ? 'command' : 'user',
       content,
       timestamp,
       queued: !!peer?.queued,
+      systemType: peer?.role === 'command' ? 'command' : undefined,
     }
     if (peer?.queued) {
       enqueueUserMessage(sid, message)
@@ -2205,6 +2330,7 @@ export const useChatStore = defineStore('chat', () => {
     const sid = activeSessionId.value
     if (!sid) return
     if (isAborting.value) return
+    clearPendingInteractions(sid)
     const ctrl = streamStates.value.get(sid)
     if (ctrl) {
       setAbortState({ aborting: true, synced: null })

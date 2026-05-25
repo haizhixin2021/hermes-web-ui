@@ -43,8 +43,7 @@ function getToken() {
 }
 
 function ensureToken() {
-  // If AUTH_DISABLED or AUTH_TOKEN is set, let server handle it
-  if (process.env.AUTH_DISABLED === '1' || process.env.AUTH_DISABLED === 'true') return null
+  // If AUTH_TOKEN is set, let server handle it.
   if (process.env.AUTH_TOKEN) return process.env.AUTH_TOKEN
 
   let token = getToken()
@@ -420,7 +419,14 @@ function startDaemon(port) {
 }
 
 function stopDaemon() {
-  const pid = getPid()
+  const pidFromFile = readPidFile()
+  if (pidFromFile && !isRunning(pidFromFile)) {
+    removePid()
+    console.log(`  ✓ hermes-web-ui was not running (cleaned stale PID: ${pidFromFile})`)
+    return
+  }
+
+  const pid = pidFromFile ?? recoverPidFromPort()
   if (!pid) {
     console.log('  ✗ hermes-web-ui is not running')
     process.exit(1)
@@ -443,7 +449,11 @@ function stopDaemon() {
     } catch {}
     // Force kill if still alive
     if (isRunning(pid)) {
-      process.kill(pid, 'SIGKILL')
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch (err) {
+        if (err?.code !== 'ESRCH') throw err
+      }
     }
     removePid()
     console.log(`  ✓ hermes-web-ui stopped (PID: ${pid})`)
@@ -702,4 +712,5 @@ export {
   getListeningPids,
   parseUnixNetstatListeningPids,
   resetDefaultLogin,
+  stopDaemon,
 }
