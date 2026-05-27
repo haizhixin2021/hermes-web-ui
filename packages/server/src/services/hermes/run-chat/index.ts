@@ -135,6 +135,8 @@ export class ChatRunSocket {
               bridge: this.bridge,
               profile: runProfile,
               model: data.model,
+              provider: data.provider,
+              model_groups: data.model_groups,
               instructions: data.instructions,
               queueId: data.queue_id,
               runQueuedItem: this.runQueuedItem.bind(this),
@@ -248,6 +250,7 @@ export class ChatRunSocket {
 
     socket.on('clarify.respond', async (data: { session_id?: string; clarify_id?: string; response?: string }) => {
       if (!data.session_id || !data.clarify_id) return
+      this.clearClarifyEventState(data.session_id, data.clarify_id)
       try {
         const result = await this.bridge.clarifyRespond(data.clarify_id, data.response || '')
         this.emitToSession(socket, data.session_id, 'clarify.resolved', {
@@ -384,6 +387,19 @@ export class ChatRunSocket {
 
   // --- Helpers ---
 
+  private clearClarifyEventState(sessionId: string, clarifyId: string) {
+    const state = this.sessionMap.get(sessionId)
+    if (!state?.events.length) return
+
+    const nextEvents = state.events.filter(({ event, data }) => {
+      if (event !== 'clarify.requested' && event !== 'clarify.resolved') return true
+      return data?.clarify_id !== clarifyId
+    })
+    if (nextEvents.length !== state.events.length) {
+      state.events = nextEvents
+    }
+  }
+
   private emitToSession(socket: Socket, sessionId: string, event: string, payload: any) {
     const tagged = { ...payload, session_id: sessionId }
     this.nsp.to(`session:${sessionId}`).emit(event, tagged)
@@ -393,12 +409,10 @@ export class ChatRunSocket {
   }
 
   private serializeQueuedMessages(queue: QueuedRun[]) {
-    return queue.map(item => ({
+    return queue.filter(item => item.displayInput !== null).map(item => ({
       id: item.queue_id,
       role: item.displayRole || (typeof item.displayInput === 'string' && item.displayInput.trim().startsWith('/') ? 'command' : 'user'),
-      content: item.displayInput === null
-        ? (item.storageMessage || '')
-        : contentBlocksToString(item.displayInput ?? item.input),
+      content: contentBlocksToString(item.displayInput ?? item.input),
       timestamp: Math.floor(Date.now() / 1000),
       queued: true,
     }))

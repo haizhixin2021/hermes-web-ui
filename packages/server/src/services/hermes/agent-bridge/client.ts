@@ -110,6 +110,7 @@ export interface AgentBridgeCommandResult extends AgentBridgeResponse {
   command: string
   handled: boolean
   type?: string
+  action?: string
   message?: string
   output?: string
   notice?: string
@@ -120,6 +121,30 @@ export interface AgentBridgeCommandResult extends AgentBridgeResponse {
   retry?: boolean
   retry_input?: AgentBridgeMessage
   title?: string
+  kickoff_prompt?: string
+  clear_goal_continuations?: boolean
+  max_turns?: number
+}
+
+export interface AgentBridgeGoalEvaluation extends AgentBridgeResponse {
+  session_id: string
+  handled: boolean
+  active?: boolean
+  status?: string | null
+  should_continue?: boolean
+  continuation_prompt?: string | null
+  verdict?: string
+  reason?: string
+  message?: string
+}
+
+export interface AgentBridgeGoalPause extends AgentBridgeResponse {
+  session_id: string
+  handled: boolean
+  active?: boolean
+  status?: string | null
+  reason?: string
+  message?: string
 }
 
 export class AgentBridgeError extends Error {
@@ -141,7 +166,7 @@ export class AgentBridgeClient {
   private summarizePayload(payload: Record<string, unknown>): Record<string, unknown> {
     const action = String(payload.action || '')
     const summary: Record<string, unknown> = { action }
-    for (const key of ['session_id', 'run_id', 'request_id', 'approval_id', 'profile']) {
+    for (const key of ['session_id', 'run_id', 'request_id', 'approval_id', 'profile', 'worker_key']) {
       if (payload[key] != null) summary[key] = payload[key]
     }
     if (Array.isArray(payload.conversation_history)) summary.conversation_history_count = payload.conversation_history.length
@@ -419,6 +444,15 @@ export class AgentBridgeClient {
     })
   }
 
+  goalEvaluate(sessionId: string, finalResponse: string, profile?: string): Promise<AgentBridgeGoalEvaluation> {
+    return this.request<AgentBridgeGoalEvaluation>({
+      action: 'goal_evaluate',
+      session_id: sessionId,
+      final_response: finalResponse,
+      ...(profile ? { profile } : {}),
+    })
+  }
+
   getOutput(runId: string, cursor = 0, eventCursor = 0, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeOutput> {
     return this.request<AgentBridgeOutput>({
       action: 'get_output',
@@ -474,6 +508,15 @@ export class AgentBridgeClient {
     })
   }
 
+  goalPause(sessionId: string, reason: string, profile?: string): Promise<AgentBridgeGoalPause> {
+    return this.request<AgentBridgeGoalPause>({
+      action: 'goal_pause',
+      session_id: sessionId,
+      reason,
+      ...(profile ? { profile } : {}),
+    })
+  }
+
   steer(sessionId: string, text: string, profile?: string): Promise<AgentBridgeResponse> {
     return this.request({
       action: 'steer',
@@ -518,11 +561,20 @@ export class AgentBridgeClient {
     })
   }
 
-  destroy(sessionId: string, profile?: string): Promise<AgentBridgeResponse> {
+  status(sessionId: string, profile?: string): Promise<AgentBridgeResponse> {
+    return this.request({
+      action: 'status',
+      session_id: sessionId,
+      ...(profile ? { profile } : {}),
+    })
+  }
+
+  destroy(sessionId: string, profile?: string, workerKey?: string): Promise<AgentBridgeResponse> {
     return this.request({
       action: 'destroy',
       session_id: sessionId,
       ...(profile ? { profile } : {}),
+      ...(workerKey ? { worker_key: workerKey } : {}),
     })
   }
 
