@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     make \
     g++ \
+    unzip \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ARCH=$(dpkg --print-architecture) \
@@ -23,6 +25,50 @@ RUN ARCH=$(dpkg --print-architecture) \
     && rm -f /tmp/node.tar.gz \
     && node --version \
     && npm --version
+# 3. 安装 RTK (智能适配：ARM用gnu，x86用musl)
+ENV RTK_VERSION=v0.40.0
+RUN ARCH=$(dpkg --print-architecture) \
+    # 核心逻辑：如果是 arm64，使用 aarch64-gnu；如果是 amd64(x86_64)，使用 x86_64-musl
+    && if [ "$ARCH" = "arm64" ]; then RTK_ARCH="aarch64" && RTK_LIBC="gnu"; \
+       else RTK_ARCH="x86_64" && RTK_LIBC="musl"; fi \
+    && echo "Downloading RTK for ${RTK_ARCH}-${RTK_LIBC}" \
+    && curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-${RTK_ARCH}-unknown-linux-${RTK_LIBC}.tar.gz" -o /tmp/rtk.tar.gz \
+    && mkdir -p /opt/rtk \
+    && tar -xzf /tmp/rtk.tar.gz -C /opt/rtk \
+    && rm -f /tmp/rtk.tar.gz \
+    && chmod +x /opt/rtk/rtk \
+    && ln -sf /opt/rtk/rtk /usr/local/bin/rtk \
+    && rtk --version
+
+# --- 新增：RTK 初始化配置 ---
+# 在所有工具安装完毕后，执行 RTK 的初始化，为后续应用运行做好准备
+RUN echo "Initializing RTK with Hermes Agent..." \
+    && rtk init --agent hermes
+
+
+# 5. 安装 Bun (优化版)
+# 使用 dpkg 获取架构信息以保持与 Node.js 步骤一致，并增加 set -e 确保出错即停
+RUN set -e; \
+    ARCH=$(dpkg --print-architecture); \
+    if [ "$ARCH" = "amd64" ]; then BUN_ARCH="x64"; \
+    elif [ "$ARCH" = "arm64" ]; then BUN_ARCH="aarch64"; \
+    else BUN_ARCH="$ARCH"; fi; \
+    echo "Downloading Bun for ${BUN_ARCH}"; \
+    mkdir -p /opt/bun; \
+    curl -fsSL "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-${BUN_ARCH}.zip" -o /tmp/bun.zip; \
+    unzip /tmp/bun.zip -d /opt/bun; \
+    rm -f /tmp/bun.zip; \
+    # 解压后的文件夹名通常为 bun-linux-x64 等，直接指向里面的 bun 二进制文件
+    chmod +x /opt/bun/bun-linux-${BUN_ARCH}/bun; \
+    ln -sf /opt/bun/bun-linux-${BUN_ARCH}/bun /usr/local/bin/bun; \
+    bun --version
+
+# 安装 Hermes Link 
+RUN curl -fsSL https://hs.clawpilot.me/install/install.sh | bash
+
+# 安装 mem0ai和hindsight_client
+RUN uv pip install mem0ai
+RUN uv pip install hindsight_client
 
 WORKDIR /app
 
