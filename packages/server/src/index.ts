@@ -7,7 +7,7 @@ import os from 'os'
 import { resolve } from 'path'
 import { mkdir } from 'fs/promises'
 import { readFileSync } from 'fs'
-import { config } from './config'
+import { config, shouldCreateWebUiDataDir } from './config'
 import { initLoginLimiter } from './services/login-limiter'
 import { bindShutdown } from './services/shutdown'
 import { setupTerminalWebSocket } from './routes/hermes/terminal'
@@ -84,7 +84,9 @@ function safeNetworkInterfaces() {
 export async function bootstrap() {
   console.log(`hermes-web-ui v${APP_VERSION} starting...`)
   await mkdir(config.uploadDir, { recursive: true })
-  await mkdir(config.dataDir, { recursive: true })
+  if (shouldCreateWebUiDataDir()) {
+    await mkdir(config.dataDir, { recursive: true })
+  }
 
   await initLoginLimiter()
   try {
@@ -133,7 +135,10 @@ export async function bootstrap() {
   console.log('[bootstrap] all stores initialized')
 
   app.use(cors({ origin: config.corsOrigins }))
-  app.use(bodyParser())
+  // Raise JSON/text limits above the default 1mb: profile avatars are posted
+  // as base64 data URLs (up to ~1MB raw → ~1.37MB base64), which otherwise
+  // tripped a 413 in the body parser before reaching the handler.
+  app.use(bodyParser({ encoding: 'utf-8', jsonLimit: '4mb', textLimit: '4mb' }))
   console.log('[bootstrap] cors + bodyParser registered')
 
   // Register all routes (handles auth internally)
