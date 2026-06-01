@@ -106,6 +106,136 @@ print(json.dumps({
   })
 })
 
+describe('agent bridge Windows desktop subprocess defaults', () => {
+  it('adds CREATE_NO_WINDOW to sync and async nested subprocesses without replacing existing flags', async () => {
+    const result = await runBridgeProbe(String.raw`
+import importlib.util
+import json
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("hermes_bridge", os.environ["BRIDGE_PATH"])
+bridge = importlib.util.module_from_spec(spec)
+sys.modules["hermes_bridge"] = bridge
+spec.loader.exec_module(bridge)
+
+original_os_name = bridge.os.name
+original_popen = bridge.subprocess.Popen
+original_async_exec = bridge.asyncio.create_subprocess_exec
+original_async_shell = bridge.asyncio.create_subprocess_shell
+original_create_no_window = getattr(bridge.subprocess, "CREATE_NO_WINDOW", None)
+original_startupinfo = getattr(bridge.subprocess, "STARTUPINFO", None)
+original_startf = getattr(bridge.subprocess, "STARTF_USESHOWWINDOW", None)
+original_sw_hide = getattr(bridge.subprocess, "SW_HIDE", None)
+original_installed = getattr(bridge.subprocess, "_hermes_hidden_defaults_installed", None)
+
+class FakePopen:
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        FakePopen.calls.append({"args": args, "kwargs": kwargs})
+
+async_calls = []
+
+async def fake_create_subprocess_exec(*args, **kwargs):
+    async_calls.append({"kind": "exec", "args": args, "kwargs": kwargs})
+    return {"kind": "exec"}
+
+async def fake_create_subprocess_shell(*args, **kwargs):
+    async_calls.append({"kind": "shell", "args": args, "kwargs": kwargs})
+    return {"kind": "shell"}
+
+class FakeStartupInfo:
+    def __init__(self):
+        self.dwFlags = 0
+        self.wShowWindow = None
+
+try:
+    bridge.os.name = "nt"
+    bridge.os.environ["HERMES_DESKTOP"] = "true"
+    bridge.subprocess.Popen = FakePopen
+    bridge.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+    bridge.asyncio.create_subprocess_shell = fake_create_subprocess_shell
+    bridge.subprocess.CREATE_NO_WINDOW = 0x08000000
+    bridge.subprocess.STARTUPINFO = FakeStartupInfo
+    bridge.subprocess.STARTF_USESHOWWINDOW = 0x00000001
+    bridge.subprocess.SW_HIDE = 0
+    if hasattr(bridge.subprocess, "_hermes_hidden_defaults_installed"):
+        delattr(bridge.subprocess, "_hermes_hidden_defaults_installed")
+
+    bridge._install_windows_hidden_subprocess_defaults()
+    bridge.subprocess.Popen(["git", "status"], creationflags=0x00000200)
+    flags = FakePopen.calls[0]["kwargs"]["creationflags"]
+    startupinfo = FakePopen.calls[0]["kwargs"]["startupinfo"]
+    bridge.asyncio.run(bridge.asyncio.create_subprocess_exec("git", "status", creationflags=0x00000400))
+    bridge.asyncio.run(bridge.asyncio.create_subprocess_shell("git status"))
+    async_exec_flags = async_calls[0]["kwargs"]["creationflags"]
+    async_exec_startupinfo = async_calls[0]["kwargs"]["startupinfo"]
+    async_shell_flags = async_calls[1]["kwargs"]["creationflags"]
+    async_shell_startupinfo = async_calls[1]["kwargs"]["startupinfo"]
+finally:
+    bridge.os.name = original_os_name
+    bridge.subprocess.Popen = original_popen
+    bridge.asyncio.create_subprocess_exec = original_async_exec
+    bridge.asyncio.create_subprocess_shell = original_async_shell
+    if original_create_no_window is None:
+        try:
+            delattr(bridge.subprocess, "CREATE_NO_WINDOW")
+        except AttributeError:
+            pass
+    else:
+        bridge.subprocess.CREATE_NO_WINDOW = original_create_no_window
+    for name, original in [
+        ("STARTUPINFO", original_startupinfo),
+        ("STARTF_USESHOWWINDOW", original_startf),
+        ("SW_HIDE", original_sw_hide),
+    ]:
+        if original is None:
+            try:
+                delattr(bridge.subprocess, name)
+            except AttributeError:
+                pass
+        else:
+            setattr(bridge.subprocess, name, original)
+    if original_installed is None:
+        try:
+            delattr(bridge.subprocess, "_hermes_hidden_defaults_installed")
+        except AttributeError:
+            pass
+    else:
+        bridge.subprocess._hermes_hidden_defaults_installed = original_installed
+
+print(json.dumps({
+    "flags": flags,
+    "has_create_no_window": bool(flags & 0x08000000),
+    "kept_existing_flag": bool(flags & 0x00000200),
+    "startupinfo_hidden": bool(startupinfo.dwFlags & 0x00000001) and startupinfo.wShowWindow == 0,
+    "async_exec_flags": async_exec_flags,
+    "async_exec_has_create_no_window": bool(async_exec_flags & 0x08000000),
+    "async_exec_kept_existing_flag": bool(async_exec_flags & 0x00000400),
+    "async_exec_startupinfo_hidden": bool(async_exec_startupinfo.dwFlags & 0x00000001) and async_exec_startupinfo.wShowWindow == 0,
+    "async_shell_flags": async_shell_flags,
+    "async_shell_has_create_no_window": bool(async_shell_flags & 0x08000000),
+    "async_shell_startupinfo_hidden": bool(async_shell_startupinfo.dwFlags & 0x00000001) and async_shell_startupinfo.wShowWindow == 0,
+}))
+`)
+
+    expect(result).toEqual({
+      flags: 0x08000200,
+      has_create_no_window: true,
+      kept_existing_flag: true,
+      startupinfo_hidden: true,
+      async_exec_flags: 0x08000400,
+      async_exec_has_create_no_window: true,
+      async_exec_kept_existing_flag: true,
+      async_exec_startupinfo_hidden: true,
+      async_shell_flags: 0x08000000,
+      async_shell_has_create_no_window: true,
+      async_shell_startupinfo_hidden: true,
+    })
+  })
+})
+
 describe('agent bridge profile environment', () => {
   it('runs agent calls with the requested profile HERMES_HOME and restores the bridge home', async () => {
     const profileHome = join(tempDir, 'profiles', 'work')

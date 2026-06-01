@@ -6,6 +6,10 @@ directories:
   output: release
   buildResources: build
 
+publish:
+  provider: generic
+  url: https://download.ekkolearnai.com
+
 # Don't auto-prune our root node_modules; we curate `files` and `extraResources` ourselves.
 buildDependenciesFromSource: false
 nodeGypRebuild: false
@@ -25,6 +29,9 @@ extraResources:
     to: "build"
     filter:
       - "icon.png"
+      - "icon.ico"
+      - "trayTemplate.png"
+      - "trayWindows.png"
   - from: "../.."
     to: "webui"
     filter:
@@ -49,17 +56,19 @@ mac:
   target:
     - target: dmg
       arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false
   notarize: true
-  artifactName: "${productName}-${version}-${arch}.${ext}"
+  artifactName: "Hermes.Studio-${version}-${arch}.${ext}"
 
 win:
   target:
     - target: nsis
       arch: [x64]
-  artifactName: "${productName}-${version}-${arch}.${ext}"
+  artifactName: "Hermes.Studio-${version}-${arch}.${ext}"
 
 linux:
   icon: build/icons
@@ -69,9 +78,10 @@ linux:
     - target: deb
       arch: [x64]   # fpm has no arm64 binary; deb only on x64
   category: Development
-  artifactName: "${productName}-${version}-${arch}.${ext}"
+  artifactName: "Hermes.Studio-${version}-${arch}.${ext}"
 
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   perMachine: false
+  include: build/installer.nsh

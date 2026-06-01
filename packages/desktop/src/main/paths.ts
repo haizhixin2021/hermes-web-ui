@@ -31,9 +31,18 @@ export function pythonDir(): string {
   return resolve(app.getAppPath(), 'resources', 'python', `${osLabel}-${archLabel}`)
 }
 
-export function hermesBin(): string {
+export function pythonBinDir(): string {
   const dir = pythonDir()
-  return isWin ? join(dir, 'Scripts', 'hermes.exe') : join(dir, 'bin', 'hermes')
+  return isWin ? join(dir, 'Scripts') : join(dir, 'bin')
+}
+
+export function bundledPython(): string {
+  const dir = pythonDir()
+  return isWin ? join(dir, 'python.exe') : join(dir, 'bin', 'python3')
+}
+
+export function hermesBin(): string {
+  return isWin ? join(pythonBinDir(), 'hermes.exe') : join(pythonBinDir(), 'hermes')
 }
 
 export function hermesBinExists(): boolean {
@@ -43,6 +52,16 @@ export function hermesBinExists(): boolean {
 export function desktopIcon(): string {
   if (app.isPackaged) return resolve(process.resourcesPath, 'build', 'icon.png')
   return resolve(app.getAppPath(), 'build', 'icon.png')
+}
+
+export function desktopWindowsTrayIcon(): string {
+  if (app.isPackaged) return resolve(process.resourcesPath, 'build', 'trayWindows.png')
+  return resolve(app.getAppPath(), 'build', 'trayWindows.png')
+}
+
+export function desktopTrayTemplateIcon(): string {
+  if (app.isPackaged) return resolve(process.resourcesPath, 'build', 'trayTemplate.png')
+  return resolve(app.getAppPath(), 'build', 'trayTemplate.png')
 }
 
 export function webUiHome(): string {

@@ -10,6 +10,7 @@ delimited JSON request/response protocol over a local socket.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import copy
 import errno
@@ -65,6 +66,86 @@ def _positive_int(value: str | None) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    if os.environ.get("HERMES_DESKTOP", "").strip().lower() != "true":
+        return {}
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0x08000000
+    kwargs: dict[str, Any] = {"creationflags": create_no_window}
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kwargs
+
+
+def _add_hidden_process_options(kwargs: dict[str, Any], create_no_window: int) -> None:
+    flags = kwargs.get("creationflags", 0) or 0
+    try:
+        kwargs["creationflags"] = int(flags) | create_no_window
+    except Exception:
+        kwargs["creationflags"] = create_no_window
+
+    startupinfo = kwargs.get("startupinfo")
+    if startupinfo is None:
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+        except Exception:
+            return
+        kwargs["startupinfo"] = startupinfo
+    try:
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    except Exception:
+        pass
+
+
+def _install_windows_hidden_subprocess_defaults() -> None:
+    """Hide console windows for subprocesses launched inside desktop bridge runs.
+
+    The desktop bridge itself must keep stdout/stderr pipes for readiness and
+    worker handshakes, so it runs under python.exe. On Windows that means any
+    nested console executable, including git.exe from context expansion, can
+    flash a window unless the child process is created with CREATE_NO_WINDOW.
+    """
+    if os.name != "nt":
+        return
+    if os.environ.get("HERMES_DESKTOP", "").strip().lower() != "true":
+        return
+    if getattr(subprocess, "_hermes_hidden_defaults_installed", False):
+        return
+
+    original_popen = subprocess.Popen
+    original_create_subprocess_exec = asyncio.create_subprocess_exec
+    original_create_subprocess_shell = asyncio.create_subprocess_shell
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0x08000000
+
+    class HiddenPopen(original_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            _add_hidden_process_options(kwargs, create_no_window)
+            super().__init__(*args, **kwargs)
+
+    async def hidden_create_subprocess_exec(*args: Any, **kwargs: Any) -> Any:
+        _add_hidden_process_options(kwargs, create_no_window)
+        return await original_create_subprocess_exec(*args, **kwargs)
+
+    async def hidden_create_subprocess_shell(*args: Any, **kwargs: Any) -> Any:
+        _add_hidden_process_options(kwargs, create_no_window)
+        return await original_create_subprocess_shell(*args, **kwargs)
+
+    subprocess.Popen = HiddenPopen  # type: ignore[assignment]
+    asyncio.create_subprocess_exec = hidden_create_subprocess_exec  # type: ignore[assignment]
+    asyncio.create_subprocess_shell = hidden_create_subprocess_shell  # type: ignore[assignment]
+    subprocess._hermes_hidden_defaults_installed = True  # type: ignore[attr-defined]
+
+
+_install_windows_hidden_subprocess_defaults()
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -76,6 +157,7 @@ def _process_exists(pid: int) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **_hidden_subprocess_kwargs(),
             )
             return str(pid) in (result.stdout or "")
         except Exception:
@@ -2427,16 +2509,18 @@ class BridgeServer:
             cfg = getattr(task, "_config", {})
             # Build filtered tool_details (name + description) for card display
             srv_cfg = mcp_configs.get(name, {}) if isinstance(mcp_configs.get(name), dict) else {}
-            tools_filter = srv_cfg.get("tools") or {}
+            tools_filter = srv_cfg.get("tools") if isinstance(srv_cfg.get("tools"), dict) else {}
+            has_include_filter = "include" in tools_filter
+            has_exclude_filter = "exclude" in tools_filter
             include_set = set(tools_filter.get("include") or [])
             exclude_set = set(tools_filter.get("exclude") or [])
             tool_details = []
             try:
                 for mcp_tool in getattr(task, "_tools", []):
                     tname = getattr(mcp_tool, "name", "?")
-                    if include_set and tname not in include_set:
+                    if has_include_filter and tname not in include_set:
                         continue
-                    if exclude_set and tname in exclude_set:
+                    if has_exclude_filter and tname in exclude_set:
                         continue
                     tool_details.append({
                         "name": tname,
@@ -2576,6 +2660,7 @@ class BridgeServer:
 
     def _mcp_tools_list(self, req: dict, profile: str, _servers, _lock) -> dict[str, Any]:
         server_filter = str(req.get("server") or "").strip() or None
+        raw_mode = bool(req.get("raw"))  # Return unfiltered tools for visibility management
         results = []
 
         config = self._read_mcp_config(profile)
@@ -2592,13 +2677,17 @@ class BridgeServer:
             registered = set(getattr(task, "_registered_tool_names", None) or [])
             tools = []
             srv_cfg = mcp_configs.get(sname, {}) if isinstance(mcp_configs.get(sname), dict) else {}
-            tools_filter = srv_cfg.get("tools") or {}
+            tools_filter = srv_cfg.get("tools") if isinstance(srv_cfg.get("tools"), dict) else {}
+            has_include_filter = "include" in tools_filter
+            has_exclude_filter = "exclude" in tools_filter
             include_set = set(tools_filter.get("include") or [])
             exclude_set = set(tools_filter.get("exclude") or [])
             def _should_include(tn):
-                if include_set:
+                if raw_mode:
+                    return True  # Skip filter in raw mode
+                if has_include_filter:
                     return tn in include_set
-                if exclude_set:
+                if has_exclude_filter:
                     return tn not in exclude_set
                 return True
             try:
@@ -2777,7 +2866,10 @@ class WorkerProcess:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                **_hidden_subprocess_kwargs(),
             )
             self._pipe_stderr()
             self._wait_ready()
@@ -2950,6 +3042,7 @@ def _windows_listening_pids_on_port(port: int) -> list[int]:
             encoding=_platform_text_encoding(),
             errors="ignore",
             timeout=5,
+            **_hidden_subprocess_kwargs(),
         )
     except Exception:
         return []
@@ -2992,6 +3085,7 @@ def _kill_windows_endpoint_occupants(endpoint: str) -> None:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                **_hidden_subprocess_kwargs(),
             )
         except Exception as exc:
             print(

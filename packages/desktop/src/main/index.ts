@@ -1,13 +1,119 @@
-import { app, BrowserWindow, Menu, shell, ipcMain } from 'electron'
+import { app, BrowserWindow, Menu, Tray, shell, ipcMain, nativeImage } from 'electron'
 import { join } from 'node:path'
 import { startWebUiServer, stopWebUiServer, getToken } from './webui-server'
-import { desktopIcon, hermesBinExists, hermesBin } from './paths'
-import { initAutoUpdater } from './updater'
+import { desktopIcon, desktopTrayTemplateIcon, desktopWindowsTrayIcon, hermesBinExists, hermesBin } from './paths'
+import { checkForDesktopUpdates, initAutoUpdater } from './updater'
+import { t } from './desktop-i18n'
+import { installHermesStudioCliShim } from './cli-shim'
+import { parseHermesCliArgs, runBundledHermesCli } from './hermes-cli'
 
 const PORT = Number(process.env.HERMES_DESKTOP_PORT) || 8748
+const START_HIDDEN = process.argv.includes('--hidden')
+const QUIT_EXISTING = process.argv.includes('--quit')
 
 let mainWindow: BrowserWindow | null = null
 let serverUrl: string | null = null
+let tray: Tray | null = null
+let isQuitting = false
+
+function showMainWindow() {
+  if (!mainWindow) {
+    createWindow()
+  }
+  if (!mainWindow) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function quitApp() {
+  isQuitting = true
+  app.quit()
+}
+
+function loginItemOptions() {
+  return {
+    path: process.execPath,
+    args: ['--hidden'],
+  }
+}
+
+function getOpenAtLogin(): boolean {
+  return app.getLoginItemSettings(loginItemOptions()).openAtLogin
+}
+
+function setOpenAtLogin(openAtLogin: boolean) {
+  app.setLoginItemSettings({
+    ...loginItemOptions(),
+    openAtLogin,
+    openAsHidden: true,
+  })
+}
+
+function updateTrayMenu() {
+  if (!tray) return
+  const isVisible = !!mainWindow && mainWindow.isVisible()
+  const menu = Menu.buildFromTemplate([
+    {
+      label: isVisible ? t('tray.hide') : t('tray.show'),
+      click: () => {
+        if (mainWindow?.isVisible()) {
+          mainWindow.hide()
+        } else {
+          showMainWindow()
+        }
+        updateTrayMenu()
+      },
+    },
+    {
+      label: t('tray.checkForUpdates'),
+      click: () => {
+        checkForDesktopUpdates(true).catch(err => {
+          console.error('[tray] update check failed:', err)
+        })
+      },
+    },
+    {
+      label: t('tray.openAtLogin'),
+      type: 'checkbox',
+      checked: getOpenAtLogin(),
+      click: (item) => {
+        setOpenAtLogin(item.checked)
+        updateTrayMenu()
+      },
+    },
+    { type: 'separator' },
+    {
+      label: t('tray.quit'),
+      click: quitApp,
+    },
+  ])
+  tray.setContextMenu(menu)
+}
+
+function createTray() {
+  if (tray) return
+  const source = process.platform === 'darwin'
+    ? desktopTrayTemplateIcon()
+    : process.platform === 'win32'
+      ? desktopWindowsTrayIcon()
+      : desktopIcon()
+  const icon = nativeImage.createFromPath(source).resize({
+    width: process.platform === 'darwin' ? 18 : process.platform === 'win32' ? 24 : 16,
+    height: process.platform === 'darwin' ? 18 : process.platform === 'win32' ? 24 : 16,
+    quality: 'best',
+  })
+  if (process.platform === 'darwin') {
+    icon.setTemplateImage(true)
+  }
+  tray = new Tray(icon)
+  tray.setToolTip('Hermes Studio')
+  tray.on('click', () => {
+    showMainWindow()
+    updateTrayMenu()
+  })
+  updateTrayMenu()
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -18,6 +124,7 @@ function createWindow() {
     title: 'Hermes Studio',
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
+    show: !START_HIDDEN,
     ...(process.platform === 'linux' ? { icon: desktopIcon() } : {}),
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.js'),
@@ -26,6 +133,16 @@ function createWindow() {
       sandbox: false,
     },
   })
+
+  mainWindow.on('close', (event) => {
+    if (isQuitting) return
+    event.preventDefault()
+    mainWindow?.hide()
+    updateTrayMenu()
+  })
+
+  mainWindow.on('show', updateTrayMenu)
+  mainWindow.on('hide', updateTrayMenu)
 
   // External links → system browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -44,6 +161,7 @@ function createWindow() {
   } else {
     mainWindow.loadURL(splashHtml())
   }
+  updateTrayMenu()
 }
 
 function splashHtml(): string {
@@ -90,44 +208,83 @@ async function bootstrap() {
 
 ipcMain.handle('hermes-desktop:get-token', () => getToken())
 
-const gotLock = app.requestSingleInstanceLock()
-if (!gotLock) {
-  app.quit()
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
+function runDesktopApp() {
+  const gotLock = app.requestSingleInstanceLock()
+  if (!gotLock) {
+    app.quit()
+    return
+  }
+
+  app.on('second-instance', (_event, argv) => {
+    if (argv.includes('--quit')) {
+      quitApp()
+      return
     }
+    showMainWindow()
   })
 
   app.whenReady().then(() => {
+    if (QUIT_EXISTING) {
+      quitApp()
+      return
+    }
+
     // Drop the default File/Edit/View/Window menu on Windows/Linux. The web
     // UI provides its own in-page controls, so the native menu bar is just
     // visual clutter. macOS keeps a menu (system requirement) but Electron's
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
+    if (app.isPackaged) {
+      installHermesStudioCliShim().then(result => {
+        if (result.status === 'skipped') {
+          console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
+        }
+      }).catch(err => {
+        console.warn(`[cli-shim] failed to install hermes-studio command: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+    createTray()
     createWindow()
     bootstrap()
-    initAutoUpdater()
+    initAutoUpdater({
+      beforeQuitAndInstall: () => {
+        isQuitting = true
+      },
+    })
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
         createWindow()
       } else if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore()
-        mainWindow.show()
-        mainWindow.focus()
+        showMainWindow()
       }
     })
   })
 
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
+    if (isQuitting && process.platform !== 'darwin') app.quit()
   })
 
   app.on('before-quit', async (e) => {
+    if (!isQuitting && process.platform !== 'darwin') {
+      e.preventDefault()
+      mainWindow?.hide()
+      updateTrayMenu()
+      return
+    }
     e.preventDefault()
     await stopWebUiServer().catch(() => undefined)
     app.exit(0)
   })
+}
+
+const hermesCliArgs = parseHermesCliArgs(process.argv)
+if (hermesCliArgs) {
+  runBundledHermesCli(hermesCliArgs)
+    .then(code => app.exit(code))
+    .catch(err => {
+      console.error(`Failed to run bundled Hermes CLI: ${err instanceof Error ? err.message : String(err)}`)
+      app.exit(1)
+    })
+} else {
+  runDesktopApp()
 }
