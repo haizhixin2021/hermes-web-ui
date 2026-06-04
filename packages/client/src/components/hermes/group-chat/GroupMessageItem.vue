@@ -7,7 +7,9 @@ import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import {
     copyTextToClipboard,
+    extractUnifiedDiffPayload,
     handleCodeBlockCopyClick,
+    isUnifiedDiffContent,
     renderHighlightedCodeBlock,
 } from '../chat/highlight'
 import { parseThinking, countThinkingChars } from '@/utils/thinking-parser'
@@ -15,7 +17,7 @@ import { useGlobalSpeech } from '@/composables/useSpeech'
 import { useVoiceSettings } from '@/composables/useVoiceSettings'
 import { speedToEdgeRate, hzToEdgePitch } from '@/utils/ttsHelpers'
 import { getDownloadUrl } from '@/api/hermes/download'
-import type { ChatMessage, RoomAgent } from '@/api/hermes/group-chat'
+import type { ChatMessage, RoomAgent, MemberInfo } from '@/api/hermes/group-chat'
 
 const TOOL_PAYLOAD_DISPLAY_LIMIT = 1000
 const JSON_STRING_DISPLAY_LIMIT = 200
@@ -28,6 +30,7 @@ const JSON_TRUNCATED_KEY = '__truncated__'
 const props = defineProps<{
     message: ChatMessage
     agents: RoomAgent[]
+    members?: MemberInfo[]
     currentUserId?: string
 }>()
 
@@ -62,6 +65,40 @@ const timeStr = computed(() => {
 
 const avatarProfileName = computed(() => agentInfo.value?.profile || props.message.senderName || props.message.senderId)
 const avatarProfile = computed(() => profilesStore.profiles.find(profile => profile.name === agentInfo.value?.profile))
+
+// 找当前消息发送者在 members 里的记录
+const memberInfo = computed(() => {
+    if (isAgent.value) return null
+    return props.members?.find(m =>
+        m.userId === props.message.senderId ||
+        m.name === props.message.senderName
+    ) || null
+})
+
+// 解析 member 的 avatar JSON
+const memberAvatar = computed(() => {
+    const av = memberInfo.value?.avatar
+    if (!av) return null
+    try {
+        const parsed = typeof av === 'string' ? JSON.parse(av) : av
+        if (parsed && parsed.type === 'image' && parsed.dataUrl) return parsed
+    } catch {}
+    return null
+})
+
+// 当前消息要显示的头像(profile / member / fallback)
+const currentAvatar = computed(() => {
+    if (isAgent.value) {
+        return avatarProfile.value?.avatar ?? null
+    }
+    return memberAvatar.value
+})
+
+// 给 ProfileAvatar 的 name seed
+const avatarDisplayName = computed(() => {
+    if (isAgent.value) return avatarProfileName.value
+    return props.message.senderName || props.message.senderId || 'user'
+})
 
 const mentionNames = computed(() => ['all', ...props.agents.map(a => a.name).filter(Boolean)])
 const parsedThinking = computed(() => parseThinking(props.message.content || '', { streaming: !!props.message.isStreaming }))
@@ -141,7 +178,7 @@ const toolExpanded = ref(false)
 const isToolMessage = computed(() => props.message.role === 'tool')
 const hasToolDetails = computed(() => !!(props.message.toolArgs || props.message.toolResult))
 const toolArgsPayload = computed(() => formatToolPayload(props.message.toolArgs))
-const toolResultPayload = computed(() => formatToolPayload(props.message.toolResult))
+const toolResultPayload = computed(() => formatToolPayload(props.message.toolResult, true))
 const fullToolArgs = computed(() => toolArgsPayload.value.full)
 const formattedToolArgs = computed(() => toolArgsPayload.value.display)
 const fullToolResult = computed(() => toolResultPayload.value.full)
@@ -237,19 +274,29 @@ function truncateJsonValue(value: unknown, marker: string): unknown {
     return { [JSON_TRUNCATED_KEY]: marker }
 }
 
-function formatToolPayload(raw?: string): ToolPayload {
+function formatToolPayload(raw?: string, extractDiff = false): ToolPayload {
     if (!raw) return { full: '', display: '' }
     try {
         const parsed = JSON.parse(raw)
         const full = JSON.stringify(parsed, null, 2)
+        const extractedDiff = extractDiff ? extractUnifiedDiffPayload(parsed) : null
+        if (extractedDiff) {
+            return {
+                full,
+                display: extractedDiff,
+                language: 'diff',
+            }
+        }
         const display = full.length > TOOL_PAYLOAD_DISPLAY_LIMIT
             ? JSON.stringify(truncateJsonValue(parsed, t('chat.truncated')), null, 2)
             : full
         return { full, display, language: 'json' }
     } catch {
+        const language = isUnifiedDiffContent(raw) ? 'diff' : undefined
         return {
             full: raw,
-            display: raw.length > TOOL_PAYLOAD_DISPLAY_LIMIT ? raw.slice(0, TOOL_PAYLOAD_DISPLAY_LIMIT) + '\n' + t('chat.truncated') : raw,
+            display: language === 'diff' || raw.length <= TOOL_PAYLOAD_DISPLAY_LIMIT ? raw : raw.slice(0, TOOL_PAYLOAD_DISPLAY_LIMIT) + '\n' + t('chat.truncated'),
+            language,
         }
     }
 }
@@ -257,6 +304,7 @@ function formatToolPayload(raw?: string): ToolPayload {
 function renderToolPayload(content: string, language?: string): string {
     return renderHighlightedCodeBlock(content, language, t('common.copy'), {
         maxHighlightLength: TOOL_PAYLOAD_DISPLAY_LIMIT,
+        formatDiffFoldLabel: (hiddenCount) => t('chat.unchangedLines', { count: hiddenCount }),
     })
 }
 
@@ -388,7 +436,7 @@ onBeforeUnmount(() => {
 <template>
     <div v-if="isToolMessage" class="group-message tool-message">
         <div class="avatar">
-            <ProfileAvatar :name="avatarProfileName" :avatar="avatarProfile?.avatar" :size="36" />
+            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
@@ -434,7 +482,7 @@ onBeforeUnmount(() => {
     <div v-else class="group-message" :class="{ agent: isAgent, self: isSelf }">
         <!-- Avatar -->
         <div class="avatar">
-            <ProfileAvatar :name="avatarProfileName" :avatar="avatarProfile?.avatar" :size="36" />
+            <ProfileAvatar :name="avatarDisplayName" :avatar="currentAvatar" :size="36" />
         </div>
 
         <div class="msg-body">
