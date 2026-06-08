@@ -12,7 +12,7 @@ import { useSessionSearch } from '@/composables/useSessionSearch'
 import { usePersistentRecord } from '@/composables/usePersistentRecord'
 import RouteLinkItem from '@/components/common/RouteLinkItem.vue'
 import { changelog } from "@/data/changelog";
-import { isStoredSuperAdmin } from "@/api/client";
+import { isStoredSuperAdmin, getStoredUsername } from "@/api/client";
 
 const { t } = useI18n();
 const message = useMessage();
@@ -27,6 +27,7 @@ const selectedKey = computed(() => {
   return route.name as string;
 });
 const isSuperAdmin = computed(() => isStoredSuperAdmin());
+const currentUsername = computed(() => getStoredUsername());
 const isVersionPreview = import.meta.env.VITE_HERMES_PREVIEW === '1';
 
 function isNavActive(...names: string[]) {
@@ -70,7 +71,7 @@ function handleReloadClient() {
 
 function handleLogout() {
   localStorage.clear();
-  router.replace({ name: 'login' });
+  window.location.reload();
 }
 
 // Changelog
@@ -345,6 +346,7 @@ function openChangelog() {
           <line x1="21" y1="12" x2="9" y2="12" />
         </svg>
         <span>{{ t("sidebar.logout") }}</span>
+        <span v-if="currentUsername" class="logout-username" :title="currentUsername">{{ currentUsername }}</span>
       </button>
       <div class="status-row">
         <div
@@ -578,9 +580,28 @@ function openChangelog() {
   font-size: 13px;
   color: $text-muted;
 
+  > svg,
+  > span:not(.logout-username) {
+    flex-shrink: 0;
+  }
+
   &:hover {
     color: $error;
     background: rgba(var(--error-rgb, 239, 68, 68), 0.06);
+  }
+
+  .logout-username {
+    margin-left: auto;
+    width: 96px;
+    min-width: 0;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+    flex: 0 1 96px;
+    font-size: 12px;
+    color: $text-muted;
   }
 }
 
