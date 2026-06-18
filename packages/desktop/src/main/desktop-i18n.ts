@@ -35,6 +35,7 @@ type TranslationKey =
   | 'desktop.downloadGithubDetail'
   | 'desktop.failedPrepareRuntime'
   | 'desktop.failedStartServices'
+  | 'desktop.shuttingDown'
   | 'runtime.checking'
   | 'runtime.downloading'
   | 'runtime.downloadingPackage'
@@ -79,6 +80,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'Use the release asset directly from GitHub.',
     'desktop.failedPrepareRuntime': 'Failed to prepare Hermes runtime',
     'desktop.failedStartServices': 'Failed to start local services',
+    'desktop.shuttingDown': 'Closing local services...',
     'runtime.checking': 'Checking Hermes runtime...',
     'runtime.downloading': 'Downloading Hermes runtime...',
     'runtime.downloadingPackage': 'Downloading {name}...',
@@ -120,6 +122,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': '直接使用 GitHub Release 资源。',
     'desktop.failedPrepareRuntime': '准备 Hermes 运行时失败',
     'desktop.failedStartServices': '启动本地服务失败',
+    'desktop.shuttingDown': '正在关闭本地服务...',
     'runtime.checking': '正在检查 Hermes 运行时...',
     'runtime.downloading': '正在下载 Hermes 运行时...',
     'runtime.downloadingPackage': '正在下载 {name}...',
@@ -161,6 +164,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': '直接使用 GitHub Release 資源。',
     'desktop.failedPrepareRuntime': '準備 Hermes 運行時失敗',
     'desktop.failedStartServices': '啟動本地服務失敗',
+    'desktop.shuttingDown': '正在關閉本地服務...',
     'runtime.checking': '正在檢查 Hermes 運行時...',
     'runtime.downloading': '正在下載 Hermes 運行時...',
     'runtime.downloadingPackage': '正在下載 {name}...',
@@ -202,6 +206,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'GitHub のリリースアセットを直接使用します。',
     'desktop.failedPrepareRuntime': 'Hermes ランタイムの準備に失敗しました',
     'desktop.failedStartServices': 'ローカルサービスの起動に失敗しました',
+    'desktop.shuttingDown': 'ローカルサービスを終了しています...',
     'runtime.checking': 'Hermes ランタイムを確認しています...',
     'runtime.downloading': 'Hermes ランタイムをダウンロードしています...',
     'runtime.downloadingPackage': '{name} をダウンロードしています...',
@@ -243,6 +248,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'GitHub 릴리스 자산을 직접 사용합니다.',
     'desktop.failedPrepareRuntime': 'Hermes 런타임 준비 실패',
     'desktop.failedStartServices': '로컬 서비스 시작 실패',
+    'desktop.shuttingDown': '로컬 서비스를 종료하는 중...',
     'runtime.checking': 'Hermes 런타임을 확인하는 중...',
     'runtime.downloading': 'Hermes 런타임을 다운로드하는 중...',
     'runtime.downloadingPackage': '{name} 다운로드 중...',
@@ -284,6 +290,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'Utilise directement l asset de release GitHub.',
     'desktop.failedPrepareRuntime': 'Echec de la preparation du runtime Hermes',
     'desktop.failedStartServices': 'Echec du demarrage des services locaux',
+    'desktop.shuttingDown': 'Fermeture des services locaux...',
     'runtime.checking': 'Verification du runtime Hermes...',
     'runtime.downloading': 'Telechargement du runtime Hermes...',
     'runtime.downloadingPackage': 'Telechargement de {name}...',
@@ -325,6 +332,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'Usa directamente el recurso de release de GitHub.',
     'desktop.failedPrepareRuntime': 'No se pudo preparar el runtime de Hermes',
     'desktop.failedStartServices': 'No se pudieron iniciar los servicios locales',
+    'desktop.shuttingDown': 'Cerrando servicios locales...',
     'runtime.checking': 'Comprobando runtime de Hermes...',
     'runtime.downloading': 'Descargando runtime de Hermes...',
     'runtime.downloadingPackage': 'Descargando {name}...',
@@ -366,6 +374,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'Verwendet das Release-Asset direkt von GitHub.',
     'desktop.failedPrepareRuntime': 'Hermes Runtime konnte nicht vorbereitet werden',
     'desktop.failedStartServices': 'Lokale Dienste konnten nicht gestartet werden',
+    'desktop.shuttingDown': 'Lokale Dienste werden beendet...',
     'runtime.checking': 'Hermes Runtime wird gepruft...',
     'runtime.downloading': 'Hermes Runtime wird heruntergeladen...',
     'runtime.downloadingPackage': '{name} wird heruntergeladen...',
@@ -407,6 +416,7 @@ const translations: Record<DesktopLocale, Record<TranslationKey, string>> = {
     'desktop.downloadGithubDetail': 'Usa diretamente o asset de release do GitHub.',
     'desktop.failedPrepareRuntime': 'Falha ao preparar o runtime Hermes',
     'desktop.failedStartServices': 'Falha ao iniciar os servicos locais',
+    'desktop.shuttingDown': 'Encerrando servicos locais...',
     'runtime.checking': 'Verificando runtime Hermes...',
     'runtime.downloading': 'Baixando runtime Hermes...',
     'runtime.downloadingPackage': 'Baixando {name}...',

@@ -1,22 +1,34 @@
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { claudeProxyMessages, claudeProxyModels, registerClaudeCodeProxyTarget } from '../../packages/server/src/services/claude-code-proxy'
-import { codexProxyModels, codexProxyResponses, registerCodexProxyTarget } from '../../packages/server/src/services/codex-proxy'
+import { dirname, join } from 'path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { claudeProxyMessages, claudeProxyModels, registerClaudeCodeProxyTarget } from '../../packages/server/src/services/agent-runner/proxies/claude-code-proxy'
+import { codexProxyModels, codexProxyResponses, registerCodexProxyTarget } from '../../packages/server/src/services/agent-runner/proxies/codex-proxy'
 import { prepareCodingAgentLaunch } from '../../packages/server/src/services/coding-agents'
 
 const homes: string[] = []
+
+function mockProcessUid(uid: number) {
+  vi.spyOn(process, 'getuid').mockReturnValue(uid)
+  vi.spyOn(process, 'geteuid').mockReturnValue(uid)
+}
 
 function makeHome() {
   const home = mkdtempSync(join(tmpdir(), 'hermes-coding-agent-launch-'))
   homes.push(home)
   process.env.HERMES_WEB_UI_HOME = home
+  process.env.HERMES_CODING_AGENT_GLOBAL_HOME = join(home, 'global-home')
   return home
 }
 
+beforeEach(() => {
+  mockProcessUid(1000)
+})
+
 afterEach(() => {
   delete process.env.HERMES_WEB_UI_HOME
+  delete process.env.HERMES_CODING_AGENT_GLOBAL_HOME
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true })
 })
@@ -54,10 +66,45 @@ describe('coding agent launch preparation', () => {
       rootDir: join(home, 'coding-agent', 'workspace', 'default', 'global'),
       workspaceDir: join(home, 'coding-agent', 'workspace', 'default', 'global'),
       command: 'claude',
-      args: [],
+      args: [
+        '--append-system-prompt-file',
+        join(home, 'global-home', '.claude', 'hermes-rules.md'),
+        '--dangerously-skip-permissions',
+      ],
       env: {},
-      shellCommand: `cd ${join(home, 'coding-agent', 'workspace', 'default', 'global')} && claude`,
-      files: [],
+      shellCommand: `cd ${join(home, 'coding-agent', 'workspace', 'default', 'global')} && claude --append-system-prompt-file ${join(home, 'global-home', '.claude', 'hermes-rules.md')} --dangerously-skip-permissions`,
+      files: [{
+        key: 'prompt',
+        path: '~/.claude/hermes-rules.md',
+        absolutePath: join(home, 'global-home', '.claude', 'hermes-rules.md'),
+      }],
+    })
+    const prompt = readFileSync(join(home, 'global-home', '.claude', 'hermes-rules.md'), 'utf-8')
+    expect(prompt).toContain('<!-- BEGIN HERMES WEB UI PROMPT -->')
+    expect(prompt).toContain('# 输出格式规范')
+  })
+
+  it('uses Claude Code auto permission mode instead of dangerous bypass when running as root', async () => {
+    mockProcessUid(0)
+    const home = makeHome()
+
+    const result = await prepareCodingAgentLaunch('claude-code', {
+      mode: 'global',
+      profile: 'default',
+    })
+
+    expect(result).toMatchObject({
+      agentId: 'claude-code',
+      mode: 'global',
+      rootDir: join(home, 'coding-agent', 'workspace', 'default', 'global'),
+      command: 'claude',
+      args: [
+        '--append-system-prompt-file',
+        join(home, 'global-home', '.claude', 'hermes-rules.md'),
+        '--permission-mode',
+        'auto',
+      ],
+      shellCommand: `cd ${join(home, 'coding-agent', 'workspace', 'default', 'global')} && claude --append-system-prompt-file ${join(home, 'global-home', '.claude', 'hermes-rules.md')} --permission-mode auto`,
     })
   })
 
@@ -85,6 +132,38 @@ describe('coding agent launch preparation', () => {
     })
   })
 
+  it('preserves existing global Claude Code prompt files while updating the Hermes block', async () => {
+    const home = makeHome()
+    const claudePromptPath = join(home, 'global-home', '.claude', 'hermes-rules.md')
+    mkdirSync(dirname(claudePromptPath), { recursive: true })
+    writeFileSync(claudePromptPath, 'Existing Claude notes\n')
+
+    await prepareCodingAgentLaunch('claude-code', { mode: 'global', profile: 'default' })
+    await prepareCodingAgentLaunch('claude-code', { mode: 'global', profile: 'default' })
+
+    const claudePrompt = readFileSync(claudePromptPath, 'utf-8')
+    expect(claudePrompt).toContain('Existing Claude notes')
+    expect(claudePrompt.match(/BEGIN HERMES WEB UI PROMPT/g)).toHaveLength(1)
+  })
+
+  it('uses a selected workspace directory when launching a coding agent', async () => {
+    const home = makeHome()
+    const workspace = join(home, 'selected workspace')
+
+    const result = await prepareCodingAgentLaunch('codex', {
+      profile: 'default',
+      provider: 'openrouter',
+      model: 'openai/gpt-oss-20b:free',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'sk-test',
+      workspace,
+    })
+
+    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openrouter', 'codex'))
+    expect(result.workspaceDir).toBe(workspace)
+    expect(result.shellCommand).toContain(workspace)
+  })
+
   it('launches Claude Code with scoped settings instead of a CLI --model override', async () => {
     const home = makeHome()
 
@@ -103,13 +182,24 @@ describe('coding agent launch preparation', () => {
       join(result.rootDir, 'settings.json'),
       '--mcp-config',
       join(result.rootDir, 'mcp.json'),
+      '--append-system-prompt-file',
+      join(result.rootDir, 'hermes-rules.md'),
+      '--dangerously-skip-permissions',
     ])
-    expect(result.shellCommand).toContain(`cd ${join(home, 'coding-agent', 'workspace', 'default', 'openrouter')} && claude`)
+    expect(result.shellCommand).toContain(`cd ${join(home, 'coding-agent', 'workspace', 'default', 'openrouter')} &&`)
+    expect(result.shellCommand).toContain(join(result.rootDir, 'launch.sh'))
+    expect(result.shellCommand).not.toContain('ANTHROPIC_API_KEY')
+    expect(result.shellCommand).not.toContain('hwui_')
     expect(result.shellCommand).not.toContain('--model')
+    const launcher = readFileSync(join(result.rootDir, 'launch.sh'), 'utf-8')
+    expect(launcher).toContain('exec claude --settings')
+    expect(launcher).toContain('--dangerously-skip-permissions')
+    expect(launcher).not.toContain('--model')
 
     const settings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
     expect(settings.model).toBe('cognitivecomputations/dolphin-mistral-24b-venice-edition:free')
     expect(settings.env.ANTHROPIC_API_KEY).toMatch(/^hwui_/)
+    expect(settings.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN')
     expect(settings.env.ANTHROPIC_BASE_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/api\/claude-code-proxy\/.+$/)
     expect(settings.env).toMatchObject({
       ANTHROPIC_MODEL: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
@@ -123,6 +213,84 @@ describe('coding agent launch preparation', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'Dolphin Mistral 24b Venice Edition:Free',
     })
     expect(settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL).not.toBe('claude-sonnet-4-6')
+
+    const mcp = JSON.parse(readFileSync(join(result.rootDir, 'mcp.json'), 'utf-8'))
+    expect(mcp.mcpServers['hermes-studio']).toMatchObject({
+      command: process.execPath,
+      args: [join(process.cwd(), 'bin/hermes-web-ui-mcp.mjs')],
+      env: {
+        HERMES_WEB_UI_URL: 'http://127.0.0.1:8648',
+        HERMES_WEB_UI_HOME: home,
+        HERMES_WEBUI_STATE_DIR: home,
+        HERMES_WEB_UI_PROFILE: 'default',
+        HERMES_MCP_SERVER_NAME: 'hermes-studio-mcp',
+        HERMES_WEB_UI_MANAGED_MCP: '1',
+      },
+    })
+
+    const prompt = readFileSync(join(result.rootDir, 'hermes-rules.md'), 'utf-8')
+    expect(prompt).toContain('# 输出格式规范')
+    expect(prompt).toContain('当你的回复中包含图片、视频或文件引用时')
+  })
+
+  it('isolates Claude Code settings for hidden chat runs only', async () => {
+    const home = makeHome()
+
+    const result = await prepareCodingAgentLaunch('claude-code', {
+      profile: 'default',
+      provider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4.6',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'sk-test',
+      isolateSettings: true,
+    })
+
+    expect(result.args).toEqual([
+      '--settings',
+      join(result.rootDir, 'settings.json'),
+      '--setting-sources',
+      'local',
+      '--mcp-config',
+      join(result.rootDir, 'mcp.json'),
+      '--append-system-prompt-file',
+      join(result.rootDir, 'hermes-rules.md'),
+      '--dangerously-skip-permissions',
+    ])
+    expect(result.shellCommand).not.toContain('--setting-sources local')
+    const launcher = readFileSync(join(result.rootDir, 'launch.sh'), 'utf-8')
+    expect(launcher).toContain('--setting-sources local')
+    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openrouter', 'claude-code'))
+  })
+
+  it('uses Claude Code auto permission mode for scoped root launches', async () => {
+    mockProcessUid(0)
+    const home = makeHome()
+
+    const result = await prepareCodingAgentLaunch('claude-code', {
+      profile: 'default',
+      provider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4.6',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'sk-test',
+      isolateSettings: true,
+    })
+
+    expect(result.args).toEqual([
+      '--settings',
+      join(result.rootDir, 'settings.json'),
+      '--setting-sources',
+      'local',
+      '--mcp-config',
+      join(result.rootDir, 'mcp.json'),
+      '--append-system-prompt-file',
+      join(result.rootDir, 'hermes-rules.md'),
+      '--permission-mode',
+      'auto',
+    ])
+    const launcher = readFileSync(join(result.rootDir, 'launch.sh'), 'utf-8')
+    expect(launcher).toContain('--permission-mode auto')
+    expect(launcher).not.toContain('--dangerously-skip-permissions')
+    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openrouter', 'claude-code'))
   })
 
   it('keeps Claude Code protocol overrides behind the local proxy', async () => {
@@ -139,6 +307,7 @@ describe('coding agent launch preparation', () => {
 
     const settings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
     expect(settings.env.ANTHROPIC_API_KEY).toMatch(/^hwui_/)
+    expect(settings.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN')
     expect(settings.env.ANTHROPIC_BASE_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/api\/claude-code-proxy\/.+$/)
   })
 
@@ -161,11 +330,26 @@ describe('coding agent launch preparation', () => {
     const config = readFileSync(join(result.rootDir, 'config.toml'), 'utf-8')
     expect(config).toContain('requires_openai_auth = false')
     expect(config).toContain(`model_catalog_json = "${join(result.rootDir, 'codex-model-catalog.json')}"`)
+    expect(config).toContain('model_reasoning_summary = "auto"')
+    expect(config).toContain('developer_instructions = """')
+    expect(config).toContain('Hermes Studio MCP usage')
+    expect(config).toContain('# 输出格式规范')
+    expect(config).toContain('[mcp_servers.hermes-studio]')
+    expect(config).toContain(`command = "${process.execPath}"`)
+    expect(config).toContain(`args = ["${join(process.cwd(), 'bin/hermes-web-ui-mcp.mjs')}"]`)
+    expect(config).toContain(`env = { HERMES_WEB_UI_URL = "http://127.0.0.1:8648", HERMES_WEB_UI_HOME = "${home}"`)
+    expect(config).toContain('HERMES_WEBUI_STATE_DIR = "')
+    expect(config).toContain('HERMES_WEB_UI_PROFILE = "default"')
+    expect(config).toContain('HERMES_MCP_SERVER_NAME = "hermes-studio-mcp"')
+    expect(config).toContain('HERMES_WEB_UI_MANAGED_MCP = "1"')
+
+    expect(result.files.some(file => file.key === 'agents')).toBe(false)
 
     const catalog = JSON.parse(readFileSync(join(result.rootDir, 'codex-model-catalog.json'), 'utf-8'))
     expect(catalog.models.some((entry: any) => entry.slug === 'openai/gpt-oss-20b:free')).toBe(true)
     expect(catalog.models[0]).toHaveProperty('base_instructions')
     expect(catalog.models[0]).toHaveProperty('model_messages')
+    expect(catalog.models[0]).toHaveProperty('default_reasoning_summary', 'auto')
   })
 
   it('points Codex Chat Completions providers at the local Responses proxy', async () => {
@@ -195,6 +379,27 @@ describe('coding agent launch preparation', () => {
     expect(deepseekModel.context_window).toBeGreaterThan(0)
     expect(deepseekModel.max_context_window).toBe(deepseekModel.context_window)
     expect(deepseekModel.model_messages.instructions_template).toContain('{{ base_instructions }}')
+  })
+
+  it('points Codex Responses providers at the local Responses proxy for stream capture', async () => {
+    const home = makeHome()
+
+    const result = await prepareCodingAgentLaunch('codex', {
+      profile: 'default',
+      provider: 'openai-api',
+      model: 'gpt-5.5',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'sk-upstream',
+      apiMode: 'codex_responses',
+      sessionId: 'chat-session-1',
+      agentSessionId: 'agent-session-1',
+    })
+
+    const config = readFileSync(join(result.rootDir, 'config.toml'), 'utf-8')
+    expect(config).toContain(`base_url = "http://127.0.0.1:8648/api/codex-proxy/`)
+    expect(config).toMatch(/experimental_bearer_token = "hwui_[^"]+"/)
+    expect(config).not.toContain('base_url = "https://api.openai.com/v1"')
+    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'openai-api', 'codex'))
   })
 
   it('points Codex Anthropic Messages providers at the local Responses proxy', async () => {
@@ -635,6 +840,30 @@ describe('coding agent launch preparation', () => {
 
     expect(chat.routeKey).not.toBe(anthropic.routeKey)
     expect(chat.token).not.toBe(anthropic.token)
+  })
+
+  it('keeps proxy routes separate for different hidden agent sessions', () => {
+    const first = registerClaudeCodeProxyTarget({
+      provider: 'same-provider',
+      model: 'same-model',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-one',
+      apiMode: 'chat_completions',
+      agentSessionId: 'agent-one',
+      chatSessionId: 'chat-one',
+    })
+    const second = registerClaudeCodeProxyTarget({
+      provider: 'same-provider',
+      model: 'same-model',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-two',
+      apiMode: 'chat_completions',
+      agentSessionId: 'agent-two',
+      chatSessionId: 'chat-two',
+    })
+
+    expect(first.routeKey).not.toBe(second.routeKey)
+    expect(first.token).not.toBe(second.token)
   })
 
   it('keeps Codex proxy routes separate for the same model with different upstream URLs', () => {

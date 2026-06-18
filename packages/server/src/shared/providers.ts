@@ -54,7 +54,9 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'anthropic',
     builtin: true,
     base_url: 'https://api.anthropic.com',
+    api_mode: 'anthropic_messages',
     models: [
+      'claude-fable-5',
       'claude-opus-4-8',
       'claude-opus-4-7',
       'claude-opus-4-6',
@@ -67,6 +69,21 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     ],
   },
   {
+    label: 'Claude OAuth',
+    value: 'claude-oauth',
+    builtin: true,
+    base_url: 'https://api.anthropic.com',
+    api_mode: 'anthropic_messages',
+    models: [
+      'claude-fable-5',
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+    ],
+  },
+  {
     label: 'Google AI Studio',
     value: 'gemini',
     builtin: true,
@@ -76,6 +93,17 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
       'gemini-3-pro-preview',
       'gemini-3-flash-preview',
       'gemini-3.1-flash-lite-preview',
+    ],
+  },
+  {
+    label: 'Google Gemini OAuth',
+    value: 'google-gemini-cli',
+    builtin: true,
+    base_url: 'cloudcode-pa://google',
+    models: [
+      'gemini-3.1-pro-preview',
+      'gemini-3-pro-preview',
+      'gemini-3-flash-preview',
     ],
   },
   {
@@ -105,6 +133,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'glm-coding-plan',
     builtin: true,
     base_url: 'https://api.z.ai/api/anthropic',
+    api_mode: 'anthropic_messages',
     models: [
       'glm-5.1',
       'glm-4.5-air',
@@ -178,6 +207,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'minimax',
     builtin: true,
     base_url: 'https://api.minimax.io/anthropic/v1',
+    api_mode: 'anthropic_messages',
     models: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2'],
   },
   {
@@ -185,6 +215,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'minimax-cn',
     builtin: true,
     base_url: 'https://api.minimaxi.com/anthropic/v1',
+    api_mode: 'anthropic_messages',
     models: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'MiniMax-M2.1', 'MiniMax-M2.1-highspeed', 'MiniMax-M2'],
   },
   {
@@ -216,6 +247,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     base_url: 'https://coding-intl.dashscope.aliyuncs.com/v1',
     models: [
       'qwen3.7-max',
+      'qwen3.7-plus',
       'qwen3.6-plus',
       'qwen3.5-plus',
       'qwen3-coder-plus',
@@ -443,6 +475,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'longcat',
     builtin: true,
     base_url: 'https://api.longcat.chat/openai',
+    api_mode: 'codex_responses',
     models: ['LongCat-Flash-Lite', 'LongCat-2.0-Preview'],
   },
   {
@@ -450,7 +483,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     value: 'openai-codex',
     builtin: true,
     base_url: 'https://chatgpt.com/backend-api/codex',
-    models: ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-codex-spark'],
+    models: ['gpt-5.5', 'gpt-5.4-mini'],
   },
   {
     label: 'OpenAI API',

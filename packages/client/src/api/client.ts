@@ -107,11 +107,45 @@ function emitAuthNotice(kind: 'expired' | 'forbidden') {
   window.dispatchEvent(new CustomEvent('hermes-auth-notice', { detail: { kind } }))
 }
 
+function messageFromErrorValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value == null) return ''
+  if (typeof value !== 'object') return String(value)
+
+  const record = value as Record<string, unknown>
+  for (const key of ['message', 'error', 'detail', 'description']) {
+    const message = messageFromErrorValue(record[key])
+    if (message) return message
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(messageFromErrorValue).filter(Boolean).join('\n')
+  }
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function responseErrorMessage(text: string, statusText: string): string {
+  const trimmed = text.trim()
+  if (!trimmed) return statusText
+  try {
+    const parsed = JSON.parse(trimmed)
+    return messageFromErrorValue(parsed) || trimmed
+  } catch {
+    return trimmed
+  }
+}
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const base = getBaseUrl()
   const url = `${base}${path}`
+  const isFormDataBody = typeof FormData !== 'undefined' && options.body instanceof FormData
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+    ...(isFormDataBody ? {} : { 'Content-Type': 'application/json' }),
     ...options.headers as Record<string, string>,
   }
 
@@ -156,7 +190,7 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
         emitAuthNotice('forbidden')
       }
     }
-    throw new Error(`API Error ${res.status}: ${text || res.statusText}`)
+    throw new Error(`API Error ${res.status}: ${responseErrorMessage(text, res.statusText)}`)
   }
 
   return res.json()

@@ -14,6 +14,7 @@ type CommandName =
   | 'status'
   | 'abort'
   | 'queue'
+  | 'skill'
   | 'plan'
   | 'goal'
   | 'subgoal'
@@ -23,6 +24,7 @@ type CommandName =
   | 'steer'
   | 'destroy'
   | 'reload-mcp'
+  | 'reload-skills'
 
 interface ParsedSessionCommand {
   name: CommandName
@@ -49,6 +51,7 @@ const COMMAND_ALIASES: Record<string, CommandName> = {
   status: 'status',
   abort: 'abort',
   queue: 'queue',
+  skill: 'skill',
   plan: 'plan',
   goal: 'goal',
   subgoal: 'subgoal',
@@ -57,8 +60,9 @@ const COMMAND_ALIASES: Record<string, CommandName> = {
   compress: 'compress',
   steer: 'steer',
   destroy: 'destroy',
-  destory: 'destroy',
   'reload-mcp': 'reload-mcp',
+  'reload-skills': 'reload-skills',
+  reload_skills: 'reload-skills',
 }
 
 export function parseSessionCommand(input: string | ContentBlock[]): ParsedSessionCommand | null {
@@ -69,7 +73,7 @@ export function parseSessionCommand(input: string | ContentBlock[]): ParsedSessi
   if (!match) return null
   const rawName = match[1].toLowerCase()
   const name = COMMAND_ALIASES[rawName]
-  if (!name) return { name: 'status', rawName, args: match[2]?.trim() || '' }
+  if (!name) return null
   return { name, rawName, args: match[2]?.trim() || '' }
 }
 
@@ -84,8 +88,8 @@ export async function handleSessionCommand(
 ): Promise<void> {
   const state = getOrCreateSession(ctx.sessionMap, sessionId)
   ctx.socket.join(`session:${sessionId}`)
-  ensureCommandSession(sessionId, ctx)
-  if (command.name !== 'plan') {
+  ensureCommandSession(sessionId, command, ctx)
+  if (command.name !== 'plan' && command.name !== 'skill') {
     persistCommandMessage(sessionId, state, `/${command.rawName}${command.args ? ` ${command.args}` : ''}`)
   }
 
@@ -101,12 +105,96 @@ export async function handleSessionCommand(
     })
   }
 
-  if (!COMMAND_ALIASES[command.rawName]) {
+  if (command.name === 'skill') {
+    const displayCommand = `/${command.rawName}${command.args ? ` ${command.args}` : ''}`
+    const skillParts = command.args.split(/\s+/, 2)
+    const skillName = skillParts[0]?.trim()
+    if (!skillName) {
+      emitCommand({
+        ok: false,
+        action: 'skill',
+        terminal: !state.isWorking,
+        message: 'Usage: /skill <skill-name> [instructions]',
+      })
+      return
+    }
+    const rest = command.args.slice(skillName.length).trim()
+    const bridgeCommand = `/${skillName}${rest ? ` ${rest}` : ''}`
+    let result
+    try {
+      result = await ctx.bridge.command(sessionId, bridgeCommand, ctx.profile)
+    } catch (err) {
+      if (state.isWorking) emitQueuedState(ctx, sessionId, state)
+      emitCommand({
+        ok: false,
+        action: 'skill',
+        terminal: !state.isWorking,
+        message: `Skill command failed: ${err instanceof Error ? err.message : String(err)}`,
+      })
+      return
+    }
+
+    const expandedPrompt = typeof result.message === 'string' ? result.message.trim() : ''
+    if (result.handled && expandedPrompt && (result.type === 'skill' || result.type === 'bundle')) {
+      logger.info(
+        '[chat-run-socket] /skill resolved session=%s profile=%s skill=%s bridge_type=%s',
+        sessionId,
+        ctx.profile,
+        skillName,
+        result.type,
+      )
+      logger.info(
+        '[chat-run-socket] /skill expanded prompt session=%s profile=%s skill=%s chars=%d expanded_prompt=%s',
+        sessionId,
+        ctx.profile,
+        skillName,
+        expandedPrompt.length,
+        expandedPrompt,
+      )
+      const next: QueuedRun = {
+        queue_id: ctx.queueId || `queue_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        input: expandedPrompt,
+        displayInput: displayCommand,
+        displayRole: 'command',
+        storageMessage: expandedPrompt,
+        model: ctx.model,
+        provider: ctx.provider,
+        model_groups: ctx.model_groups,
+        instructions: ctx.instructions,
+        profile: ctx.profile,
+        source: 'cli',
+        originSocketId: ctx.socket.id,
+      }
+
+      if (state.isWorking) {
+        state.queue.push(next)
+        emitQueuedState(ctx, sessionId, state)
+        return
+      }
+
+      emitCommand({
+        action: result.type === 'bundle' ? 'bundle' : 'skill',
+        terminal: false,
+        started: true,
+      })
+      ctx.runQueuedItem(ctx.socket, sessionId, next, ctx.profile)
+      return
+    }
+
+    logger.warn(
+      '[chat-run-socket] /skill unresolved session=%s profile=%s skill=%s bridge_type=%s message=%s',
+      sessionId,
+      ctx.profile,
+      skillName,
+      typeof result.type === 'string' ? result.type : '',
+      typeof result.message === 'string' ? result.message : '',
+    )
+    if (state.isWorking) emitQueuedState(ctx, sessionId, state)
     emitCommand({
       ok: false,
       action: 'error',
       terminal: !state.isWorking,
-      message: `Unknown bridge command: /${command.rawName}`,
+      message: result?.message || `Unknown bridge command: /${command.rawName}`,
     })
     return
   }
@@ -506,6 +594,34 @@ export async function handleSessionCommand(
       return
     }
 
+    case 'reload-skills': {
+      if (state.isWorking) {
+        emitCommand({
+          ok: false,
+          action: 'reload-skills',
+          terminal: false,
+          message: 'Skills reload can only run while the session is idle. Wait for the current run to finish or abort it first.',
+        })
+        return
+      }
+      try {
+        const result = await reloadSkillsThroughBridge(ctx, sessionId)
+        emitCommand({
+          action: 'reload-skills',
+          message: formatReloadSkillsMessage(result),
+          result,
+        })
+      } catch (err) {
+        emitCommand({
+          ok: false,
+          action: 'reload-skills',
+          terminal: !state.isWorking,
+          message: `Skills reload failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+      }
+      return
+    }
+
     case 'destroy': {
       const wasWorking = state.isWorking
       let bridgeReachable = true
@@ -650,15 +766,70 @@ function parseGoalTurnProgress(message: string): { used: number; max: number } |
   return { used, max }
 }
 
-function ensureCommandSession(sessionId: string, ctx: SessionCommandContext) {
+async function reloadSkillsThroughBridge(
+  ctx: SessionCommandContext,
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    return await ctx.bridge.reloadSkills(ctx.profile)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (!message.includes('unknown action: skills_reload')) throw err
+  }
+
+  const result = await ctx.bridge.command(sessionId, 'reload-skills', ctx.profile)
+  if (result.handled && result.action === 'reload-skills') return result
+  throw new Error(
+    'The running Agent Bridge does not support /reload-skills yet. Restart the bridge and try again.',
+  )
+}
+
+function formatReloadSkillsMessage(result: Record<string, unknown>): string {
+  const added = Array.isArray(result.added) ? result.added : []
+  const removed = Array.isArray(result.removed) ? result.removed : []
+  const total = typeof result.total === 'number' && Number.isFinite(result.total)
+    ? result.total
+    : null
+  const lines = ['Skills reloaded successfully.']
+  if (!added.length && !removed.length) {
+    lines.push(total === null ? 'No skill changes detected.' : `No skill changes detected. Total skills: ${total}.`)
+    return lines.join('\n')
+  }
+  if (added.length) {
+    lines.push('Added skills:')
+    for (const item of added) lines.push(`- ${formatReloadSkillItem(item)}`)
+  }
+  if (removed.length) {
+    lines.push('Removed skills:')
+    for (const item of removed) lines.push(`- ${formatReloadSkillItem(item)}`)
+  }
+  if (total !== null) lines.push(`Total skills: ${total}.`)
+  return lines.join('\n')
+}
+
+function formatReloadSkillItem(item: unknown): string {
+  if (!item || typeof item !== 'object') return String(item || '')
+  const record = item as Record<string, unknown>
+  const name = typeof record.name === 'string' ? record.name : ''
+  const description = typeof record.description === 'string' ? record.description : ''
+  return description ? `${name}: ${description}` : name
+}
+
+function ensureCommandSession(sessionId: string, command: ParsedSessionCommand, ctx: SessionCommandContext) {
   if (getSession(sessionId)) return
   createSession({
     id: sessionId,
     profile: ctx.profile,
     source: 'cli',
     model: ctx.model,
-    title: 'Bridge command',
+    title: buildCommandSessionTitle(command),
   })
+}
+
+function buildCommandSessionTitle(command: ParsedSessionCommand): string {
+  const prefix = `[${command.rawName}]`
+  const args = command.args.replace(/\s+/g, ' ').trim()
+  return args ? `${prefix} ${args}`.slice(0, 120) : prefix
 }
 
 function persistCommandMessage(sessionId: string, state: SessionState, content: string) {

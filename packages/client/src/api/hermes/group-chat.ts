@@ -54,6 +54,7 @@ export interface ChatMessage {
     toolPreview?: string
     toolResult?: unknown
     toolStatus?: 'running' | 'done' | 'error'
+    firstSeenAt?: number
     attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>
 }
 
@@ -83,7 +84,7 @@ export function connectGroupChat(opts?: { userId?: string; userName?: string; de
 
     const token = getApiKey()
     const userId = opts?.userId || localStorage.getItem('gc_user_id') || generateUUID()
-    localStorage.setItem('gc_user_id', userId)
+    if (!opts?.userId) localStorage.setItem('gc_user_id', userId)
 
     socket = io('/group-chat', {
         auth: {

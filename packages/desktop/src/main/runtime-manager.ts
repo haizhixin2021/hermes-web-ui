@@ -15,14 +15,15 @@ import { get as httpsGet } from 'node:https'
 import { basename, dirname, join, relative } from 'node:path'
 import { app } from 'electron'
 import {
-  bundledGit,
-  bundledNode,
-  bundledPython,
   desktopRuntimeDir,
-  hermesBinExists,
+  desktopRuntimeVersion,
   runtimePlatformKey,
+  targetDesktopRuntimeDir,
+  webUiHome,
+  webuiDir,
 } from './paths'
 import {
+  compareHermesAgentVersions,
   hermesAgentVersionFromRuntimeTag,
   runtimeManifestMatchesHermesAgentVersion,
 } from './runtime-version'
@@ -30,9 +31,10 @@ import { extractTarGzipArchive } from './runtime-archive'
 import { t } from './desktop-i18n'
 
 const DEFAULT_RUNTIME_BASE_URL = 'https://download.ekkolearnai.com'
-const DEFAULT_RUNTIME_GITHUB_REPO = 'EKKOLearnAI/hermes-web-ui'
+const DEFAULT_RUNTIME_GITHUB_REPO = 'EKKOLearnAI/hermes-studio'
 const RUNTIME_MANIFEST_NAME = 'runtime-manifest.json'
 const PACKAGED_RUNTIME_RELEASE_NAME = 'runtime-release.json'
+const ACTIVE_RUNTIME_VERSION_NAME = 'active-version.json'
 
 export type RuntimeDownloadSource = 'cf' | 'github'
 
@@ -97,8 +99,15 @@ function missingRuntimeFiles(root: string): string[] {
 }
 
 function runtimeReady(): boolean {
-  const gitReady = process.platform !== 'win32' || !!bundledGit()
-  return existsSync(bundledPython()) && hermesBinExists() && existsSync(bundledNode()) && gitReady
+  return rootRuntimeReady(desktopRuntimeDir())
+}
+
+function rootRuntimeReady(root: string): boolean {
+  const gitPath = process.platform === 'win32' ? join(root, 'git', 'cmd', 'git.exe') : null
+  return existsSync(process.platform === 'win32' ? join(root, 'python', 'python.exe') : join(root, 'python', 'bin', 'python3'))
+    && existsSync(process.platform === 'win32' ? join(root, 'python', 'Scripts', 'hermes.exe') : join(root, 'python', 'bin', 'hermes'))
+    && existsSync(process.platform === 'win32' ? join(root, 'node', 'node.exe') : join(root, 'node', 'bin', 'node'))
+    && (!gitPath || existsSync(gitPath))
 }
 
 export function isDesktopRuntimeReady(): boolean {
@@ -147,7 +156,14 @@ export function cachedRuntimeNeedsPackagedReleaseUpdate(): boolean {
     ? hermesAgentVersionFromRuntimeTag(process.env.HERMES_DESKTOP_RUNTIME_RELEASE_TAG)
     : metadata?.hermesAgentVersion || hermesAgentVersionFromRuntimeTag(metadata?.tag)
   if (!expectedVersion) return false
-  const match = runtimeManifestMatchesHermesAgentVersion(readCachedRuntimeManifest(desktopRuntimeDir()), expectedVersion)
+  const manifest = readCachedRuntimeManifest(desktopRuntimeDir())
+  const assetVersion = typeof manifest?.asset?.name === 'string'
+    ? manifest.asset.name.match(/hermes-agent-([^-]+)-/)?.[1]
+    : undefined
+  const cachedVersion = manifest?.hermesAgentVersion || assetVersion
+  const comparison = compareHermesAgentVersions(cachedVersion, expectedVersion)
+  if (comparison !== null) return comparison < 0
+  const match = runtimeManifestMatchesHermesAgentVersion(manifest, expectedVersion)
   return match === false
 }
 
@@ -234,8 +250,33 @@ function readCachedRuntimeManifest(root: string): RuntimeManifest | null {
   }
 }
 
+function webUiVersion(): string {
+  const packageJson = join(webuiDir(), 'package.json')
+  try {
+    const metadata = JSON.parse(readFileSync(packageJson, 'utf-8')) as { version?: unknown }
+    if (typeof metadata.version === 'string' && metadata.version.trim()) return metadata.version.trim()
+  } catch {}
+  return app.getVersion()
+}
+
+export function writeActiveRuntimeVersion(runtimeRoot = desktopRuntimeDir()): void {
+  const manifest = readCachedRuntimeManifest(runtimeRoot)
+  const hermesRuntimeVersion = manifest?.hermesAgentVersion || desktopRuntimeVersion()
+  const activeVersionPath = join(webUiHome(), 'desktop-runtime', ACTIVE_RUNTIME_VERSION_NAME)
+  mkdirSync(dirname(activeVersionPath), { recursive: true })
+  writeFileSync(activeVersionPath, JSON.stringify({
+    schema: 1,
+    hermesRuntimeVersion,
+    webUiVersion: webUiVersion(),
+    runtimeDirectory: runtimeRoot,
+    webUiDirectory: webuiDir(),
+    platform: runtimePlatformKey(),
+    updatedAt: new Date().toISOString(),
+  }, null, 2) + '\n')
+}
+
 function cachedRuntimeMatches(root: string, descriptor: RuntimeDescriptor): boolean {
-  if (!runtimeReady()) return false
+  if (!rootRuntimeReady(root)) return false
   const manifest = readCachedRuntimeManifest(root)
   if (!manifest?.asset?.name) return true
   return manifest.asset.name === descriptor.name
@@ -324,7 +365,7 @@ export async function ensureDesktopRuntime(
   onProgress?: RuntimeProgressHandler,
   source?: RuntimeDownloadSource,
 ): Promise<void> {
-  const runtimeRoot = desktopRuntimeDir()
+  const runtimeRoot = targetDesktopRuntimeDir()
   mkdirSync(runtimeRoot, { recursive: true })
 
   let descriptor: RuntimeDescriptor
@@ -376,5 +417,6 @@ export async function ensureDesktopRuntime(
     }, null, 2))
   }
   onProgress?.({ stage: 'ready', message: t('runtime.ready') })
+  writeActiveRuntimeVersion(runtimeRoot)
   console.log(`[runtime] Hermes runtime ready at ${runtimeRoot}`)
 }

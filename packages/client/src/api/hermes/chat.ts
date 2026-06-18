@@ -1,5 +1,6 @@
 import { io, type Socket } from 'socket.io-client'
 import { getBaseUrlValue, getApiKey } from '../client'
+import type { ProviderApiMode } from './system'
 
 export type ContentBlock =
   | { type: 'text'; text: string }
@@ -20,7 +21,21 @@ export interface StartRunRequest {
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
   queue_id?: string
-  source?: 'api_server' | 'cli'
+  source?: 'api_server' | 'cli' | 'coding_agent' | 'global_agent'
+  session_source?: 'global_agent'
+  coding_agent_id?: 'claude-code' | 'codex'
+  agent_id?: 'claude-code' | 'codex'
+  mode?: 'scoped' | 'global'
+  workspace?: string | null
+  baseUrl?: string
+  base_url?: string
+  apiKey?: string
+  api_key?: string
+  apiMode?: ProviderApiMode
+  api_mode?: ProviderApiMode
+  /** Per-session reasoning effort override.
+   * Empty/undefined = use config.yaml default. */
+  reasoning_effort?: string
 }
 
 export interface StartRunResponse {
@@ -98,6 +113,8 @@ export interface ResumeSessionPayload {
 let chatRunSocket: Socket | null = null
 let globalListenersRegistered = false
 let chatRunSocketProfile: string | null = null
+export type ChatRunTransport = 'chat-run' | 'global-agent'
+let chatRunSocketTransport: ChatRunTransport = 'chat-run'
 
 const TRANSIENT_DISCONNECT_REASONS = new Set<string>([
   'transport close',
@@ -552,8 +569,9 @@ export function respondClarify(
   sessionId: string,
   clarifyId: string,
   response: string,
+  transport: ChatRunTransport = 'chat-run',
 ): void {
-  const socket = connectChatRun()
+  const socket = connectChatRun(null, transport)
   socket.emit('clarify.respond', {
     session_id: sessionId,
     clarify_id: clarifyId,
@@ -565,8 +583,9 @@ export function respondToolApproval(
   sessionId: string,
   approvalId: string,
   choice: 'once' | 'session' | 'always' | 'deny',
+  transport: ChatRunTransport = 'chat-run',
 ): void {
-  const socket = connectChatRun()
+  const socket = connectChatRun(null, transport)
   socket.emit('approval.respond', {
     session_id: sessionId,
     approval_id: approvalId,
@@ -574,13 +593,18 @@ export function respondToolApproval(
   })
 }
 
-export function getChatRunSocket(): Socket | null {
+export function getChatRunSocket(transport?: ChatRunTransport): Socket | null {
+  if (transport && chatRunSocketTransport !== transport) return null
   return chatRunSocket
 }
 
-export function connectChatRun(requestedProfile?: string | null): Socket {
+export function connectChatRun(requestedProfile?: string | null, transport: ChatRunTransport = 'chat-run'): Socket {
   const normalizedRequestedProfile = requestedProfile?.trim() || null
-  if (chatRunSocket?.connected && (!normalizedRequestedProfile || chatRunSocketProfile === normalizedRequestedProfile)) {
+  if (
+    chatRunSocket?.connected &&
+    chatRunSocketTransport === transport &&
+    (!normalizedRequestedProfile || chatRunSocketProfile === normalizedRequestedProfile)
+  ) {
     return chatRunSocket
   }
 
@@ -608,8 +632,10 @@ export function connectChatRun(requestedProfile?: string | null): Socket {
     profile = normalizedRequestedProfile || localStorage.getItem('hermes_active_profile_name') || 'default'
   }
   chatRunSocketProfile = profile
+  chatRunSocketTransport = transport
 
-  chatRunSocket = io(`${baseUrl}/chat-run`, {
+  const namespace = transport === 'global-agent' ? '/global-agent' : '/chat-run'
+  chatRunSocket = io(`${baseUrl}${namespace}`, {
     auth: { token },
     query: { profile },
     transports: ['websocket', 'polling'],
@@ -673,6 +699,7 @@ export function disconnectChatRun(): void {
     chatRunSocket.disconnect()
     chatRunSocket = null
     chatRunSocketProfile = null
+    chatRunSocketTransport = 'chat-run'
     globalListenersRegistered = false
     sessionEventHandlers.clear()
   }
@@ -701,10 +728,16 @@ export function resumeSession(
   sessionId: string,
   onResumed: (data: ResumeSessionPayload) => void,
   profile?: string | null,
+  transport: ChatRunTransport = 'chat-run',
 ): Socket {
-  const socket = connectChatRun(profile)
+  const socket = connectChatRun(profile, transport)
 
-  socket.once('resumed', onResumed)
+  const handleResumed = (data: ResumeSessionPayload) => {
+    if (data?.session_id !== sessionId) return
+    removeSocketListener(socket, 'resumed', handleResumed)
+    onResumed(data)
+  }
+  socket.on('resumed', handleResumed)
   socket.emit('resume', { session_id: sessionId, ...(profile ? { profile } : {}) })
 
   return socket
@@ -718,6 +751,7 @@ export function startRunViaSocket(
   onStarted?: (runId: string) => void,
   options?: {
     onReconnectResume?: (data: ResumeSessionPayload) => void
+    transport?: ChatRunTransport
   },
 ): { abort: () => void } {
   const sid = body.session_id
@@ -726,7 +760,7 @@ export function startRunViaSocket(
   }
 
   let closed = false
-  const socket = connectChatRun(body.profile)
+  const socket = connectChatRun(body.profile, options?.transport)
   if (sessionEventHandlers.has(sid)) {
     socket.emit('run', body)
     return {

@@ -46,6 +46,15 @@ describe('LAN discovery', () => {
     expect(discoveryPortForHttpPort(8748)).toBe(48748)
   })
 
+  it('does not start a discovery responder for HTTP ports without a UDP mapping', () => {
+    const socket = startLanDiscoveryResponder({
+      httpPort: 54321,
+      getSystemInfo: async () => fakeInfo,
+    })
+
+    expect(socket).toBeNull()
+  })
+
   it('classifies well-known LAN endpoints', () => {
     expect(getLanEndpointKind(8648)).toBe('web')
     expect(getLanEndpointKind(8748)).toBe('desktop')
@@ -143,7 +152,7 @@ describe('LAN discovery', () => {
     expect(result.devices).toEqual([])
   })
 
-  it('registers device request routes before auth and management routes behind auth', () => {
+  it('registers device request routes before auth and management routes behind super admin auth', () => {
     const source = readFileSync('packages/server/src/routes/index.ts', 'utf8')
     const deviceRoutesSource = readFileSync('packages/server/src/routes/devices.ts', 'utf8')
     const bootstrapSource = readFileSync('packages/server/src/index.ts', 'utf8')
@@ -157,6 +166,9 @@ describe('LAN discovery', () => {
     expect(deviceIndex).toBeGreaterThanOrEqual(0)
     expect(deviceRoutesSource).toContain("devicePublicRoutes.post('/api/devices/link-status'")
     expect(deviceRoutesSource).toContain("devicePublicRoutes.get('/api/devices/link-info'")
+    expect(deviceRoutesSource).toContain("import { requireSuperAdmin }")
+    expect(deviceRoutesSource).toContain('deviceRoutes.use(requireSuperAdmin)')
+    expect(deviceRoutesSource).toContain("deviceRoutes.get('/api/devices/pairing-link'")
     expect(deviceRoutesSource).toContain("deviceRoutes.post('/api/devices/manual-request'")
     expect(deviceRoutesSource).toContain("deviceRoutes.delete('/api/devices/:id/request-history'")
     expect(deviceRoutesSource).toContain("deviceRoutes.get('/api/devices/peer-connections'")
@@ -183,7 +195,12 @@ describe('LAN discovery', () => {
 
     expect(mcpSource).toContain("name: 'hermes_lan_devices_list'")
     expect(mcpSource).toContain('online status')
+    expect(mcpSource).toContain('temporary profile token')
+    expect(mcpSource).toContain("'X-Hermes-Profile': profile")
+    expect(mcpSource).toContain('token: args.token')
+    expect(mcpSource).toContain('profile: args.profile')
+    expect(mcpSource).toContain("join(appHome(), 'profiles', segment, '.model-run-token')")
     expect(mcpSource).toContain("name: 'hermes_lan_terminal_list'")
-    expect(mcpSource).toContain('/terminals`))')
+    expect(mcpSource).toContain('/terminals`, withAuthArgs(args))')
   })
 })

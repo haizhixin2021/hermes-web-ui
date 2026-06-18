@@ -644,13 +644,9 @@ function handleSpeechToggle() {
   // MiMo TTS 模式
   if (voiceSettings.provider.value === 'mimo') {
     const apiKey = voiceSettings.mimoApiKey.value
-    if (!apiKey) {
-      console.warn('[MessageItem] MiMo TTS API Key 为空')
-      return
-    }
     speech.mimoToggle(props.message.id, content, {
       baseUrl: voiceSettings.mimoBaseUrl.value,
-      apiKey,
+      apiKey: apiKey || undefined,
       authMode: voiceSettings.mimoAuthMode.value,
       model: voiceSettings.mimoModel.value,
       voiceMode: voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voicedesign' ? 'voiceDesign' : voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voiceclone' ? 'voiceClone' : 'preset',
@@ -714,20 +710,18 @@ onMounted(() => {
         }).catch(handleAutoplayTtsError)
       } else if (voiceSettings.provider.value === 'mimo') {
         const apiKey = voiceSettings.mimoApiKey.value
-        if (apiKey) {
-          void speech.mimoPlay(props.message.id, content, {
-            baseUrl: voiceSettings.mimoBaseUrl.value,
-            apiKey,
-            authMode: voiceSettings.mimoAuthMode.value,
-            model: voiceSettings.mimoModel.value,
-            voiceMode: voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voicedesign' ? 'voiceDesign' : voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voiceclone' ? 'voiceClone' : 'preset',
-            voice: voiceSettings.mimoVoice.value,
-            voiceDesignDesc: voiceSettings.mimoVoiceDesignDesc.value || undefined,
-            voiceCloneDataUri: voiceSettings.mimoVoiceCloneDataUri.value || undefined,
-            voiceCloneFormat: voiceSettings.mimoVoiceCloneFormat.value,
-            stylePrompt: voiceSettings.mimoStylePrompt.value || undefined,
-          }).catch(handleAutoplayTtsError)
-        }
+        void speech.mimoPlay(props.message.id, content, {
+          baseUrl: voiceSettings.mimoBaseUrl.value,
+          apiKey: apiKey || undefined,
+          authMode: voiceSettings.mimoAuthMode.value,
+          model: voiceSettings.mimoModel.value,
+          voiceMode: voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voicedesign' ? 'voiceDesign' : voiceSettings.mimoModel.value === 'mimo-v2.5-tts-voiceclone' ? 'voiceClone' : 'preset',
+          voice: voiceSettings.mimoVoice.value,
+          voiceDesignDesc: voiceSettings.mimoVoiceDesignDesc.value || undefined,
+          voiceCloneDataUri: voiceSettings.mimoVoiceCloneDataUri.value || undefined,
+          voiceCloneFormat: voiceSettings.mimoVoiceCloneFormat.value,
+          stylePrompt: voiceSettings.mimoStylePrompt.value || undefined,
+        }).catch(handleAutoplayTtsError)
       } else if (voiceSettings.provider.value === 'webspeech') {
         const text = speech.extractReadableText(content)
         if (text) {
@@ -1133,12 +1127,16 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   gap: 8px;
   max-width: 85%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .msg-content {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .message-bubble {
@@ -1146,8 +1144,10 @@ onBeforeUnmount(() => {
   font-size: 14px;
   line-height: 1.65;
   word-break: break-word;
+  overflow-wrap: anywhere;
   border-radius: 10px;
   max-width: 100%;
+  min-width: 0;
   position: relative;
   box-sizing: border-box;
 
