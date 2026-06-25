@@ -21,6 +21,7 @@ import {
 import { useGlobalSpeech } from "@/composables/useSpeech";
 import { useVoiceSettings } from "@/composables/useVoiceSettings";
 import { speedToEdgeRate, hzToEdgePitch } from "@/utils/ttsHelpers";
+import { formatChatTimestamp } from "@/utils/chat-timestamp";
 
 const TOOL_PAYLOAD_DISPLAY_LIMIT = 1000;
 const JSON_STRING_DISPLAY_LIMIT = 200;
@@ -30,7 +31,7 @@ const JSON_MAX_KEYS_PER_OBJECT = 50;
 const JSON_MAX_ITEMS_PER_ARRAY = 50;
 const JSON_TRUNCATED_KEY = "__truncated__";
 
-const props = defineProps<{ message: Message; highlight?: boolean; headingIdPrefix?: string }>();
+const props = defineProps<{ message: Message; highlight?: boolean; headingIdPrefix?: string; showForkAction?: boolean }>();
 const { t } = useI18n();
 const toast = useMessage();
 
@@ -196,6 +197,11 @@ const copyableContent = computed(() => {
   return content
 })
 
+function forkFromCurrentTail() {
+  if (!props.showForkAction || chatStore.isStreaming || chatStore.isForkPending) return
+  chatStore.sendMessage('/fork')
+}
+
 async function copyBubbleContent() {
   const text = copyableContent.value
   if (!text) return
@@ -293,10 +299,7 @@ function formatDuration(ms: number): string {
   return r === 0 ? `${m}m` : `${m}m ${r}s`;
 }
 
-const timeStr = computed(() => {
-  const d = new Date(props.message.timestamp);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-});
+const timeStr = computed(() => formatChatTimestamp(props.message.timestamp));
 
 function isImage(type: string): boolean {
   return type.startsWith("image/");
@@ -568,22 +571,22 @@ const canPlaySpeech = computed(() => {
   // 只有 assistant 消息可以播放
   if (props.message.role !== 'assistant') return false
   if (!copyableContent.value) return false
-  // OpenAI / Custom / Edge / MiMo 不依赖浏览器 Web Speech API
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') return true
+  // OpenAI / Custom / Edge / MiMo / Doubao 不依赖浏览器 Web Speech API
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') return true
   return speech.isSupported
 })
 
 const isPlayingThisMessage = computed(() => {
-  // OpenAI / Custom / Edge / MiMo 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') {
+  // OpenAI / Custom / Edge / MiMo / Doubao 模式
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPlaying.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPlaying.value
 })
 
 const isPausedThisMessage = computed(() => {
-  // OpenAI / Custom / Edge / MiMo 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo') {
+  // OpenAI / Custom / Edge / MiMo / Doubao 模式
+  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPaused.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPaused.value
@@ -659,6 +662,17 @@ function handleSpeechToggle() {
     return
   }
 
+  if (voiceSettings.provider.value === 'doubao') {
+    speech.openaiToggle(props.message.id, content, {
+      provider: 'doubao',
+      baseUrl: voiceSettings.doubaoBaseUrl.value,
+      model: voiceSettings.doubaoModel.value,
+      voice: voiceSettings.doubaoVoice.value,
+      stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
+    })
+    return
+  }
+
   // Web Speech API 模式
   if (voiceSettings.provider.value === 'webspeech') {
     speech.toggleBrowser(props.message.id, content, {
@@ -721,6 +735,14 @@ onMounted(() => {
           voiceCloneDataUri: voiceSettings.mimoVoiceCloneDataUri.value || undefined,
           voiceCloneFormat: voiceSettings.mimoVoiceCloneFormat.value,
           stylePrompt: voiceSettings.mimoStylePrompt.value || undefined,
+        }).catch(handleAutoplayTtsError)
+      } else if (voiceSettings.provider.value === 'doubao') {
+        void speech.openaiPlay(props.message.id, content, {
+          provider: 'doubao',
+          baseUrl: voiceSettings.doubaoBaseUrl.value,
+          model: voiceSettings.doubaoModel.value,
+          voice: voiceSettings.doubaoVoice.value,
+          stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
         }).catch(handleAutoplayTtsError)
       } else if (voiceSettings.provider.value === 'webspeech') {
         const text = speech.extractReadableText(content)
@@ -1017,6 +1039,20 @@ onBeforeUnmount(() => {
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+            </button>
+            <button
+              v-if="showForkAction"
+              class="fork-bubble-btn"
+              @click="forkFromCurrentTail"
+              :title="t('chat.slashCommands.fork')"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="6" cy="5" r="2.25" />
+                <circle cx="18" cy="5" r="2.25" />
+                <circle cx="12" cy="19" r="2.25" />
+                <path d="M6 7.25v2.25a4 4 0 0 0 4 4h4a4 4 0 0 0 4-4V7.25" />
+                <path d="M12 13.5v3.25" />
               </svg>
             </button>
             <span class="message-time">{{ timeStr }}</span>
@@ -1433,7 +1469,8 @@ onBeforeUnmount(() => {
 }
 
 .copy-bubble-btn,
-.speech-bubble-btn {
+.speech-bubble-btn,
+.fork-bubble-btn {
   display: flex;
   align-items: center;
   justify-content: center;

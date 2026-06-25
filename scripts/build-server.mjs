@@ -1,7 +1,7 @@
 import * as esbuild from 'esbuild'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { chmodSync, cpSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs'
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf-8'))
@@ -50,3 +50,21 @@ cpSync(
   skillsOutDir,
   { recursive: true },
 )
+
+const firmwareBuildSrc = resolve(rootDir, 'packages/esp32-c3/.pio/build/esp32-c3-devkitm-1/firmware.bin')
+const firmwareReleaseSrc = resolve(rootDir, 'packages/esp32-c3/release/firmware.bin')
+const firmwareOutDir = resolve(rootDir, 'dist/mcu')
+const firmwareOutPath = resolve(firmwareOutDir, 'firmware.bin')
+if (existsSync(firmwareBuildSrc)) {
+  mkdirSync(firmwareOutDir, { recursive: true })
+  mkdirSync(dirname(firmwareReleaseSrc), { recursive: true })
+  cpSync(firmwareBuildSrc, firmwareReleaseSrc)
+  cpSync(firmwareBuildSrc, firmwareOutPath)
+  console.log('[build-server] ESP32-C3 firmware copied from PlatformIO build output')
+} else if (existsSync(firmwareReleaseSrc)) {
+  mkdirSync(firmwareOutDir, { recursive: true })
+  cpSync(firmwareReleaseSrc, firmwareOutPath)
+  console.log('[build-server] ESP32-C3 firmware copied from release artifact')
+} else {
+  console.warn('[build-server] ESP32-C3 firmware not found, skipped dist/mcu/firmware.bin')
+}

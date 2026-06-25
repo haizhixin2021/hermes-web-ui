@@ -82,6 +82,26 @@ function isUpdateCheckDisabled(): boolean {
   return raw === 'true' || raw === '1' || raw === 'on' || raw === 'yes'
 }
 
+function compareVersions(left: string, right: string): number {
+  const normalize = (value: string) => value.trim().replace(/^v/i, '').split(/[.-]/)
+  const leftParts = normalize(left)
+  const rightParts = normalize(right)
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const leftPart = leftParts[index] || '0'
+    const rightPart = rightParts[index] || '0'
+    const leftNumber = Number.parseInt(leftPart, 10)
+    const rightNumber = Number.parseInt(rightPart, 10)
+    const numeric = Number.isFinite(leftNumber) && Number.isFinite(rightNumber)
+    const diff = numeric ? leftNumber - rightNumber : leftPart.localeCompare(rightPart, undefined, { numeric: true })
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
+function isNewerVersion(candidate: string, current: string): boolean {
+  return compareVersions(candidate, current) > 0
+}
+
 export async function checkLatestVersion(): Promise<void> {
   if (isUpdateCheckDisabled()) return
   try {
@@ -91,7 +111,7 @@ export async function checkLatestVersion(): Promise<void> {
     if (res.ok) {
       const data = await res.json() as { version: string }
       cachedLatestVersion = data.version
-      if (LOCAL_VERSION && cachedLatestVersion !== LOCAL_VERSION) {
+      if (LOCAL_VERSION && cachedLatestVersion && isNewerVersion(cachedLatestVersion, LOCAL_VERSION)) {
         console.log(`Update available: ${LOCAL_VERSION} → ${cachedLatestVersion}`)
       }
     }
@@ -180,7 +200,7 @@ export async function healthCheck(ctx: any) {
     webui_latest: isUpdateCheckDisabled() ? '' : cachedLatestVersion,
     webui_update_available: isUpdateCheckDisabled()
       ? false
-      : Boolean(LOCAL_VERSION && cachedLatestVersion && cachedLatestVersion !== LOCAL_VERSION),
+      : Boolean(LOCAL_VERSION && cachedLatestVersion && isNewerVersion(cachedLatestVersion, LOCAL_VERSION)),
     node_version: process.versions.node,
     agent_bridge: agentBridge,
   }

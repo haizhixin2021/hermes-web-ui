@@ -233,6 +233,20 @@ runtime and stores Hermes Agent data in the native Hermes location:
 The desktop wrapper stores its own Web UI state separately in
 `~/.hermes-web-ui` unless `HERMES_WEB_UI_HOME` is set.
 
+After the packaged desktop app starts, it installs managed command shims so the
+desktop app, bundled Hermes Agent CLI, and bundled Web UI CLI do not conflict:
+
+| Command | Description |
+| --- | --- |
+| `hermes-studio` | Open the Hermes Studio desktop app |
+| `hermes-studio cli ...` | Run the bundled Hermes Agent CLI |
+| `hermes-studio web ...` | Run the bundled `hermes-web-ui` command |
+| `hermes-studio -h` | Show wrapper help |
+| `hermes-studio-mcp` | Run the managed Web UI MCP bridge |
+
+Use `hermes-studio cli -h` for Hermes Agent CLI help and
+`hermes-studio web -h` for Web UI CLI help.
+
 Desktop auto-updates read the latest feed from
 `https://download.ekkolearnai.com/latest` first. If that endpoint is
 unavailable, the updater falls back to
@@ -412,3 +426,7 @@ The BFF layer handles Socket.IO chat streaming, the Hermes agent bridge, profile
 ## License
 
 [BSL-1.1](./LICENSE)
+
+The license covers Hermes Studio, the former Hermes Web UI name, the
+`hermes-web-ui` npm package and CLI, desktop applications, firmware, release
+artifacts, documentation, and associated files in this repository.

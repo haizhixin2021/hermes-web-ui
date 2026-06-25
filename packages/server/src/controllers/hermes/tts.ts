@@ -1,14 +1,22 @@
 import type { Context } from 'koa'
+import { createReadStream } from 'fs'
+import { stat } from 'fs/promises'
+import { join } from 'path'
+import { config } from '../../config'
 import { textToSpeech, openaiCompatibleTts, speedToEdgeRate } from '../../services/hermes/tts'
 import { getTtsProvider } from '../../services/hermes/tts-providers'
 import { assertSafeResolvedTtsBaseUrl } from '../../services/hermes/tts-providers/url-safety'
 import {
+  assertActiveTtsProvider,
   assertStoredTtsProvider,
   clearStoredTtsSecret,
+  deleteTtsProviderSetting,
+  getActiveTtsProvider,
   getTtsProviderSetting,
   isStoredTtsProvider,
   listTtsProviderSettings,
   removeTtsBaseUrlPreset,
+  saveActiveTtsProvider,
   saveTtsProviderSetting,
   TtsSettingsValidationError,
 } from '../../db/hermes/tts-settings-store'
@@ -29,6 +37,12 @@ function authUserId(ctx: Context): number | null {
   return userId
 }
 
+function requestedProfile(ctx: Context): string {
+  const queryProfile = typeof ctx.query?.profile === 'string' ? ctx.query.profile : ''
+  const headerProfile = ctx.get?.('x-hermes-profile') || ''
+  return (ctx.state?.profile?.name || queryProfile || headerProfile || 'default').trim() || 'default'
+}
+
 function handleSettingsError(ctx: Context, error: unknown): boolean {
   if (error instanceof TtsSettingsValidationError) {
     ctx.status = 400
@@ -45,23 +59,41 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function mergeStoredTtsOptions(ctx: Context, providerName: string, options: Record<string, unknown>): Record<string, unknown> {
-  const userId = currentUserId(ctx)
-  if (!userId || !isStoredTtsProvider(providerName)) {
-    return options
-  }
-
-  const stored = getTtsProviderSetting(userId, providerName, { includeSecrets: true })
-  if (!stored) return options
-
-  const requestOptions = Object.fromEntries(
+  const nonEmptyRequestOptions = Object.fromEntries(
     Object.entries(options).filter(([, value]) => value !== '' && value !== undefined && value !== null),
   )
+  const requestOptionsWithoutApiKey = Object.fromEntries(
+    Object.entries(nonEmptyRequestOptions).filter(([key]) => key !== 'apiKey'),
+  )
+
+  const userId = currentUserId(ctx)
+  if (!userId || !isStoredTtsProvider(providerName)) {
+    return nonEmptyRequestOptions
+  }
+
+  const stored = getTtsProviderSetting(requestedProfile(ctx), providerName, { includeSecrets: true })
+  if (!stored) return nonEmptyRequestOptions
+
+  const storedSecrets = stored.secrets.apiKey
+    ? stored.secrets
+    : {
+      ...stored.secrets,
+      ...(typeof nonEmptyRequestOptions.apiKey === 'string' ? { apiKey: nonEmptyRequestOptions.apiKey } : {}),
+    }
 
   return {
     ...stored.settings,
-    ...stored.secrets,
-    ...requestOptions,
+    ...storedSecrets,
+    ...requestOptionsWithoutApiKey,
   }
+}
+
+function resolveActiveTtsProvider(profile: string, userId: number | null, settings?: ReturnType<typeof listTtsProviderSettings>) {
+  if (!userId) return 'edge'
+  const active = getActiveTtsProvider(profile)
+  if (active) return active
+  const configured = (settings ?? listTtsProviderSettings(profile)).filter(setting => setting.provider !== 'edge')
+  return configured.length === 1 ? configured[0].provider : 'edge'
 }
 
 export async function listSettings(ctx: Context) {
@@ -69,8 +101,11 @@ export async function listSettings(ctx: Context) {
   if (!userId) return
 
   try {
+    const profile = requestedProfile(ctx)
+    const settings = listTtsProviderSettings(profile)
     ctx.body = {
-      settings: listTtsProviderSettings(userId),
+      settings,
+      activeProvider: resolveActiveTtsProvider(profile, userId, settings),
     }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -83,14 +118,36 @@ export async function saveSettings(ctx: Context) {
   if (!userId) return
 
   const provider = ctx.params.provider || ''
-  const body = ctx.request.body as { settings?: unknown; secrets?: unknown } | undefined
+  const body = ctx.request.body as { settings?: unknown; secrets?: unknown; activeProvider?: unknown } | undefined
 
   try {
-    const setting = saveTtsProviderSetting(userId, assertStoredTtsProvider(provider), {
+    const profile = requestedProfile(ctx)
+    const storedProvider = assertStoredTtsProvider(provider)
+    const setting = saveTtsProviderSetting(profile, storedProvider, {
       settings: body?.settings,
       secrets: body?.secrets,
     })
-    ctx.body = { setting }
+    const activeProvider = body?.activeProvider === undefined
+      ? saveActiveTtsProvider(profile, storedProvider)
+      : saveActiveTtsProvider(profile, assertActiveTtsProvider(String(body.activeProvider)))
+
+    ctx.body = { setting, activeProvider }
+  } catch (error) {
+    if (handleSettingsError(ctx, error)) return
+    throw error
+  }
+}
+
+export async function saveActiveProvider(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId) return
+
+  const body = ctx.request.body as { provider?: unknown } | undefined
+
+  try {
+    const profile = requestedProfile(ctx)
+    const activeProvider = saveActiveTtsProvider(profile, assertActiveTtsProvider(String(body?.provider || '')))
+    ctx.body = { activeProvider }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
     throw error
@@ -110,7 +167,9 @@ export async function deleteBaseUrlPreset(ctx: Context) {
   }
 
   try {
-    const setting = removeTtsBaseUrlPreset(userId, assertStoredTtsProvider(provider), rawUrl)
+    const profile = requestedProfile(ctx)
+    const storedProvider = assertStoredTtsProvider(provider)
+    const setting = removeTtsBaseUrlPreset(profile, storedProvider, rawUrl)
     ctx.body = { success: true, setting }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
@@ -126,8 +185,36 @@ export async function deleteSecret(ctx: Context) {
   const secretName = ctx.params.secretName || ''
 
   try {
-    const setting = clearStoredTtsSecret(userId, assertStoredTtsProvider(provider), secretName)
+    const profile = requestedProfile(ctx)
+    const storedProvider = assertStoredTtsProvider(provider)
+    const setting = clearStoredTtsSecret(profile, storedProvider, secretName)
     ctx.body = { success: true, setting }
+  } catch (error) {
+    if (handleSettingsError(ctx, error)) return
+    throw error
+  }
+}
+
+export async function deleteProvider(ctx: Context) {
+  const userId = authUserId(ctx)
+  if (!userId) return
+
+  const provider = ctx.params.provider || ''
+
+  try {
+    const profile = requestedProfile(ctx)
+    const storedProvider = assertStoredTtsProvider(provider)
+    if (storedProvider === 'edge') {
+      ctx.status = 400
+      ctx.body = { error: 'built-in TTS provider cannot be deleted' }
+      return
+    }
+    const deleted = deleteTtsProviderSetting(profile, storedProvider)
+    const currentActiveProvider = getActiveTtsProvider(profile)
+    const activeProvider = currentActiveProvider === storedProvider
+      ? saveActiveTtsProvider(profile, 'edge')
+      : currentActiveProvider
+    ctx.body = { success: true, deleted, activeProvider }
   } catch (error) {
     if (handleSettingsError(ctx, error)) return
     throw error
@@ -375,9 +462,11 @@ export async function synthesize(ctx: Context) {
   }
 
   const requestOptions = asRecord(body.options)
-  const options = mergeStoredTtsOptions(ctx, body.provider || '', requestOptions)
+  const userId = currentUserId(ctx)
+  const providerName = body.provider || resolveActiveTtsProvider(requestedProfile(ctx), userId)
+  const options = mergeStoredTtsOptions(ctx, providerName, requestOptions)
 
-  const provider = getTtsProvider(body.provider || '')
+  const provider = getTtsProvider(providerName)
   if (!provider) {
     ctx.status = 400
     ctx.body = { error: 'unknown TTS provider' }
@@ -514,4 +603,30 @@ export async function openaiProxy(ctx: Context) {
   ctx.set('Content-Length', String(audio.length))
   ctx.set('X-TTS-Engine', engine)
   ctx.body = audio
+}
+
+export async function mcuAudio(ctx: Context) {
+  const file = String(ctx.params.file || '').trim()
+  if (!/^[a-f0-9-]+\.pcm$/i.test(file)) {
+    ctx.status = 404
+    ctx.body = { error: 'audio not found' }
+    return
+  }
+
+  const audioPath = join(config.appHome, 'mcu-audio', file)
+  try {
+    const info = await stat(audioPath)
+    if (!info.isFile()) {
+      ctx.status = 404
+      ctx.body = { error: 'audio not found' }
+      return
+    }
+    ctx.set('Content-Type', 'audio/x-pcm')
+    ctx.set('Content-Length', String(info.size))
+    ctx.set('Cache-Control', 'no-store')
+    ctx.body = createReadStream(audioPath)
+  } catch {
+    ctx.status = 404
+    ctx.body = { error: 'audio not found' }
+  }
 }

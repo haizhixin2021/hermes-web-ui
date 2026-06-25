@@ -3,7 +3,7 @@
   "info": {
     "title": "Hermes Studio API",
     "description": "Hermes Studio API — chat sessions, scheduled jobs, platform channels, model management, skills, memory, logs, file browser, group chat, and terminal.",
-    "version": "0.6.17"
+    "version": "0.6.20"
   },
   "servers": [
     {
@@ -484,8 +484,7 @@
                   "account",
                   "id",
                   "password",
-                  "token",
-                  "url"
+                  "token"
                 ]
               }
             }
@@ -6689,6 +6688,68 @@
         ]
       }
     },
+    "/api/hermes/mcu/audio/{file}": {
+      "get": {
+        "tags": [
+          "TTS"
+        ],
+        "summary": "Get :file",
+        "description": "GET /api/hermes/mcu/audio/:file",
+        "operationId": "mcuAudio",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "file",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/hermes/mcu/voice-turn": {
+      "post": {
+        "tags": [
+          "STT"
+        ],
+        "summary": "Create voice-turn",
+        "description": "POST /api/hermes/mcu/voice-turn",
+        "operationId": "mcuVoiceTurn",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
     "/api/hermes/media/apikey-image-generate": {
       "post": {
         "tags": [
@@ -8569,6 +8630,42 @@
         ]
       }
     },
+    "/api/hermes/sessions/count": {
+      "get": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Get count",
+        "description": "GET /api/hermes/sessions/count",
+        "operationId": "count",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/hermes/sessions/hermes": {
       "get": {
         "tags": [
@@ -9501,6 +9598,58 @@
         ]
       }
     },
+    "/api/hermes/stt/profile-status": {
+      "get": {
+        "tags": [
+          "STT"
+        ],
+        "summary": "Get profile-status",
+        "description": "GET /api/hermes/stt/profile-status",
+        "operationId": "profileStatus",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/hermes/stt/profile-status/missing-audio": {
+      "get": {
+        "tags": [
+          "STT"
+        ],
+        "summary": "Get missing-audio",
+        "description": "GET /api/hermes/stt/profile-status/missing-audio",
+        "operationId": "missingProfileAudio",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
     "/api/hermes/stt/settings": {
       "get": {
         "tags": [
@@ -9813,6 +9962,48 @@
         }
       }
     },
+    "/api/hermes/tts/settings/active": {
+      "put": {
+        "tags": [
+          "TTS"
+        ],
+        "summary": "Update active",
+        "description": "PUT /api/hermes/tts/settings/active",
+        "operationId": "saveActiveProvider",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/hermes/tts/settings/{provider}": {
       "put": {
         "tags": [
@@ -9854,6 +10045,10 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "activeProvider": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
                   "secrets": {
                     "type": "object",
                     "additionalProperties": true

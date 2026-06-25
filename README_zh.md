@@ -240,6 +240,20 @@ hermes-web-ui reset-default-login
 桌面壳自身的 Web UI 状态会单独保存到 `~/.hermes-web-ui`，除非设置了
 `HERMES_WEB_UI_HOME`。
 
+打包后的桌面应用启动后，会安装受管命令 shim，避免桌面应用、内置 Hermes Agent CLI
+和内置 Web UI CLI 的命令互相冲突：
+
+| 命令 | 说明 |
+|---|---|
+| `hermes-studio` | 打开 Hermes Studio 桌面应用 |
+| `hermes-studio cli ...` | 运行内置 Hermes Agent CLI |
+| `hermes-studio web ...` | 运行内置 `hermes-web-ui` 命令 |
+| `hermes-studio -h` | 显示 wrapper 帮助 |
+| `hermes-studio-mcp` | 运行受管 Web UI MCP bridge |
+
+使用 `hermes-studio cli -h` 查看 Hermes Agent CLI 帮助，使用
+`hermes-studio web -h` 查看 Web UI CLI 帮助。
+
 桌面自动更新会优先读取 `https://download.ekkolearnai.com/latest`。
 如果该端点不可用，更新器会回退到
 `https://github.com/EKKOLearnAI/hermes-studio/releases/latest/download`。
@@ -415,3 +429,6 @@ BFF 层负责：Socket.IO 聊天流式推送、Hermes agent bridge、按 Profile
 ## 许可证
 
 [BSL-1.1](./LICENSE)
+
+该许可证覆盖 Hermes Studio、原 Hermes Web UI 名称、`hermes-web-ui` npm 包和
+CLI、桌面应用、固件、发布产物、文档以及本仓库内的关联文件。
