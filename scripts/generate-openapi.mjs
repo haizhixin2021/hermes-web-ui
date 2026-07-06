@@ -75,6 +75,7 @@ const tagMappings = {
   'routes/hermes/runtime-versions.ts': { name: 'Runtime Versions', description: 'Runtime and Web UI version management' },
   'routes/hermes/write-gate.ts': { name: 'Write Gate', description: 'Hermes Agent write approval review' },
   'routes/hermes/performance-monitor.ts': { name: 'Performance', description: 'Runtime performance monitoring' },
+  'routes/hermes/journey.ts': { name: 'Journey', description: 'Hermes Agent learning journey graph' },
   'routes/hermes/terminal.ts': { name: 'Terminal', description: 'WebSocket terminal' },
   'routes/health.ts': { name: 'Health', description: 'Health check' },
   'routes/update.ts': { name: 'Update', description: 'Self-update management' },
@@ -607,6 +608,9 @@ function schemaFromType(type) {
   const schema = {}
 
   if (/\bnull\b/.test(normalized)) schema.nullable = true
+  if (/SessionProviderApiMode|CodingAgentApiMode/.test(normalized)) {
+    return { ...schema, type: 'string', enum: ['chat_completions', 'codex_responses', 'anthropic_messages'] }
+  }
   if (/string\[\]|Array<string>/.test(normalized)) {
     return { ...schema, type: 'array', items: { type: 'string' } }
   }

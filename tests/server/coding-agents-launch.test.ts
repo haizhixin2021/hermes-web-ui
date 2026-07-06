@@ -9,8 +9,10 @@ import { prepareCodingAgentLaunch } from '../../packages/server/src/services/cod
 const homes: string[] = []
 
 function mockProcessUid(uid: number) {
-  vi.spyOn(process, 'getuid').mockReturnValue(uid)
-  vi.spyOn(process, 'geteuid').mockReturnValue(uid)
+  vi.stubGlobal('process', Object.assign(process, {
+    getuid: vi.fn(() => uid),
+    geteuid: vi.fn(() => uid),
+  }))
 }
 
 function makeHome() {
@@ -28,6 +30,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.HERMES_WEB_UI_HOME
   delete process.env.HERMES_CODING_AGENT_GLOBAL_HOME
+  delete process.env.HERMES_AGENT_NODE
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true })
@@ -250,6 +253,32 @@ describe('coding agent launch preparation', () => {
     expect(prompt).toContain('当你的回复中包含图片、视频或文件引用时')
   })
 
+  it('uses the desktop runtime node for scoped Hermes Studio MCP configs when available', async () => {
+    const home = makeHome()
+    process.env.HERMES_AGENT_NODE = '/runtime/node'
+
+    const result = await prepareCodingAgentLaunch('claude-code', {
+      profile: 'default',
+      provider: 'openrouter',
+      model: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'sk-test',
+    })
+
+    const mcp = JSON.parse(readFileSync(join(result.rootDir, 'mcp.json'), 'utf-8'))
+    expect(mcp.mcpServers['hermes-studio-api']).toMatchObject({
+      command: '/runtime/node',
+      args: [join(process.cwd(), 'bin/hermes-studio-mcp.mjs'), 'api'],
+      env: {
+        HERMES_WEB_UI_HOME: home,
+        HERMES_MCP_SERVER_NAME: 'hermes-studio-api',
+        HERMES_MCP_TOOLSET: 'api',
+      },
+    })
+    expect(mcp.mcpServers['hermes-studio-devices'].command).toBe('/runtime/node')
+    expect(mcp.mcpServers['hermes-studio-use'].command).toBe('/runtime/node')
+  })
+
   it('cleans legacy Hermes MCP entries from scoped Claude and Codex configs', async () => {
     const home = makeHome()
     const claudeRoot = join(home, 'coding-agent', 'model', 'default', 'openrouter', 'claude-code')
@@ -467,6 +496,28 @@ describe('coding agent launch preparation', () => {
     expect(deepseekModel.context_window).toBeGreaterThan(0)
     expect(deepseekModel.max_context_window).toBe(deepseekModel.context_window)
     expect(deepseekModel.model_messages.instructions_template).toContain('{{ base_instructions }}')
+  })
+
+  it('normalizes Codex app-server provider mode to Responses for scoped Codex runs', async () => {
+    const home = makeHome()
+
+    const result = await prepareCodingAgentLaunch('codex', {
+      profile: 'default',
+      provider: 'ai-pixel.online',
+      model: 'gpt-5.5',
+      baseUrl: 'https://ai-pixel.online/v1',
+      apiKey: 'sk-upstream',
+      apiMode: 'codex_app_server' as any,
+    })
+
+    const config = readFileSync(join(result.rootDir, 'config.toml'), 'utf-8')
+    expect(config).toContain(`base_url = "http://127.0.0.1:`)
+    expect(config).toContain('/api/codex-proxy/')
+    expect(config).toContain('wire_api = "responses"')
+    expect(config).toContain('requires_openai_auth = false')
+    expect(config).toMatch(/experimental_bearer_token = "hwui_[^"]+"/)
+    expect(config).not.toContain('base_url = "https://ai-pixel.online/v1"')
+    expect(result.rootDir).toBe(join(home, 'coding-agent', 'model', 'default', 'ai-pixel.online', 'codex'))
   })
 
   it('defaults Codex providers without an api mode to Chat Completions', async () => {

@@ -313,6 +313,7 @@ Web UI 启动后端聊天能力时，会优先使用包含 `run_agent.py` 的源
 | `CORS_ORIGINS` | 仅同 host | HTTP、Socket.IO、WebSocket 跨源 allowlist，支持逗号或空格分隔。只有明确需要旧版 wildcard CORS 时才设置为 `*`。 |
 | `AUTH_TOKEN` | 自动生成 | 显式指定 bearer token。未设置时，Web UI 会在 `HERMES_WEB_UI_HOME` 下自动生成。 |
 | `AUTH_JWT_SECRET` | `AUTH_TOKEN` | 用户名/密码会话的 JWT 签名密钥覆盖。 |
+| `HERMES_WEB_UI_AUTH_JWT_EXPIRES_IN` | `30d` | 用户名/密码会话 JWT 有效期。支持秒数或 `s`/`m`/`h`/`d` 后缀，例如 `12h` 或 `7d`。 |
 | `PROFILE` | `default` | 启动/默认 Hermes profile。运行时请求使用前端当前选择且当前账号有权限访问的 Profile。 |
 | `LOG_LEVEL` | `info` | Server 日志级别。 |
 | `BRIDGE_LOG_LEVEL` | `$LOG_LEVEL` 或 `info` | Bridge 日志级别。 |
@@ -330,6 +331,7 @@ Web UI 启动后端聊天能力时，会优先使用包含 `run_agent.py` 的源
 | `HERMES_AGENT_BRIDGE_TIMEOUT_MS` | `120000` | Node 请求 bridge broker 的响应超时。 |
 | `HERMES_AGENT_BRIDGE_CONNECT_RETRY_MS` | `5000` | 连接 bridge socket 失败时的短重试窗口。 |
 | `HERMES_AGENT_BRIDGE_STARTUP_TIMEOUT_MS` | `120000` | 等待 Python bridge ready 的超时。 |
+| `HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN` | 开启 | Web UI 关闭和重启时是否停止 bridge broker；设为 `0`、`false`、`no` 或 `off` 才会在重启时保留 broker。 |
 | `HERMES_AGENT_BRIDGE_AUTO_RESTART` | 开启 | bridge broker 意外退出后是否自动重启；设为 `0`、`false`、`no` 或 `off` 可关闭。 |
 | `HERMES_AGENT_BRIDGE_RESTART_DELAY_MS` | `1000` | bridge 自动重启退避的基础延迟。 |
 | `HERMES_AGENT_BRIDGE_PLATFORM` | `cli` | 传给 Hermes Agent 的 platform 标识。 |
@@ -360,12 +362,14 @@ Web UI 启动后端聊天能力时，会优先使用包含 `run_agent.py` 的源
 | `hermes-web-ui start` | 后台启动（守护进程模式） |
 | `hermes-web-ui start --port 9000` | 自定义端口启动 |
 | `hermes-web-ui stop` | 停止后台进程 |
-| `hermes-web-ui restart` | 重启后台进程 |
+| `hermes-web-ui restart` | 重启后台进程；默认会关闭 bridge broker |
 | `hermes-web-ui status` | 查看运行状态 |
 | `hermes-web-ui update` | 更新到最新版本并重启 |
 | `hermes-web-ui upgrade` | `update` 的别名 |
 | `hermes-web-ui -v` | 显示版本号 |
 | `hermes-web-ui -h` | 显示帮助信息 |
+
+`restart`、`update` 和 `upgrade` 默认会停止 Agent Bridge broker，避免重启或更新后的服务复用旧 Python bridge 进程。只有明确希望保留 broker 和正在运行的 bridge session 时，才在重启前设置 `HERMES_AGENT_BRIDGE_STOP_ON_SHUTDOWN=0`。
 
 `update` / `upgrade` 会先尝试执行 `npm cache clean --force`，再执行 `npm install -g hermes-web-ui@latest` 并重启。缓存清理是 best-effort；如果清理失败，只提示 warning，升级安装会继续执行。
 

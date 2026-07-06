@@ -428,6 +428,62 @@ describe('hermes-web-ui MCP server', () => {
         }))
         return
       }
+      if (req.url === '/api/hermes/workflows?profile=default') {
+        res.end(JSON.stringify({ workflows: [{ id: 'workflow-1', name: 'Demo workflow', profile: 'default' }] }))
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1' && req.method === 'GET') {
+        res.end(JSON.stringify({ workflow: { id: 'workflow-1', name: 'Demo workflow', profile: 'default' } }))
+        return
+      }
+      if (req.url === '/api/hermes/workflows' && req.method === 'POST') {
+        let raw = ''
+        req.on('data', chunk => { raw += chunk })
+        req.on('end', () => {
+          res.end(JSON.stringify({ workflow: { id: 'workflow-created', body: raw ? JSON.parse(raw) : null } }))
+        })
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1' && req.method === 'PATCH') {
+        let raw = ''
+        req.on('data', chunk => { raw += chunk })
+        req.on('end', () => {
+          res.end(JSON.stringify({ workflow: { id: 'workflow-1', body: raw ? JSON.parse(raw) : null } }))
+        })
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1/runs?limit=5') {
+        res.end(JSON.stringify({ runs: [{ id: 'run-1', workflow_id: 'workflow-1', status: 'completed', node_sessions: [] }] }))
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1/run' && req.method === 'POST') {
+        let raw = ''
+        req.on('data', chunk => { raw += chunk })
+        req.on('end', () => {
+          res.end(JSON.stringify({ ok: true, status: 'accepted', body: raw ? JSON.parse(raw) : null }))
+        })
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1/runs/run-1/stop' && req.method === 'POST') {
+        res.end(JSON.stringify({ ok: true, run: { id: 'run-1', status: 'canceled' } }))
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1/runs/run-1/rerun-from-node' && req.method === 'POST') {
+        let raw = ''
+        req.on('data', chunk => { raw += chunk })
+        req.on('end', () => {
+          res.end(JSON.stringify({ ok: true, status: 'accepted', body: raw ? JSON.parse(raw) : null }))
+        })
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1/runs/run-1' && req.method === 'DELETE') {
+        res.end(JSON.stringify({ ok: true, deleted_run: 'run-1' }))
+        return
+      }
+      if (req.url === '/api/hermes/workflows/workflow-1' && req.method === 'DELETE') {
+        res.end(JSON.stringify({ ok: true, deleted_workflow: 'workflow-1' }))
+        return
+      }
       res.statusCode = 404
       res.end('{}')
     })
@@ -489,6 +545,14 @@ describe('hermes-web-ui MCP server', () => {
       name: 'hermes_studio_use_available_models',
       arguments: {},
     })
+    writeRpc(child, 30, 'tools/call', {
+      name: 'hermes_studio_use_available_models',
+      arguments: { query: 'claude', limit_per_provider: 1 },
+    })
+    writeRpc(child, 31, 'tools/call', {
+      name: 'hermes_studio_use_available_models',
+      arguments: { include_details: true },
+    })
     writeRpc(child, 13, 'tools/call', {
       name: 'hermes_studio_use_model_provider_get',
       arguments: { model: 'gpt-5.1' },
@@ -528,6 +592,53 @@ describe('hermes-web-ui MCP server', () => {
       name: 'hermes_studio_use_worker_status',
       arguments: {},
     })
+    writeRpc(child, 20, 'tools/call', {
+      name: 'hermes_studio_use_workflows_list',
+      arguments: { profile: 'default' },
+    })
+    writeRpc(child, 21, 'tools/call', {
+      name: 'hermes_studio_use_workflow_get',
+      arguments: { workflow_id: 'workflow-1' },
+    })
+    writeRpc(child, 22, 'tools/call', {
+      name: 'hermes_studio_use_workflow_create',
+      arguments: {
+        name: 'Created workflow',
+        profile: 'default',
+        workspace: '/tmp/workflow',
+        nodes: [{ id: 'node-1', type: 'agent' }],
+        edges: [],
+        viewport: { x: 1, y: 2, zoom: 0.8 },
+      },
+    })
+    writeRpc(child, 23, 'tools/call', {
+      name: 'hermes_studio_use_workflow_update',
+      arguments: { workflow_id: 'workflow-1', name: 'Updated workflow', nodes: [{ id: 'node-2' }] },
+    })
+    writeRpc(child, 24, 'tools/call', {
+      name: 'hermes_studio_use_workflow_runs_list',
+      arguments: { workflow_id: 'workflow-1', limit: 5 },
+    })
+    writeRpc(child, 25, 'tools/call', {
+      name: 'hermes_studio_use_workflow_run_start',
+      arguments: { workflow_id: 'workflow-1', start_node_ids: ['node-1'], input: 'go', timeout_ms: 1000 },
+    })
+    writeRpc(child, 26, 'tools/call', {
+      name: 'hermes_studio_use_workflow_run_stop',
+      arguments: { workflow_id: 'workflow-1', run_id: 'run-1' },
+    })
+    writeRpc(child, 27, 'tools/call', {
+      name: 'hermes_studio_use_workflow_run_rerun_from_node',
+      arguments: { workflow_id: 'workflow-1', run_id: 'run-1', node_id: 'node-2', preserve_start_node: true, timeout_ms: 2000 },
+    })
+    writeRpc(child, 28, 'tools/call', {
+      name: 'hermes_studio_use_workflow_run_delete',
+      arguments: { workflow_id: 'workflow-1', run_id: 'run-1' },
+    })
+    writeRpc(child, 29, 'tools/call', {
+      name: 'hermes_studio_use_workflow_delete',
+      arguments: { workflow_id: 'workflow-1' },
+    })
 
     const initialized = await waitForRpc(responses, 1)
     expect(initialized.result.serverInfo).toMatchObject({ toolset: 'use' })
@@ -543,8 +654,12 @@ describe('hermes-web-ui MCP server', () => {
     expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_use_provider_add')).toBe(true)
     expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_use_provider_delete')).toBe(true)
     expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_use_worker_status')).toBe(true)
+    expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_use_workflows_list')).toBe(true)
+    expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_use_workflow_run_rerun_from_node')).toBe(true)
     expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_api_request')).toBe(false)
     expect(list.result.tools.some((tool: any) => tool.name === 'hermes_studio_lan_devices_list')).toBe(false)
+    expect(list.result.tools.find((tool: any) => tool.name === 'hermes_studio_use_chat_run')?.description).toContain('internal delegation')
+    expect(list.result.tools.find((tool: any) => tool.name === 'hermes_studio_use_session_context')?.description).toContain('internal delegation')
 
     const chatRun = JSON.parse((await waitForRpc(responses, 3)).result.content[0].text)
     expect(chatRun.body).toMatchObject({ input: 'hello', session_id: 'session-1', include_events: true })
@@ -563,7 +678,30 @@ describe('hermes-web-ui MCP server', () => {
     const profiles = JSON.parse((await waitForRpc(responses, 7)).result.content[0].text)
     expect(profiles.profiles).toEqual(['default'])
     const models = JSON.parse((await waitForRpc(responses, 8)).result.content[0].text)
+    expect(models).toMatchObject({
+      default: 'gpt-5.1',
+      default_provider: 'openai',
+      provider_count: 2,
+      model_count: 3,
+      returned_model_count: 3,
+    })
     expect(models.providers[0].models).toEqual(['gpt-5.1'])
+    expect(JSON.stringify(models)).not.toContain('model_meta')
+    const filteredModels = JSON.parse((await waitForRpc(responses, 30)).result.content[0].text)
+    expect(filteredModels).toMatchObject({
+      query: 'claude',
+      returned_provider_count: 1,
+      returned_model_count: 1,
+      providers: [
+        {
+          provider: 'openrouter',
+          models: ['claude-sonnet'],
+          aliases: { 'claude-sonnet': 'Claude Sonnet' },
+        },
+      ],
+    })
+    const detailedModels = JSON.parse((await waitForRpc(responses, 31)).result.content[0].text)
+    expect(detailedModels.providers[1].model_meta).toEqual({ 'claude-sonnet': { alias: 'Claude Sonnet' } })
     const modelProvider = JSON.parse((await waitForRpc(responses, 13)).result.content[0].text)
     expect(modelProvider).toMatchObject({
       model: 'gpt-5.1',
@@ -619,6 +757,34 @@ describe('hermes-web-ui MCP server', () => {
     })
     expect(workerStatus.interacting_workers.map((worker: any) => worker.profile)).toEqual(['default'])
     expect(workerStatus.completed_workers.map((worker: any) => worker.profile)).toEqual(['research'])
+    const workflows = JSON.parse((await waitForRpc(responses, 20)).result.content[0].text)
+    expect(workflows.workflows[0]).toMatchObject({ id: 'workflow-1', profile: 'default' })
+    const workflow = JSON.parse((await waitForRpc(responses, 21)).result.content[0].text)
+    expect(workflow.workflow).toMatchObject({ id: 'workflow-1', name: 'Demo workflow' })
+    const createdWorkflow = JSON.parse((await waitForRpc(responses, 22)).result.content[0].text)
+    expect(createdWorkflow.workflow.body).toMatchObject({
+      name: 'Created workflow',
+      profile: 'default',
+      workspace: '/tmp/workflow',
+      nodes: [{ id: 'node-1', type: 'agent' }],
+      edges: [],
+      viewport: { x: 1, y: 2, zoom: 0.8 },
+    })
+    const updatedWorkflow = JSON.parse((await waitForRpc(responses, 23)).result.content[0].text)
+    expect(updatedWorkflow.workflow.body).toEqual({ name: 'Updated workflow', nodes: [{ id: 'node-2' }] })
+    const workflowRuns = JSON.parse((await waitForRpc(responses, 24)).result.content[0].text)
+    expect(workflowRuns.runs[0]).toMatchObject({ id: 'run-1', workflow_id: 'workflow-1' })
+    const startedWorkflowRun = JSON.parse((await waitForRpc(responses, 25)).result.content[0].text)
+    expect(startedWorkflowRun).toMatchObject({ ok: true, status: 'accepted' })
+    expect(startedWorkflowRun.body).toEqual({ start_node_ids: ['node-1'], input: 'go', timeout_ms: 1000 })
+    const stoppedWorkflowRun = JSON.parse((await waitForRpc(responses, 26)).result.content[0].text)
+    expect(stoppedWorkflowRun.run).toMatchObject({ id: 'run-1', status: 'canceled' })
+    const rerunWorkflowRun = JSON.parse((await waitForRpc(responses, 27)).result.content[0].text)
+    expect(rerunWorkflowRun.body).toEqual({ node_id: 'node-2', preserve_start_node: true, timeout_ms: 2000 })
+    const deletedWorkflowRun = JSON.parse((await waitForRpc(responses, 28)).result.content[0].text)
+    expect(deletedWorkflowRun).toEqual({ ok: true, deleted_run: 'run-1' })
+    const deletedWorkflow = JSON.parse((await waitForRpc(responses, 29)).result.content[0].text)
+    expect(deletedWorkflow).toEqual({ ok: true, deleted_workflow: 'workflow-1' })
 
     await new Promise<void>(resolve => server.close(() => resolve()))
   })

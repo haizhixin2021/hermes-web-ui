@@ -544,7 +544,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                 </div>
             </div>
 
-            <template v-if="hasRoom">
+            <div v-if="hasRoom" class="group-chat-surface">
                 <div class="group-message-shell">
                     <GroupMessageList />
                     <Transition name="approval-float">
@@ -611,7 +611,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </div>
                 </div>
                 <GroupChatInput ref="groupChatInputRef" @send="handleSendMessage" />
-            </template>
+            </div>
 
             <div v-else class="no-room">
                 <div class="no-room-icon">
@@ -1231,6 +1231,26 @@ export default defineComponent({ components: { CreateRoomForm } })
     position: relative;
 }
 
+.group-chat-surface {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: $bg-card;
+    animation: group-chat-surface-fade-in 1.5s ease both;
+}
+
+@keyframes group-chat-surface-fade-in {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
 .chat-main--drop-active::after {
     content: "";
     position: absolute;
@@ -1561,6 +1581,10 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 
     .header-sidebar-toggle {
+        display: none;
+    }
+
+    .room-title-text {
         display: none;
     }
 
