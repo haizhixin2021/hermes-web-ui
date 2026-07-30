@@ -13,10 +13,10 @@ vi.mock('@/router', () => ({
 }))
 
 import { getApiKey, setApiKey, clearApiKey, hasApiKey, getStoredUserRole, isStoredSuperAdmin, request } from '../../packages/client/src/api/client'
-import { getDownloadUrl } from '../../packages/client/src/api/hermes/download'
+import { downloadFile, getDownloadUrl } from '../../packages/client/src/api/hermes/download'
 import { uploadFiles } from '../../packages/client/src/api/hermes/files'
 import { importSkill } from '../../packages/client/src/api/hermes/skills'
-import { archiveSession, batchDeleteSessions, importHermesSession, unarchiveSession } from '../../packages/client/src/api/hermes/sessions'
+import { archiveSession, batchDeleteSessions, exportSession, fetchHermesSessionGroups, fetchHermesSessionPage, importHermesSession, unarchiveSession } from '../../packages/client/src/api/hermes/sessions'
 import router from '@/router'
 
 function fakeJwt(payload: Record<string, unknown>) {
@@ -224,6 +224,90 @@ describe('API Client', () => {
       expect(url.searchParams.get('path')).toBe('/tmp/100% ready.txt')
       expect(url.searchParams.get('name')).toBe('100% ready.txt')
     })
+
+    it('uses the target basename when a supplied download label has no extension', () => {
+      const url = new URL(getDownloadUrl('/tmp/report.md', '下载报告'), 'http://localhost')
+
+      expect(url.pathname).toBe('/api/hermes/download')
+      expect(url.searchParams.get('path')).toBe('/tmp/report.md')
+      expect(url.searchParams.get('name')).toBe('report.md')
+    })
+
+    it('preserves explicit custom download names that already include an extension', () => {
+      const url = new URL(getDownloadUrl('/tmp/report.md', 'custom-name.md'), 'http://localhost')
+
+      expect(url.searchParams.get('path')).toBe('/tmp/report.md')
+      expect(url.searchParams.get('name')).toBe('custom-name.md')
+    })
+
+    it('sets the browser download name from the path when the label has no extension', async () => {
+      const blob = new Blob(['report'])
+      mockFetch.mockResolvedValue({
+        ok: true,
+        blob: () => Promise.resolve(blob),
+      })
+      const createObjectUrl = vi.fn(() => 'blob:download')
+      const revokeObjectUrl = vi.fn()
+      const OriginalUrl = URL
+      class DownloadUrl extends OriginalUrl {}
+      Object.defineProperties(DownloadUrl, {
+        createObjectURL: { value: createObjectUrl },
+        revokeObjectURL: { value: revokeObjectUrl },
+      })
+      vi.stubGlobal('URL', DownloadUrl)
+      const originalCreateElement = document.createElement.bind(document)
+      const downloadAnchor = originalCreateElement('a') as HTMLAnchorElement
+      vi.spyOn(downloadAnchor, 'click').mockImplementation(() => undefined)
+      const createElementSpy = vi.spyOn(document, 'createElement').mockImplementation((tagName: string) => {
+        return tagName.toLowerCase() === 'a' ? downloadAnchor : originalCreateElement(tagName)
+      })
+
+      try {
+        await expect(downloadFile('/tmp/report.md', '下载报告')).resolves.toBeUndefined()
+        expect(downloadAnchor.download).toBe('report.md')
+        expect(revokeObjectUrl).toHaveBeenCalledWith('blob:download')
+      } finally {
+        createElementSpy.mockRestore()
+        vi.unstubAllGlobals()
+        vi.stubGlobal('fetch', mockFetch)
+      }
+    })
+
+    it('exports sessions when the response filename contains a raw percent sign', async () => {
+      const blob = new Blob(['session'])
+      mockFetch.mockResolvedValue({
+        ok: true,
+        blob: () => Promise.resolve(blob),
+        headers: new Headers({
+          'Content-Disposition': 'attachment; filename="100% ready.json"',
+        }),
+      })
+      const createObjectUrl = vi.fn(() => 'blob:session-export')
+      const revokeObjectUrl = vi.fn()
+      const OriginalUrl = URL
+      class ExportUrl extends OriginalUrl {}
+      Object.defineProperties(ExportUrl, {
+        createObjectURL: { value: createObjectUrl },
+        revokeObjectURL: { value: revokeObjectUrl },
+      })
+      vi.stubGlobal('URL', ExportUrl)
+      const originalCreateElement = document.createElement.bind(document)
+      const downloadAnchor = originalCreateElement('a') as HTMLAnchorElement
+      vi.spyOn(downloadAnchor, 'click').mockImplementation(() => undefined)
+      const createElementSpy = vi.spyOn(document, 'createElement').mockImplementation((tagName: string) => {
+        return tagName.toLowerCase() === 'a' ? downloadAnchor : originalCreateElement(tagName)
+      })
+
+      try {
+        await expect(exportSession('session-1')).resolves.toBeUndefined()
+        expect(downloadAnchor.download).toBe('100% ready.json')
+        expect(revokeObjectUrl).toHaveBeenCalledWith('blob:session-export')
+      } finally {
+        createElementSpy.mockRestore()
+        vi.unstubAllGlobals()
+        vi.stubGlobal('fetch', mockFetch)
+      }
+    })
   })
 
   describe('file upload', () => {
@@ -286,6 +370,32 @@ describe('API Client', () => {
   })
 
   describe('sessions API', () => {
+    it('requests source-group pages with pinned and routed sessions included', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ groups: [], included: [] }),
+      })
+
+      await fetchHermesSessionGroups(20, 'travel', ['pinned-1', 'route-1'])
+
+      const [url] = mockFetch.mock.calls[0]
+      expect(url).toBe('/api/hermes/sessions/hermes/groups?limit=20&profile=travel&include=pinned-1&include=route-1')
+    })
+
+    it('requests the next page for one Hermes history source', async () => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ sessions: [], hasMore: false, offset: 20, limit: 20 }),
+      })
+
+      await fetchHermesSessionPage('cli', 20, 20, 'travel')
+
+      const [url] = mockFetch.mock.calls[0]
+      expect(url).toBe('/api/hermes/sessions/hermes?source=cli&offset=20&limit=20&profile=travel')
+    })
+
     it('sends profile-qualified targets for batch deletes', async () => {
       localStorage.setItem('hermes_active_profile_name', 'research')
       mockFetch.mockResolvedValue({

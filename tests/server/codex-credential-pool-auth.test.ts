@@ -42,6 +42,7 @@ async function loadModelsController() {
   vi.resetModules()
   vi.doMock('../../packages/server/src/services/app-config', () => ({
     readAppConfig: vi.fn().mockResolvedValue({}),
+    providerDisplayLabel: (_appConfig: any, _profile: string, _providerId: string, fallback: string) => fallback,
   }))
   vi.doMock('../../packages/server/src/services/hermes/copilot-models', () => ({
     getCopilotModelsDetailed: vi.fn().mockResolvedValue([]),
@@ -62,6 +63,7 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
   beforeEach(() => {
     hermesHome = mkdtempSync(join(tmpdir(), 'hwui-codex-pool-'))
     process.env.HERMES_HOME = hermesHome
+    process.env.HERMES_WEB_UI_HOME = join(hermesHome, 'web-ui-home')
     process.env.CODEX_HOME = join(hermesHome, 'codex-home')
     writeConfigYaml('model:\n  default: gpt-5.5\n  provider: openai-codex\n')
     writeEnv('')
@@ -72,6 +74,7 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
     vi.doUnmock('../../packages/server/src/services/hermes/copilot-models')
     vi.doUnmock('../../packages/server/src/services/logger')
     delete process.env.HERMES_HOME
+    delete process.env.HERMES_WEB_UI_HOME
     delete process.env.CODEX_HOME
     if (hermesHome) rmSync(hermesHome, { recursive: true, force: true })
     hermesHome = ''

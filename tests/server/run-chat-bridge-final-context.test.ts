@@ -13,6 +13,14 @@ const updateUsageMock = vi.fn()
 const buildCompressedHistoryMock = vi.fn()
 const buildDbHistoryMock = vi.fn()
 const buildSnapshotAwareHistoryMock = vi.fn(async (_sessionId: string, _profile: string, history: any[]) => history)
+const buildDbSnapshotAwareHistoryMock = vi.fn(async (sessionId: string, profile: string, options: any, modelContext: any) => (
+  buildSnapshotAwareHistoryMock(
+    sessionId,
+    profile,
+    await buildDbHistoryMock(sessionId, options),
+    modelContext,
+  )
+))
 const pushStateMock = vi.fn()
 const replaceStateMock = vi.fn()
 const forceCompressBridgeHistoryMock = vi.fn()
@@ -40,6 +48,8 @@ const recordBridgeToolCompletedMock = vi.fn()
 const recordBridgeMoaDisplayToolMock = vi.fn()
 const resolveBridgeRunModelConfigMock = vi.fn()
 const issueModelRunJwtMock = vi.fn(async () => 'model-run-token')
+const startWorkspaceRunCheckpointMock = vi.fn()
+const completeWorkspaceRunCheckpointMock = vi.fn()
 const homes: string[] = []
 
 vi.mock('../../packages/server/src/lib/llm-prompt', () => ({
@@ -67,6 +77,7 @@ vi.mock('../../packages/server/src/services/hermes/run-chat/compression', () => 
   buildCompressedHistory: buildCompressedHistoryMock,
   buildDbHistory: buildDbHistoryMock,
   buildSnapshotAwareHistory: buildSnapshotAwareHistoryMock,
+  buildDbSnapshotAwareHistory: buildDbSnapshotAwareHistoryMock,
   pushState: pushStateMock,
   replaceState: replaceStateMock,
   forceCompressBridgeHistory: forceCompressBridgeHistoryMock,
@@ -92,6 +103,11 @@ vi.mock('../../packages/server/src/services/hermes/run-chat/bridge-message', () 
 
 vi.mock('../../packages/server/src/services/hermes/run-chat/model-config', () => ({
   resolveBridgeRunModelConfig: resolveBridgeRunModelConfigMock,
+}))
+
+vi.mock('../../packages/server/src/services/hermes/run-chat/workspace-diff-tracker', () => ({
+  startWorkspaceRunCheckpoint: startWorkspaceRunCheckpointMock,
+  completeWorkspaceRunCheckpoint: completeWorkspaceRunCheckpointMock,
 }))
 
 vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
@@ -147,6 +163,7 @@ describe('bridge run final context usage', () => {
     buildSnapshotAwareHistoryMock.mockImplementation(async (_sessionId: string, _profile: string, history: any[]) => history)
     calcAndUpdateUsageMock.mockResolvedValue({ inputTokens: 11, outputTokens: 7 })
     estimateUsageTokensFromMessagesMock.mockReturnValue({ inputTokens: 11, outputTokens: 7 })
+    completeWorkspaceRunCheckpointMock.mockReturnValue(null)
     ensureOpenBridgeAssistantMessageMock.mockImplementation((state: any, sessionId: string, runMarker: string) => {
       const existing = [...state.messages].reverse().find((message: any) => (
         message.runMarker === runMarker &&
@@ -187,6 +204,72 @@ describe('bridge run final context usage', () => {
   afterEach(() => {
     delete process.env.HERMES_WEB_UI_HOME
     for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true })
+  })
+
+  it('reopens an ended bridge session when starting a new run', async () => {
+    getSessionMock.mockReturnValue({
+      id: 'session-1',
+      profile: 'default',
+      model: 'gpt-test',
+      provider: 'openai',
+      workspace: '/tmp/hermes-bridge-final-context/default/workspace',
+      ended_at: 1_770_000_000,
+      end_reason: 'complete',
+    })
+    const emit = vi.fn()
+    const nsp = makeNamespace(emit)
+    const socket = makeSocket()
+    const state = makeState()
+    const sessionMap = new Map([['session-1', state]])
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({
+        token_count: 12345,
+        fixed_context_tokens: 12327,
+        message_count: 2,
+        tool_count: 4,
+        system_prompt_chars: 13,
+      }),
+      streamOutput: vi.fn(async function* () {
+        yield { run_id: 'run-1', done: true, status: 'completed', output: 'done' }
+      }),
+    } as any
+
+    const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+    await handleBridgeRun(
+      nsp,
+      socket,
+      { input: 'hello again', session_id: 'session-1', queue_id: 'mcu-test-run' },
+      'default',
+      sessionMap,
+      bridge,
+      false,
+      vi.fn(),
+      vi.fn(),
+    )
+
+    const reopenCallIndex = updateSessionMock.mock.calls.findIndex(([sessionId, data]) => (
+      sessionId === 'session-1' &&
+      data.ended_at === null &&
+      data.end_reason === null &&
+      typeof data.last_active === 'number'
+    ))
+    const endedCallIndex = updateSessionMock.mock.calls.findIndex(([sessionId, data]) => (
+      sessionId === 'session-1' &&
+      typeof data.ended_at === 'number' &&
+      data.end_reason === 'complete'
+    ))
+
+    expect(reopenCallIndex).toBeGreaterThanOrEqual(0)
+    expect(endedCallIndex).toBeGreaterThanOrEqual(0)
+    expect(reopenCallIndex).toBeLessThan(endedCallIndex)
+    expect(emit).toHaveBeenCalledWith('run.started', expect.objectContaining({
+      queue_id: 'mcu-test-run',
+    }))
+    expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+      output: 'done',
+      queue_id: 'mcu-test-run',
+    }))
   })
 
   it('refreshes full context tokens when a bridge run completes', async () => {
@@ -232,6 +315,14 @@ describe('bridge run final context usage', () => {
         provider: 'openai',
         workspace: '/tmp/hermes-bridge-final-context/default/workspace',
       },
+    )
+    expect(bridge.chat).toHaveBeenCalledWith(
+      'session-1',
+      'hello',
+      expect.any(Array),
+      expect.any(String),
+      'default',
+      expect.objectContaining({ background_delegation_enabled: true }),
     )
     expect(bridge.contextEstimate.mock.calls[0][2]).toContain('system prompt')
     expect(bridge.contextEstimate.mock.calls[0][2]).toContain('X-Hermes-Profile')
@@ -329,7 +420,91 @@ describe('bridge run final context usage', () => {
     )
   })
 
-  it('uses result.final_response for moa when a terminal bridge chunk has no streamed output', async () => {
+  it('seals authoritative interim assistant messages without duplicating streamed text', async () => {
+    const emit = vi.fn()
+    const nsp = makeNamespace(emit)
+    const socket = makeSocket()
+    const state = makeState()
+    flushBridgePendingToDbMock.mockImplementation((targetState: any, _sessionId: string, runMarker: string) => {
+      const message = [...targetState.messages].reverse().find((candidate: any) => (
+        candidate.runMarker === runMarker
+        && candidate.role === 'assistant'
+        && candidate.finish_reason == null
+      ))
+      if (message && String(targetState.bridgePendingAssistantContent || '').trim()) {
+        message.finish_reason = 'stop'
+      }
+      targetState.bridgePendingAssistantContent = ''
+      targetState.bridgePendingReasoningContent = ''
+    })
+    const sessionMap = new Map([['session-1', state]])
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({
+        token_count: 12345,
+        fixed_context_tokens: 12327,
+        message_count: 2,
+        tool_count: 4,
+        system_prompt_chars: 13,
+      }),
+      streamOutput: vi.fn(async function* () {
+        yield {
+          run_id: 'run-1',
+          done: false,
+          status: 'running',
+          events: [
+            { event: 'stream.delta', delta: 'partial' },
+            { event: 'message.interim', text: 'partial answer', already_streamed: true },
+            { event: 'message.interim', text: 'callback-only commentary', already_streamed: false },
+          ],
+        }
+        yield {
+          run_id: 'run-1',
+          done: true,
+          status: 'completed',
+          output: 'partialfinal answer',
+          events: [{ event: 'stream.delta', delta: 'final answer' }],
+        }
+      }),
+    } as any
+
+    const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+    await handleBridgeRun(
+      nsp,
+      socket,
+      { input: 'hello', session_id: 'session-1' },
+      'default',
+      sessionMap,
+      bridge,
+      false,
+      vi.fn(),
+      vi.fn(),
+    )
+
+    expect(state.messages.filter((message: any) => message.role === 'assistant').map((message: any) => message.content)).toEqual([
+      'partial answer',
+      'callback-only commentary',
+      'final answer',
+    ])
+    expect(state.bridgeOutput).toBe('partial answercallback-only commentaryfinal answer')
+    expect(emit.mock.calls.filter(([event]) => event === 'message.delta')).toEqual([
+      ['message.delta', expect.objectContaining({ delta: 'partial' })],
+      ['message.delta', expect.objectContaining({ delta: 'final answer' })],
+    ])
+    expect(emit).toHaveBeenCalledWith('message.interim', expect.objectContaining({
+      text: 'partial answer',
+      already_streamed: true,
+    }))
+    expect(emit).toHaveBeenCalledWith('message.interim', expect.objectContaining({
+      text: 'callback-only commentary',
+      already_streamed: false,
+    }))
+    expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+      output: 'partial answercallback-only commentaryfinal answer',
+    }))
+  })
+
+  it('uses result.final_response for moa and records only its exact model-call event', async () => {
     resolveBridgeRunModelConfigMock.mockResolvedValueOnce({ model: 'default', provider: 'moa' })
     const emit = vi.fn()
     const nsp = makeNamespace(emit)
@@ -351,7 +526,25 @@ describe('bridge run final context usage', () => {
           done: true,
           status: 'completed',
           output: '',
-          result: { final_response: '你好呀！' },
+          events: [{
+            event: 'model.usage',
+            api_request_id: 'request-1',
+            turn_id: 'turn-1',
+            api_call_count: 1,
+            model: 'moa-aggregator',
+            provider: 'openai',
+            usage: {
+              input_tokens: 120,
+              output_tokens: 30,
+              cache_read_tokens: 20,
+              cache_write_tokens: 4,
+              reasoning_tokens: 6,
+            },
+          }],
+          result: {
+            final_response: '你好呀！',
+            usage: { input_tokens: 999, output_tokens: 999 },
+          },
         }
       }),
     } as any
@@ -374,6 +567,22 @@ describe('bridge run final context usage', () => {
     expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
       output: '你好呀！',
     }))
+    expect(updateUsageMock).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      runId: 'run-1:api:request-1',
+      source: 'hermes',
+      usageScope: 'model_call',
+      apiCalls: 1,
+      inputTokens: 120,
+      outputTokens: 30,
+      cacheReadTokens: 20,
+      cacheWriteTokens: 4,
+      reasoningTokens: 6,
+      model: 'moa-aggregator',
+      provider: 'openai',
+      profile: 'default',
+      isEstimated: false,
+    }))
+    expect(updateUsageMock).toHaveBeenCalledTimes(1)
   })
 
   it('does not synthesize non-moa assistant output from result.final_response', async () => {
@@ -474,6 +683,66 @@ describe('bridge run final context usage', () => {
     }))
     expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
       output: 'partial reply',
+      inputTokens: 11,
+      outputTokens: 7,
+      contextTokens: 12345,
+    }))
+  })
+
+  it('releases workflow state without judging goals when the bridge stream ends without a terminal chunk', async () => {
+    const emit = vi.fn()
+    const nsp = makeNamespace(emit)
+    const socket = makeSocket()
+    const state = makeState()
+    const sessionMap = new Map([['session-1', state]])
+    const goalEvaluate = vi.fn(async () => {
+      throw new Error('workflow synthetic completion must not judge standing goals')
+    })
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({
+        token_count: 12345,
+        fixed_context_tokens: 12327,
+        message_count: 2,
+        tool_count: 4,
+        system_prompt_chars: 13,
+      }),
+      streamOutput: vi.fn(async function* () {
+        yield {
+          run_id: 'run-1',
+          session_id: 'session-1',
+          done: false,
+          status: 'running',
+          delta: 'partial workflow reply',
+          cursor: 1,
+          output: 'partial workflow reply',
+          events: [],
+          event_cursor: 0,
+        }
+      }),
+      goalEvaluate,
+    } as any
+
+    const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+    await handleBridgeRun(
+      nsp,
+      socket,
+      { input: 'hello', session_id: 'session-1', source: 'workflow' },
+      'default',
+      sessionMap,
+      bridge,
+      false,
+      vi.fn(),
+      vi.fn(),
+    )
+
+    expect(state.isWorking).toBe(false)
+    expect(state.isAborting).toBe(false)
+    expect(state.runId).toBeUndefined()
+    expect(state.activeRunMarker).toBeUndefined()
+    expect(goalEvaluate).not.toHaveBeenCalled()
+    expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+      output: 'partial workflow reply',
       inputTokens: 11,
       outputTokens: 7,
       contextTokens: 12345,
@@ -599,6 +868,7 @@ describe('bridge run final context usage', () => {
         session_id: 'workflow-session',
         source: 'workflow',
         workspace: '/tmp/hermes-workflow-workspace',
+        background_delegation_enabled: false,
       },
       'default',
       sessionMap,
@@ -619,10 +889,189 @@ describe('bridge run final context usage', () => {
       expect.any(Array),
       expect.any(String),
       'default',
-      expect.objectContaining({ workspace: '/tmp/hermes-workflow-workspace' }),
+      expect.objectContaining({
+        workspace: '/tmp/hermes-workflow-workspace',
+        background_delegation_enabled: false,
+      }),
     )
     expect(state.source).toBe('workflow')
   })
+
+  it('does not evaluate standing goals after a workflow run with no queued continuation', async () => {
+    const emit = vi.fn()
+    const nsp = makeNamespace(emit)
+    const socket = makeSocket()
+    const state = makeState()
+    const sessionMap = new Map([['workflow-session', state]])
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-workflow', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({
+        token_count: 42,
+        message_count: 1,
+        tool_count: 0,
+        system_prompt_chars: 13,
+      }),
+      goalEvaluate: vi.fn().mockRejectedValue(new Error('workflow must not evaluate standing goals')),
+      streamOutput: vi.fn(async function* () {
+        yield {
+          run_id: 'run-workflow',
+          done: true,
+          status: 'completed',
+          output: 'workflow node complete',
+          result: { final_response: 'workflow node complete' },
+        }
+      }),
+    } as any
+
+    const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+    await handleBridgeRun(
+      nsp,
+      socket,
+      { input: 'run workflow node', session_id: 'workflow-session', source: 'workflow' },
+      'default',
+      sessionMap,
+      bridge,
+      false,
+      vi.fn(),
+      vi.fn(),
+    )
+
+    expect(bridge.goalEvaluate).not.toHaveBeenCalled()
+    expect(state.queue).toEqual([])
+    expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+      output: 'workflow node complete',
+    }))
+  })
+
+  it.each(['cli', 'global_agent'] as const)(
+    'does not evaluate standing goals after a workflow run when a %s continuation is queued',
+    async (nextSource) => {
+      const emit = vi.fn()
+      const nsp = makeNamespace(emit)
+      const socket = makeSocket()
+      const state = makeState()
+      // Mark the queued item as an internal continuation so hasRealQueuedRun()
+      // cannot hide a regression in the completed-run source decision.
+      state.queue.push({
+        queue_id: `next-${nextSource}`,
+        input: 'queued continuation',
+        profile: 'default',
+        source: nextSource,
+        goalContinuation: true,
+      })
+      const sessionMap = new Map([['workflow-session', state]])
+      const dequeueNextQueuedRun = vi.fn()
+      const bridge = {
+        chat: vi.fn().mockResolvedValue({ run_id: 'run-workflow', status: 'started' }),
+        contextEstimate: vi.fn().mockResolvedValue({
+          token_count: 42,
+          message_count: 1,
+          tool_count: 0,
+          system_prompt_chars: 13,
+        }),
+        goalEvaluate: vi.fn().mockRejectedValue(new Error('workflow must not evaluate standing goals')),
+        streamOutput: vi.fn(async function* () {
+          yield {
+            run_id: 'run-workflow',
+            done: true,
+            status: 'completed',
+            output: 'workflow node complete',
+            result: { final_response: 'workflow node complete' },
+          }
+        }),
+      } as any
+
+      const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+      await handleBridgeRun(
+        nsp,
+        socket,
+        { input: 'run workflow node', session_id: 'workflow-session', source: 'workflow' },
+        'default',
+        sessionMap,
+        bridge,
+        false,
+        vi.fn(),
+        dequeueNextQueuedRun,
+      )
+
+      expect(bridge.goalEvaluate).not.toHaveBeenCalled()
+      expect(state.source).toBe(nextSource)
+      expect(dequeueNextQueuedRun).toHaveBeenCalledWith(socket, 'workflow-session')
+      expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+        output: 'workflow node complete',
+      }))
+      expect(emit).not.toHaveBeenCalledWith('run.failed', expect.anything())
+    },
+  )
+
+  it.each(['cli', 'global_agent'] as const)(
+    'evaluates standing goals for a completed %s run even when a workflow continuation is queued',
+    async (runSource) => {
+      const emit = vi.fn()
+      const nsp = makeNamespace(emit)
+      const socket = makeSocket()
+      const state = makeState()
+      // Keep the queued Workflow item internal so the real-queue guard cannot
+      // bypass the completed ordinary run's standing-goal evaluation.
+      state.queue.push({
+        queue_id: 'next-workflow',
+        input: 'queued workflow continuation',
+        profile: 'default',
+        source: 'workflow',
+        goalContinuation: true,
+      })
+      const sessionMap = new Map([['ordinary-session', state]])
+      const dequeueNextQueuedRun = vi.fn()
+      const bridge = {
+        chat: vi.fn().mockResolvedValue({ run_id: `run-${runSource}`, status: 'started' }),
+        contextEstimate: vi.fn().mockResolvedValue({
+          token_count: 42,
+          message_count: 1,
+          tool_count: 0,
+          system_prompt_chars: 13,
+        }),
+        goalEvaluate: vi.fn().mockResolvedValue({
+          handled: true,
+          should_continue: true,
+          continuation_prompt: 'continue ordinary standing goal',
+        }),
+        streamOutput: vi.fn(async function* () {
+          yield {
+            run_id: `run-${runSource}`,
+            done: true,
+            status: 'completed',
+            output: 'ordinary chat complete',
+            result: { final_response: 'ordinary chat complete' },
+          }
+        }),
+      } as any
+
+      const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+      await handleBridgeRun(
+        nsp,
+        socket,
+        { input: 'continue chat', session_id: 'ordinary-session', source: runSource },
+        'default',
+        sessionMap,
+        bridge,
+        false,
+        vi.fn(),
+        dequeueNextQueuedRun,
+      )
+
+      expect(bridge.goalEvaluate).toHaveBeenCalledWith('ordinary-session', 'ordinary chat complete', 'default')
+      expect(state.queue).toEqual([
+        expect.objectContaining({ source: 'workflow' }),
+        expect.objectContaining({
+          input: 'continue ordinary standing goal',
+          source: runSource,
+          goalContinuation: true,
+        }),
+      ])
+      expect(state.source).toBe('workflow')
+      expect(dequeueNextQueuedRun).toHaveBeenCalledWith(socket, 'ordinary-session')
+    },
+  )
 
   it('evaluates active goals after a successful bridge run and queues continuation prompts', async () => {
     const emit = vi.fn()
@@ -949,6 +1398,105 @@ describe('bridge run final context usage', () => {
       output: 'Text [Call',
     }))
   })
+
+  it.each(['terminal', 'write_file'])(
+    'attributes native Hermes Agent %s workspace changes to the final persisted assistant row',
+    async (toolName) => {
+      const emit = vi.fn()
+      const nsp = makeNamespace(emit)
+      const socket = makeSocket()
+      const state = makeState()
+      const sessionMap = new Map([['session-1', state]])
+      const change = {
+        change_id: `run:run-1:${toolName}`,
+        assistant_message_id: '73',
+        session_id: 'session-1',
+        run_id: 'run-1',
+        source: 'run',
+        files: [],
+      }
+      recordBridgeToolStartedMock.mockReturnValue({
+        id: `call-${toolName}`,
+        name: toolName,
+        arguments: '{}',
+      })
+      recordBridgeToolCompletedMock.mockReturnValue({
+        id: `call-${toolName}`,
+        output: 'ok',
+      })
+      flushBridgePendingToDbMock.mockImplementation((targetState: any) => {
+        if (String(targetState.bridgePendingAssistantContent || '').trim()) {
+          targetState.bridgePendingAssistantContent = ''
+          targetState.bridgeAssistantMessageId = '73'
+        }
+        return targetState.bridgeAssistantMessageId
+      })
+      completeWorkspaceRunCheckpointMock.mockReturnValue(change)
+      const bridge = {
+        chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+        contextEstimate: vi.fn().mockResolvedValue({
+          token_count: 12345,
+          message_count: 2,
+          tool_count: 4,
+          system_prompt_chars: 13,
+        }),
+        streamOutput: vi.fn(async function* () {
+          yield {
+            run_id: 'run-1',
+            done: false,
+            status: 'running',
+            events: [
+              { event: 'tool.started', tool_name: toolName, tool_call_id: `call-${toolName}`, args: {} },
+              { event: 'tool.completed', tool_name: toolName, tool_call_id: `call-${toolName}`, result: 'ok' },
+            ],
+          }
+          yield { run_id: 'run-1', done: true, status: 'completed', delta: 'Done.', output: 'Done.', events: [] }
+        }),
+      } as any
+
+      const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+      await handleBridgeRun(
+        nsp,
+        socket,
+        { input: 'update the workspace', session_id: 'session-1' },
+        'default',
+        sessionMap,
+        bridge,
+        false,
+        vi.fn(),
+        vi.fn(),
+      )
+
+      expect(recordBridgeToolStartedMock).toHaveBeenCalledWith(
+        state,
+        'session-1',
+        expect.any(String),
+        toolName,
+        {},
+        `call-${toolName}`,
+      )
+      expect(recordBridgeToolCompletedMock).toHaveBeenCalledWith(
+        state,
+        'session-1',
+        expect.any(String),
+        toolName,
+        expect.objectContaining({ event: 'tool.completed' }),
+      )
+      expect(startWorkspaceRunCheckpointMock).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'session-1',
+        runId: 'run-1',
+      }))
+      expect(completeWorkspaceRunCheckpointMock).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'session-1',
+        runId: 'run-1',
+        assistantMessageId: '73',
+      }))
+      expect(emit).toHaveBeenCalledWith('workspace.diff.completed', expect.objectContaining({ change }))
+      expect(emit).toHaveBeenCalledWith('run.completed', expect.objectContaining({
+        workspace_run_change: change,
+      }))
+    },
+  )
 
   it('persists the visible plan command instead of the expanded skill prompt', async () => {
     const emit = vi.fn()

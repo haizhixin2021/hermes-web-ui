@@ -25,19 +25,36 @@ import { VOICE_API_PRESETS } from '@/constants/voiceApiPresets'
 import type { VoiceApiConnection, VoiceApiKind, VoiceApiProvider, VoiceApiSavePayload } from '@/types/voice-api'
 
 function isStoredSttProvider(provider: VoiceApiProvider): provider is StoredSttProvider {
-  return provider === 'openai' || provider === 'custom' || provider === 'doubao'
+  return provider === 'openai' ||
+    provider === 'custom' ||
+    provider === 'doubao' ||
+    provider === 'groq' ||
+    provider === 'mistral' ||
+    provider === 'xai' ||
+    provider === 'elevenlabs' ||
+    provider === 'deepinfra'
 }
 
 function isStoredTtsProvider(provider: VoiceApiProvider): provider is StoredTtsProvider {
-  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo' || provider === 'doubao'
+  return provider === 'edge' ||
+    provider === 'openai' ||
+    provider === 'custom' ||
+    provider === 'mimo' ||
+    provider === 'doubao' ||
+    provider === 'elevenlabs' ||
+    provider === 'gemini' ||
+    provider === 'xai' ||
+    provider === 'mistral' ||
+    provider === 'minimax' ||
+    provider === 'deepinfra'
 }
 
 function isSttProvider(provider: VoiceApiProvider): provider is SttProvider {
-  return provider === 'browser' || provider === 'openai' || provider === 'custom' || provider === 'doubao'
+  return provider === 'browser' || isStoredSttProvider(provider)
 }
 
 function isTtsProvider(provider: VoiceApiProvider): provider is StoredTtsProvider {
-  return provider === 'edge' || provider === 'openai' || provider === 'custom' || provider === 'mimo' || provider === 'doubao'
+  return isStoredTtsProvider(provider)
 }
 
 function stringSetting(settings: object, key: string): string {
@@ -51,9 +68,11 @@ export function useVoiceApiConnections() {
   const loading = ref(false)
   const vs = useVoiceSettings()
   const stt = useSttSettings()
+  const activeTtsProvider = ref<StoredTtsProvider>(vs.provider.value === 'webspeech' ? 'edge' : vs.provider.value)
+  const activeSttProvider = ref<SttProvider>(stt.provider.value)
 
-  const activeTtsId = computed(() => `tts-${vs.provider.value === 'webspeech' ? 'edge' : vs.provider.value}`)
-  const activeSttId = computed(() => `stt-${stt.provider.value}`)
+  const activeTtsId = computed(() => `tts-${activeTtsProvider.value}`)
+  const activeSttId = computed(() => `stt-${activeSttProvider.value}`)
 
   const ttsConnections = computed(() => connections.value.filter(c => c.kind === 'tts'))
   const sttConnections = computed(() => connections.value.filter(c => c.kind === 'stt'))
@@ -94,6 +113,8 @@ export function useVoiceApiConnections() {
       vs.setMimoVoice(connection.voice || stringSetting(settings, 'voice') || vs.mimoVoice.value)
       vs.setMimoStylePrompt(stringSetting(settings, 'stylePrompt'))
       vs.setMimoVoiceDesignDesc(stringSetting(settings, 'voiceDesignDesc'))
+      const cloneFormat = stringSetting(settings, 'voiceCloneFormat')
+      if (cloneFormat === 'mp3' || cloneFormat === 'wav') vs.setMimoVoiceCloneFormat(cloneFormat)
       return
     }
 
@@ -142,7 +163,11 @@ export function useVoiceApiConnections() {
   }
 
   function makeSttConnection(provider: StoredSttProvider, settings: SttStoredSettings, hasSecret: boolean): VoiceApiConnection {
-    const preset = VOICE_API_PRESETS.find(pr => pr.kind === 'stt' && pr.provider === provider && (pr.baseUrl === settings.baseUrl || !pr.baseUrl))
+    const preset = VOICE_API_PRESETS.find(pr =>
+      pr.kind === 'stt' &&
+      (pr.provider === provider || (provider === 'custom' && !!pr.baseUrl && pr.baseUrl === settings.baseUrl)) &&
+      (pr.baseUrl === settings.baseUrl || !pr.baseUrl),
+    )
     return {
       id: `stt-${provider}`,
       kind: 'stt',
@@ -165,7 +190,12 @@ export function useVoiceApiConnections() {
         fetchSttSettings(),
       ])
       if (ttsData.activeProvider && isTtsProvider(ttsData.activeProvider)) {
+        activeTtsProvider.value = ttsData.activeProvider
         vs.setProvider(ttsData.activeProvider)
+      }
+      if (sttData.activeProvider && isSttProvider(sttData.activeProvider)) {
+        activeSttProvider.value = sttData.activeProvider
+        stt.setProvider(sttData.activeProvider)
       }
 
       const newConnections: VoiceApiConnection[] = [
@@ -226,14 +256,16 @@ export function useVoiceApiConnections() {
     if (!connection) return
 
     if (kind === 'tts') {
-      applyTtsConnectionToLegacyState(connection)
       if (isTtsProvider(connection.provider)) {
-        await saveActiveTtsProvider(connection.provider)
+        const provider = await saveActiveTtsProvider(connection.provider)
+        activeTtsProvider.value = provider
+        applyTtsConnectionToLegacyState(connection)
       }
     } else {
-      applySttConnectionToLegacyState(connection)
       if (isSttProvider(connection.provider)) {
-        await saveActiveSttProvider(connection.provider)
+        const provider = await saveActiveSttProvider(connection.provider)
+        activeSttProvider.value = provider
+        applySttConnectionToLegacyState(connection)
       }
     }
 
@@ -246,18 +278,30 @@ export function useVoiceApiConnections() {
   async function saveConnection(kind: VoiceApiKind, provider: VoiceApiProvider, payload: VoiceApiSavePayload) {
     if (kind === 'tts') {
       if (!isStoredTtsProvider(provider)) throw new Error(`Unsupported TTS provider: ${String(provider)}`)
+      const settings = { ...(payload.settings || {}) }
+      const hasCloneDataUri = Object.prototype.hasOwnProperty.call(settings, 'voiceCloneDataUri')
+      const hasCloneFileName = Object.prototype.hasOwnProperty.call(settings, 'voiceCloneFileName')
+      const cloneDataUri = settings.voiceCloneDataUri
+      const cloneFileName = settings.voiceCloneFileName
+      delete settings.voiceCloneDataUri
+      delete settings.voiceCloneFileName
       const res = await saveTtsSettings(provider, {
-        settings: payload.settings as TtsStoredSettings | undefined,
+        settings: settings as TtsStoredSettings,
         secrets: payload.secrets as TtsStoredSecretsInput | undefined,
         activeProvider: provider,
       })
       await refresh()
       await setActiveConnection('tts', `tts-${provider}`)
+      if (provider === 'mimo') {
+        if (hasCloneDataUri && typeof cloneDataUri === 'string') vs.setMimoVoiceCloneDataUri(cloneDataUri)
+        if (hasCloneFileName && typeof cloneFileName === 'string') vs.setMimoVoiceCloneFileName(cloneFileName)
+      }
       return res
     }
 
     if (provider === 'browser') {
-      await saveActiveSttProvider('browser')
+      const activeProvider = await saveActiveSttProvider('browser')
+      activeSttProvider.value = activeProvider
       stt.setProvider('browser')
       await refresh()
       return null

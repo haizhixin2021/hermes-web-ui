@@ -103,7 +103,7 @@ body {
   font-family: $font-ui;
   background-color: $bg-primary;
   color: $text-primary;
-  font-size: 14px;
+  font-size: var(--font-size-base);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -137,6 +137,27 @@ body {
 .hermes-desktop-pet-window #app {
   background: transparent !important;
   background-color: transparent !important;
+}
+
+.hermes-desktop-windows,
+.hermes-desktop-windows body,
+.hermes-desktop-windows #app {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+// Naive UI menus are teleported to body, so they need a document-level
+// background-image state instead of relying on the app shell selector.
+html.theme-has-custom-background {
+  .n-base-select-menu,
+  .n-dropdown-menu,
+  .n-cascader-menu,
+  .slash-command-dropdown,
+  .mention-dropdown {
+    background-color: rgba(var(--bg-main-surface-rgb), 0.72) !important;
+    -webkit-backdrop-filter: blur(8px) saturate(110%);
+    backdrop-filter: blur(8px) saturate(110%);
+  }
 }
 
 // Teleported overlays must remain clickable above Electron drag regions.
@@ -219,15 +240,26 @@ a {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 21px 20px;
+  gap: 12px;
+  min-height: 64px;
+  padding: 14px 20px;
   border-bottom: 1px solid $border-color;
   flex-shrink: 0;
 }
 
 .header-title {
+  margin: 0;
   font-size: 16px;
   font-weight: 600;
+  line-height: 1.4;
   color: $text-primary;
+}
+
+.page-header > .header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 // Responsive utility classes for inline width replacement

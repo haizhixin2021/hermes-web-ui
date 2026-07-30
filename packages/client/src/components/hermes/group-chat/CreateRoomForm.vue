@@ -3,6 +3,7 @@ import { ref, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { NInput, NButton, NSpace, NInputNumber, NCollapse, NCollapseItem } from 'naive-ui'
 import { getStoredUsername } from '@/api/client'
+import FolderPicker from '@/components/hermes/chat/FolderPicker.vue'
 
 type InputLikeInstance = {
     focus: () => void
@@ -10,12 +11,13 @@ type InputLikeInstance = {
 
 const { t } = useI18n()
 const emit = defineEmits<{
-    submit: [name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }]
+    submit: [name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }, workspace: string]
     cancel: []
 }>()
 
 const roomName = ref('')
 const inviteCode = ref('')
+const workspace = ref('')
 const userName = ref(localStorage.getItem('gc_user_name') || getStoredUsername() || '')
 const description = ref(localStorage.getItem('gc_user_description') || '')
 const roomInput = ref<InputLikeInstance | null>(null)
@@ -40,7 +42,7 @@ function handleCreate() {
     const code = inviteCode.value.trim() || generateCode()
     const user = userName.value.trim()
     if (!name || !user) return
-    emit('submit', name, code, user, description.value.trim(), { ...compression.value })
+    emit('submit', name, code, user, description.value.trim(), { ...compression.value }, workspace.value || '')
 }
 
 function focusRoomInput() {
@@ -55,6 +57,7 @@ function focusRoomInput() {
             <NInput
                 v-model:value="userName"
                 :placeholder="t('groupChat.yourNamePlaceholder')"
+                :maxlength="120"
                 @keyup.enter="focusRoomInput"
             />
         </div>
@@ -64,6 +67,7 @@ function focusRoomInput() {
                 v-model:value="description"
                 type="textarea"
                 :rows="2"
+                :maxlength="2000"
                 :placeholder="t('groupChat.yourDescriptionPlaceholder')"
             />
         </div>
@@ -89,6 +93,11 @@ function focusRoomInput() {
                     </svg>
                 </NButton>
             </div>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">{{ t('chat.workspace') }}</label>
+            <FolderPicker v-model="workspace" />
         </div>
 
         <NCollapse class="compression-collapse">

@@ -6,9 +6,12 @@
 import {
   getSessionDetail,
 } from '../../../db/hermes/session-store'
-import { getCompressionSnapshot } from '../../../db/hermes/compression-snapshot'
+import { deleteCompressionSnapshot, getCompressionSnapshot } from '../../../db/hermes/compression-snapshot'
+import { getRecordedUsageTotals, getUsage } from '../../../db/hermes/usage-store'
 import { countTokens, SUMMARY_PREFIX } from '../../../lib/context-compressor'
+import { truncateToolResultForContext } from '../../../lib/tool-result-context'
 import { logger } from '../../logger'
+import { assembleCursorSnapshotHistory, readCursorSnapshotParts } from './context-history'
 import type { SessionState } from './types'
 
 type UsageTokenMessage = {
@@ -44,35 +47,126 @@ export async function calcAndUpdateUsage(
   sid: string,
   state: SessionState,
   emit: (event: string, payload: any) => void,
-): Promise<{ inputTokens: number; outputTokens: number }> {
+  options: {
+    truncateToolResultsForContext?: boolean
+    nativeSource?: 'coding_agent'
+  } = {},
+): Promise<{
+  inputTokens: number
+  outputTokens: number
+  contextInputTokens?: number
+  contextOutputTokens?: number
+}> {
   try {
-    const detail = getSessionDetail(sid)
-    const msgs = detail?.messages
-      ?.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool') || []
+    if (options.nativeSource) {
+      const totals = getRecordedUsageTotals(sid, options.nativeSource)
+      const latest = getUsage(sid)
+      const usage = {
+        inputTokens: totals.inputTokens,
+        outputTokens: totals.outputTokens,
+      }
+      state.inputTokens = usage.inputTokens
+      state.outputTokens = usage.outputTokens
+      emit('usage.updated', {
+        event: 'usage.updated',
+        session_id: sid,
+        ...usage,
+      })
+      return {
+        ...usage,
+        ...(latest
+          ? {
+              contextInputTokens: Number(latest.input_tokens || 0),
+              contextOutputTokens: Number(latest.output_tokens || 0),
+            }
+          : {}),
+      }
+    }
 
     const snapshot = getCompressionSnapshot(sid)
-    let inputTokens: number
-    let outputTokens: number
-    if (snapshot && msgs.length && snapshot.lastMessageIndex >= 0 && snapshot.lastMessageIndex < msgs.length) {
-      const newMessages = msgs.slice(snapshot.lastMessageIndex + 1)
-      const newUsage = estimateUsageTokensFromMessages(newMessages)
-      inputTokens = countTokens(SUMMARY_PREFIX + snapshot.summary) +
-        newUsage.inputTokens
-      outputTokens = newUsage.outputTokens
-    } else {
-      const usage = estimateUsageTokensFromMessages(msgs)
-      inputTokens = usage.inputTokens
-      outputTokens = usage.outputTokens
+    if (snapshot?.compressedThroughMessageId != null) {
+      const cursorRead = readCursorSnapshotParts(sid, snapshot, {
+        truncateToolResults: false,
+      })
+      if (cursorRead.status === 'usable') {
+        const messages = assembleCursorSnapshotHistory(snapshot, cursorRead.parts, SUMMARY_PREFIX)
+        const usage = estimateUsageTokensFromMessages(messages)
+        let contextUsage: { inputTokens: number; outputTokens: number } | undefined
+        if (options.truncateToolResultsForContext) {
+          const contextRead = readCursorSnapshotParts(sid, snapshot, {
+            truncateToolResults: true,
+          })
+          if (contextRead.status === 'usable') {
+            contextUsage = estimateUsageTokensFromMessages(
+              assembleCursorSnapshotHistory(snapshot, contextRead.parts, SUMMARY_PREFIX),
+            )
+          }
+        }
+        state.inputTokens = usage.inputTokens
+        state.outputTokens = usage.outputTokens
+        emit('usage.updated', {
+          event: 'usage.updated',
+          session_id: sid,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+        })
+        return {
+          ...usage,
+          ...(contextUsage
+            ? {
+                contextInputTokens: contextUsage.inputTokens,
+                contextOutputTokens: contextUsage.outputTokens,
+              }
+            : {}),
+        }
+      }
+      if (cursorRead.status === 'invalid') {
+        logger.warn(
+          '[chat-run-socket] invalid cursor snapshot while calculating usage for session %s (%s)',
+          sid,
+          cursorRead.reason,
+        )
+        deleteCompressionSnapshot(sid)
+      }
     }
-    state.inputTokens = inputTokens
-    state.outputTokens = outputTokens
+
+    const detail = getSessionDetail(sid)
+    const storedMessages = detail?.messages
+      ?.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool') || []
+    const estimateSnapshotUsage = (messages: typeof storedMessages) => {
+      if (snapshot && messages.length && snapshot.lastMessageIndex >= 0 && snapshot.lastMessageIndex < messages.length) {
+        const newMessages = messages.slice(snapshot.lastMessageIndex + 1)
+        const newUsage = estimateUsageTokensFromMessages(newMessages)
+        return {
+          inputTokens: countTokens(SUMMARY_PREFIX + snapshot.summary) + newUsage.inputTokens,
+          outputTokens: newUsage.outputTokens,
+        }
+      }
+      return estimateUsageTokensFromMessages(messages)
+    }
+    const usage = estimateSnapshotUsage(storedMessages)
+    const contextUsage = options.truncateToolResultsForContext
+      ? estimateSnapshotUsage(storedMessages.map(message => message.role === 'tool'
+        ? { ...message, content: truncateToolResultForContext(message.content || '') }
+        : message))
+      : undefined
+    state.inputTokens = usage.inputTokens
+    state.outputTokens = usage.outputTokens
     emit('usage.updated', {
       event: 'usage.updated',
       session_id: sid,
-      inputTokens,
-      outputTokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
     })
-    return { inputTokens, outputTokens }
+    return {
+      ...usage,
+      ...(contextUsage
+        ? {
+            contextInputTokens: contextUsage.inputTokens,
+            contextOutputTokens: contextUsage.outputTokens,
+          }
+        : {}),
+    }
   } catch (err: any) {
     logger.warn(err, '[chat-run-socket] failed to calculate usage for session %s', sid)
     return { inputTokens: 0, outputTokens: 0 }

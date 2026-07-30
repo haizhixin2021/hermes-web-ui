@@ -11,11 +11,18 @@ import {
 import { parseSseFrame, readSseFrames, readSseFrameTexts, sseEvent } from '../../packages/server/src/services/agent-runner/sse'
 import { AgentTargetRegistry, type AgentTargetInput } from '../../packages/server/src/services/agent-runner/target-registry'
 import { teeAsyncIterable } from '../../packages/server/src/services/agent-runner/stream-tee'
-import { CodingAgentRunManager, codingAgentGatewayErrorMessage, sanitizeCodingAgentTerminalOutput } from '../../packages/server/src/services/agent-runner/coding-agent-run-manager'
+import {
+  buildClaudeStreamJsonInput,
+  codexImageArgs,
+  CodingAgentRunManager,
+  codingAgentGatewayErrorMessage,
+  sanitizeCodingAgentTerminalOutput,
+} from '../../packages/server/src/services/agent-runner/coding-agent-run-manager'
 import { mapCodingAgentResponseEvent } from '../../packages/server/src/services/agent-runner/coding-agent-event-mapper'
 import { applyResponseStreamEvent } from '../../packages/server/src/services/hermes/run-chat/response-stream'
 import { initAllHermesTables } from '../../packages/server/src/db/hermes/schemas'
 import { addMessage, getSession, getSessionDetail, listSessions } from '../../packages/server/src/db/hermes/session-store'
+import { getRecordedUsageTotals, getUsage } from '../../packages/server/src/db/hermes/usage-store'
 
 describe('agent runner endpoint resolver', () => {
   it('adds v1 for provider hosts without an API root path', () => {
@@ -56,6 +63,40 @@ describe('coding agent completion errors', () => {
     expect(codingAgentGatewayErrorMessage(`  ${error}\n`)).toBe(error)
     expect(codingAgentGatewayErrorMessage('Provider returned HTTP 502')).toBe('Provider returned HTTP 502')
     expect(codingAgentGatewayErrorMessage('Here is a normal answer mentioning API Error: 529 as an example')).toBeNull()
+  })
+})
+
+describe('coding agent image inputs', () => {
+  it('builds native Codex image arguments and Claude stream-json image blocks', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'coding-agent-image-'))
+    const imagePath = join(tempDir, 'screen.png')
+    writeFileSync(imagePath, Buffer.from([1, 2, 3]))
+    try {
+      const image = { name: 'screen.png', path: imagePath, mediaType: 'image/png' }
+      expect(codexImageArgs([image])).toEqual(['--image', imagePath])
+
+      const payload = JSON.parse(buildClaudeStreamJsonInput('inspect this', [image]))
+      expect(payload).toEqual({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'inspect this' },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: Buffer.from([1, 2, 3]).toString('base64'),
+              },
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+      })
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -155,6 +196,41 @@ describe('agent runner target registry', () => {
     expect(chat.routeKey).not.toBe(secondUrl.routeKey)
     expect(chat.token).not.toBe(secondUrl.token)
   })
+
+  it('keeps target tuples distinct when a key part contains the legacy delimiter', () => {
+    type SessionTargetInput = AgentTargetInput & {
+      agentSessionId: string
+      chatSessionId: string
+    }
+    const registry = new AgentTargetRegistry<SessionTargetInput>(
+      input => [input.provider, input.model, input.apiMode, input.baseUrl, input.agentSessionId, input.chatSessionId],
+    )
+    const common = {
+      provider: 'custom:compat-provider',
+      model: 'review-model',
+      baseUrl: 'https://provider.example',
+      apiMode: 'anthropic_messages' as const,
+    }
+
+    const first = registry.register({
+      ...common,
+      apiKey: 'sk-first',
+      agentSessionId: 'agent',
+      chatSessionId: 'chat\0tail',
+    })
+    const second = registry.register({
+      ...common,
+      apiKey: 'sk-second',
+      agentSessionId: 'agent\0chat',
+      chatSessionId: 'tail',
+    })
+
+    expect(first.key).not.toBe(second.key)
+    expect(first.routeKey).not.toBe(second.routeKey)
+    expect(first.token).not.toBe(second.token)
+    expect(registry.find(first.routeKey)?.apiKey).toBe('sk-first')
+    expect(registry.find(second.routeKey)?.apiKey).toBe('sk-second')
+  })
 })
 
 describe('agent runner stream tee', () => {
@@ -192,6 +268,52 @@ describe('coding agent terminal output sanitizer', () => {
 })
 
 describe('coding agent run state', () => {
+  it('stores structured display input separately from the CLI prompt', () => {
+    const manager = new CodingAgentRunManager()
+    const addUserMessage = vi.fn()
+    const startClaudePrintTurn = vi.fn()
+    ;(manager as any).ensureDbSession = () => {}
+    ;(manager as any).emitToChat = () => {}
+    ;(manager as any).addUserMessage = addUserMessage
+    ;(manager as any).startClaudePrintTurn = startClaudePrintTurn
+
+    manager.start({
+      agentSessionId: 'agent-session-storage-1',
+      agentId: 'claude-code',
+      mode: 'scoped',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'test-model',
+      sessionId: 'chat-session-storage-1',
+      command: 'claude',
+      args: [],
+      shellCommand: 'claude',
+      workspaceDir: process.cwd(),
+      state: { messages: [], isWorking: false, events: [], queue: [] },
+    })
+
+    const storageInput = JSON.stringify([
+      { type: 'text', text: 'inspect' },
+      { type: 'image', name: 'screen.png', path: '/tmp/screen.png', media_type: 'image/png' },
+    ])
+    manager.send('chat-session-storage-1', 'inspect\n\nLocal image path for tools: /tmp/screen.png', {
+      images: [{ name: 'screen.png', path: '/tmp/screen.png', mediaType: 'image/png' }],
+      storageInput,
+    })
+
+    expect(addUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'agent-session-storage-1' }),
+      storageInput,
+    )
+    expect(startClaudePrintTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'agent-session-storage-1' }),
+      'inspect\n\nLocal image path for tools: /tmp/screen.png',
+      '',
+      [{ name: 'screen.png', path: '/tmp/screen.png', mediaType: 'image/png' }],
+    )
+    manager.shutdown()
+  })
+
   it('marks existing scoped Codex runners incompatible when Hermes MCP config is missing', () => {
     const codexHome = mkdtempSync(join(tmpdir(), 'hwui-codex-mcp-compat-'))
     try {
@@ -285,6 +407,41 @@ describe('coding agent run state', () => {
     manager.shutdown()
   })
 
+  it('ignores late Claude proxy events after a print turn completed', () => {
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    const emitted = vi.fn()
+    ;(manager as any).ensureDbSession = () => {}
+    ;(manager as any).emitToChat = emitted
+
+    manager.start({
+      agentSessionId: 'agent-session-completed',
+      agentId: 'claude-code',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'test-model',
+      sessionId: 'chat-session-completed',
+      command: 'claude',
+      args: [],
+      shellCommand: 'claude',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get('agent-session-completed')
+    run.terminalEventHandled = true
+    state.isWorking = false
+
+    manager.handleResponseEvent('agent-session-completed', {
+      type: 'response.output_text.delta',
+      data: { delta: 'belongs to another session' },
+    })
+
+    expect(state.isWorking).toBe(false)
+    expect(state.messages).toEqual([])
+    expect(emitted).not.toHaveBeenCalled()
+    manager.shutdown()
+  })
+
   it('clears shared chat session run state when a print turn completes', async () => {
     initAllHermesTables()
     const manager = new CodingAgentRunManager()
@@ -319,6 +476,8 @@ describe('coding agent run state', () => {
           id: 'resp-1',
           status: 'completed',
           output: [],
+          model: 'test-model',
+          usage: { input_tokens: 12, output_tokens: 5 },
         },
       },
     })
@@ -330,6 +489,79 @@ describe('coding agent run state', () => {
       activeRunMarker: undefined,
       events: [],
     }))
+    expect(getUsage('chat-session-1')).toEqual(expect.objectContaining({
+      input_tokens: 12,
+      output_tokens: 5,
+      model: 'test-model',
+      profile: 'default',
+    }))
+    manager.shutdown()
+  })
+
+  it('records scoped proxy usage once per model call and skips the scoped turn aggregate', async () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-proxy-usage-${suffix}`
+    const chatSessionId = `chat-session-proxy-usage-${suffix}`
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    ;(manager as any).ensureDbSession = () => {}
+    ;(manager as any).emitToChat = () => {}
+    ;(manager as any).markChatRunCompleted = () => {}
+
+    manager.start({
+      agentSessionId,
+      agentId: 'claude-code',
+      mode: 'scoped',
+      profile: 'default',
+      provider: 'glm',
+      model: 'glm-5-turbo',
+      sessionId: chatSessionId,
+      command: 'claude',
+      args: [],
+      shellCommand: 'claude',
+      workspaceDir: process.cwd(),
+      state,
+    })
+
+    const proxyCompleted = {
+      type: 'response.completed',
+      data: {
+        response: {
+          id: `provider-call-${suffix}`,
+          status: 'completed',
+          model: 'glm-5-turbo',
+          output: [],
+          usage: {
+            prompt_tokens: 120,
+            completion_tokens: 7,
+            prompt_tokens_details: { cached_tokens: 30 },
+          },
+        },
+      },
+    }
+    manager.handleProxyUsageEvent(agentSessionId, proxyCompleted)
+    manager.handleProxyUsageEvent(agentSessionId, proxyCompleted)
+    manager.handleResponseEvent(agentSessionId, {
+      type: 'response.completed',
+      data: {
+        response: {
+          id: `turn-${suffix}`,
+          status: 'completed',
+          output: [],
+          usage: { input_tokens: 120, output_tokens: 7 },
+        },
+      },
+    })
+
+    expect(getRecordedUsageTotals(chatSessionId, 'coding_agent')).toEqual({
+      inputTokens: 90,
+      outputTokens: 7,
+      cacheReadTokens: 30,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      apiCalls: 1,
+    })
     manager.shutdown()
   })
 
@@ -924,6 +1156,66 @@ describe('coding agent run state', () => {
     manager.shutdown()
   })
 
+  it('deduplicates a Codex CLI final snapshot already completed by the proxy stream', () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    const emitted: Array<{ event: string; payload: any }> = []
+    ;(manager as any).emitToChat = (_sessionId: string, event: string, payload: any) => {
+      emitted.push({ event, payload })
+    }
+    ;(manager as any).markChatRunCompleted = () => {}
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-codex-proxy-cli-dedupe-${suffix}`
+    const chatSessionId = `chat-session-codex-proxy-cli-dedupe-${suffix}`
+    manager.start({
+      agentSessionId,
+      agentId: 'codex',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'gpt-5-codex',
+      sessionId: chatSessionId,
+      command: 'codex',
+      args: ['--model', 'gpt-5-codex'],
+      shellCommand: 'codex --model gpt-5-codex',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get(agentSessionId)
+    run.printResponseId = 'resp_codex_proxy_cli_dedupe'
+    run.printMessageId = 'msg_resp_codex_proxy_cli_dedupe'
+    run.printTextStarted = false
+    run.printText = ''
+    run.printCompleted = false
+    run.responseStartEmitted = false
+    run.terminalEventHandled = false
+    run.codexToolBlocks = new Map()
+    run.codexChatText = ''
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.created',
+      data: { response: { id: 'resp_codex_proxy_cli_dedupe', status: 'in_progress', model: 'gpt-5-codex', output: [] } },
+    })
+
+    const text = '好的，我来帮你查询厦门的天气。'
+    manager.handleResponseEvent(agentSessionId, {
+      type: 'response.output_text.delta',
+      data: { type: 'response.output_text.delta', delta: text },
+    })
+    manager.handleResponseEvent(agentSessionId, {
+      type: 'response.output_text.done',
+      data: { type: 'response.output_text.done', text },
+    })
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text },
+    }))
+
+    const textMessages = state.messages.filter((message: any) => message.role === 'assistant' && !message.tool_calls?.length)
+    expect(textMessages.map((message: any) => message.content)).toEqual([text])
+    expect(emitted.filter(event => event.event === 'message.delta').map(event => event.payload.delta)).toEqual([text])
+    manager.shutdown()
+  })
+
   it('keeps repeated short Codex streaming deltas', () => {
     initAllHermesTables()
     const manager = new CodingAgentRunManager()
@@ -1373,6 +1665,40 @@ describe('coding agent run state', () => {
     expect(state.isWorking).toBe(false)
     expect(run.pendingChatCompletionEvent).toBeUndefined()
     expect(run.pendingChatCompletionPayload).toBeUndefined()
+  })
+
+  it('writes print coding-agent session end markers only after the final queued run completes', () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: true, events: [], queue: [{ queue_id: 'queued-1', input: 'next' }] }
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-ended-marker-${suffix}`
+    const chatSessionId = `chat-session-ended-marker-${suffix}`
+    manager.start({
+      agentSessionId,
+      agentId: 'claude-code',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'claude-test',
+      sessionId: chatSessionId,
+      command: 'claude',
+      args: [],
+      shellCommand: 'claude',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get(agentSessionId)
+
+    ;(manager as any).emitAndMarkPrintChatRunCompleted(run, 'run.completed', { event: 'run.completed' })
+    expect(getSession(chatSessionId)?.ended_at).toBeNull()
+    expect(getSession(chatSessionId)?.end_reason).toBeNull()
+
+    state.queue = []
+    state.isWorking = true
+    ;(manager as any).emitAndMarkPrintChatRunCompleted(run, 'run.failed', { event: 'run.failed' })
+    const session = getSession(chatSessionId)
+    expect(session?.ended_at).toEqual(expect.any(Number))
+    expect(session?.end_reason).toBe('error')
   })
 })
 

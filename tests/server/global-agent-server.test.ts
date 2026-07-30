@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  decodeMcuImaAdpcm,
+  encodeMcuImaAdpcm,
+} from '../../packages/server/src/services/hermes/mcu-adpcm'
 
 const authMocks = vi.hoisted(() => ({
   authenticateUserToken: vi.fn(),
@@ -82,13 +86,43 @@ function createMockNamespace() {
 
 function createMockSocket(id: string, auth: Record<string, unknown> = {}, headers: Record<string, string> = {}) {
   const handlers = new Map<string, (...args: any[]) => void>()
+  const mcuEventsRequiringApiToken = new Set([
+    'mcu.ready',
+    'mcu.status',
+    'mcu.interrupt',
+    'mcu.session.clear',
+    'mcu.session.cleared',
+    'voice.stream.start',
+    'voice.stream.chunk',
+    'voice.stream.end',
+    'voice.stream.abort',
+    'voice.recorded',
+    'interaction.status',
+    'tool.started',
+    'tool.completed',
+    'tool.failed',
+    'audio.started',
+    'audio.done',
+    'audio.interrupted',
+    'audio.queued',
+    'audio.dropped',
+    'audio.cleared',
+  ])
   const socket: any = {
     id,
     data: {},
     handshake: { auth, headers },
     broadcast: { emit: vi.fn() },
     on: vi.fn((event: string, handler: (...args: any[]) => void) => {
-      handlers.set(event, handler)
+      handlers.set(event, (...args: any[]) => {
+        if (mcuEventsRequiringApiToken.has(event) && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+          args[0] = {
+            apiToken: socket.data.userToken || socket.handshake.auth?.token,
+            ...args[0],
+          }
+        }
+        return handler(...args)
+      })
       return socket
     }),
     emit: vi.fn((_event: string, payload: unknown, ack?: (response: unknown) => void) => {
@@ -108,6 +142,17 @@ async function waitForMockCalls(mock: { mock: { calls: unknown[] } }, count: num
   }
 }
 
+function crc32ForTest(buffer: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let i = 0; i < 8; i += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
 async function waitForMockCallWith(
   mock: { mock: { calls: unknown[][] } },
   predicate: (call: unknown[]) => boolean,
@@ -118,6 +163,16 @@ async function waitForMockCallWith(
     await new Promise(resolve => setTimeout(resolve, 5))
   }
   throw new Error('Timed out waiting for matching mock call')
+}
+
+function startPrimaryMockRun(socket: any, runId = 'run-primary'): string {
+  const runCall = socket.emit.mock.calls
+    .filter(([event]: [string]) => event === 'run')
+    .at(-1)
+  const queueId = runCall?.[1]?.queue_id
+  expect(queueId).toMatch(/^mcu_/)
+  socket.__handlers.get('run.started')?.({ run_id: runId, queue_id: queueId })
+  return queueId
 }
 
 describe('GlobalAgentServer', () => {
@@ -484,6 +539,264 @@ describe('GlobalAgentServer', () => {
     }))
   })
 
+  it('accepts MCU voice stream chunks as Socket.IO binary payloads', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    const pcm = Uint8Array.from([1, 0, 2, 0, 3, 0, 4, 0])
+    agentSocket.__handlers.get('voice.stream.start')?.({
+      interactionId: 'voice-binary',
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-binary',
+      offset: 0,
+      bytes: pcm.byteLength,
+      data: pcm,
+    })
+    agentSocket.__handlers.get('voice.stream.end')?.({
+      interactionId: 'voice-binary',
+      bytes: pcm.byteLength,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    const request = fetchImpl.mock.calls[0][1] as RequestInit
+    const wav = Buffer.from(request.body as Uint8Array)
+    expect(wav.readUInt32LE(40)).toBe(pcm.byteLength)
+    expect(wav.subarray(44)).toEqual(Buffer.from(pcm))
+  })
+
+  it('decodes chunk-framed MCU IMA-ADPCM streams before STT', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    const firstPcm = Buffer.from([0, 0, 232, 3, 208, 7, 232, 3])
+    const secondPcm = Buffer.from([0, 0, 24, 252, 48, 248, 24, 252])
+    const first = encodeMcuImaAdpcm(firstPcm, 16000)
+    const second = encodeMcuImaAdpcm(secondPcm, 16000)
+    agentSocket.__handlers.get('voice.stream.start')?.({
+      interactionId: 'voice-adpcm',
+      mimeType: 'audio/x-ima-adpcm',
+      frameFormat: 'hadp-chunk-v1',
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-adpcm',
+      offset: 0,
+      bytes: first.length,
+      data: first,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-adpcm',
+      offset: first.length,
+      bytes: second.length,
+      data: second,
+    })
+    agentSocket.__handlers.get('voice.stream.end')?.({
+      interactionId: 'voice-adpcm',
+      bytes: first.length + second.length,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    const request = fetchImpl.mock.calls[0][1] as RequestInit
+    const wav = Buffer.from(request.body as Uint8Array)
+    const expectedPcm = Buffer.concat([
+      decodeMcuImaAdpcm(first).pcm,
+      decodeMcuImaAdpcm(second).pcm,
+    ])
+    expect(request.headers).toEqual(expect.objectContaining({ 'Content-Type': 'audio/wav' }))
+    expect(wav.readUInt32LE(40)).toBe(expectedPcm.length)
+    expect(wav.subarray(44)).toEqual(expectedPcm)
+  })
+
+  it('ignores stale MCU voice stream chunks and ends from previous interactions', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    const stalePcm = Buffer.from([1, 0, 1, 0])
+    const currentPcm = Buffer.from([2, 0, 2, 0])
+    agentSocket.__handlers.get('voice.stream.start')?.({
+      interactionId: 'voice-2',
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-1',
+      offset: 0,
+      bytes: stalePcm.length,
+      data: stalePcm.toString('base64'),
+    })
+    agentSocket.__handlers.get('voice.stream.end')?.({
+      interactionId: 'voice-1',
+      bytes: stalePcm.length,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-2',
+      offset: 0,
+      bytes: currentPcm.length,
+      data: currentPcm.toString('base64'),
+    })
+    agentSocket.__handlers.get('voice.stream.end')?.({
+      interactionId: 'voice-2',
+      bytes: currentPcm.length,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    const request = fetchImpl.mock.calls[0][1] as RequestInit
+    const wav = Buffer.from(request.body as Uint8Array)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(wav.readUInt32LE(40)).toBe(currentPcm.length)
+    expect(wav.subarray(44)).toEqual(currentPcm)
+  })
+
+  it('rejects MCU voice stream chunks that arrive out of offset order', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    const firstPcm = Buffer.from([1, 0, 1, 0])
+    const secondPcm = Buffer.from([2, 0, 2, 0])
+    agentSocket.__handlers.get('voice.stream.start')?.({
+      interactionId: 'voice-1',
+      sampleRate: 16000,
+      channels: 1,
+      bitsPerSample: 16,
+    })
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-1',
+      seq: 1,
+      offset: firstPcm.length,
+      bytes: secondPcm.length,
+      crc32: crc32ForTest(secondPcm),
+      data: secondPcm.toString('base64'),
+    })
+    expect(agentSocket.emit).toHaveBeenCalledWith('voice.stream.chunk.ack', expect.objectContaining({
+      interactionId: 'voice-1',
+      offset: firstPcm.length,
+      ok: false,
+      reason: 'out_of_order',
+    }))
+
+    agentSocket.__handlers.get('voice.stream.chunk')?.({
+      interactionId: 'voice-1',
+      seq: 0,
+      offset: 0,
+      bytes: firstPcm.length,
+      crc32: crc32ForTest(firstPcm),
+      data: firstPcm.toString('base64'),
+    })
+    agentSocket.__handlers.get('voice.stream.end')?.({
+      interactionId: 'voice-1',
+      bytes: firstPcm.length,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    const request = fetchImpl.mock.calls[0][1] as RequestInit
+    const wav = Buffer.from(request.body as Uint8Array)
+    expect(wav.readUInt32LE(40)).toBe(firstPcm.length)
+    expect(wav.subarray(44)).toEqual(firstPcm)
+  })
+
   it('returns relative MCU audio URLs for device-side playback', async () => {
     authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
     authMocks.userCanAccessProfile.mockReturnValue(true)
@@ -502,7 +815,7 @@ describe('GlobalAgentServer', () => {
     server.init()
 
     const audio = await (server as any).synthesizeMcuSpeech('hello', 'user-jwt', 'research')
-    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.pcm$/)
+    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.adpcm$/)
     expect(fetchImpl.mock.calls[0][1]?.headers).toMatchObject({
       'X-Hermes-Profile': 'research',
     })
@@ -567,7 +880,7 @@ describe('GlobalAgentServer', () => {
 
     const audio = await (server as any).synthesizeMcuSpeech('hello', 'user-jwt', 'research')
 
-    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.pcm$/)
+    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.adpcm$/)
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     expect(fetchImpl.mock.calls[1][1]?.headers).toMatchObject({
       'X-Hermes-Profile': 'research',
@@ -610,7 +923,7 @@ describe('GlobalAgentServer', () => {
 
     const audio = await (server as any).synthesizeMcuSpeech('hello', 'user-jwt', 'research')
 
-    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.pcm$/)
+    expect(audio.url).toMatch(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.adpcm$/)
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     expect(fetchImpl.mock.calls[1][1]?.headers).toMatchObject({
       'X-Hermes-Profile': 'research',
@@ -662,36 +975,41 @@ describe('GlobalAgentServer', () => {
     })
     const localSocket = clientSocketMocks.localSockets.at(-1)
     localSocket.__handlers.get('connect')?.()
-    localSocket.__handlers.get('message.delta')?.({ delta: '好嘞，这就去查。' })
-    expect(fetchImpl).not.toHaveBeenCalled()
-
-    localSocket.__handlers.get('tool.started')?.({ tool: 'weather', preview: '厦门天气' })
+    startPrimaryMockRun(localSocket)
+    localSocket.__handlers.get('message.delta')?.({ delta: '好嘞，这就去查。\n' })
     await waitForMockCalls(fetchImpl, 1)
     expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toMatchObject({
       text: '好嘞，这就去查。',
     })
+    localSocket.__handlers.get('tool.started')?.({ tool: 'weather', preview: '厦门天气' })
     await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
       event === 'audio.enqueue' && (payload as { segmentId?: string })?.segmentId === 'voice-1-tts-1',
     )
     expect(agentSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
       interactionId: 'voice-1',
       segmentId: 'voice-1-tts-1',
-      url: expect.stringMatching(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.pcm$/),
+      url: expect.stringMatching(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.adpcm$/),
       completionManagedByServer: true,
     }))
-    agentSocket.__handlers.get('audio.done')?.({
-      interactionId: 'voice-1',
-      segmentId: 'voice-1-tts-1',
-    })
-
     localSocket.__handlers.get('tool.completed')?.({ tool: 'weather' })
     localSocket.__handlers.get('message.delta')?.({ delta: '结果如下：\n| 名称 | 值 |\n' })
-    localSocket.__handlers.get('message.delta')?.({ delta: '| --- | --- |\n| foo | 1 |\n请确认。' })
+    localSocket.__handlers.get('message.delta')?.({ delta: '| --- | --- |\n| foo | 1 |\n请确认。\n' })
     localSocket.__handlers.get('run.completed')?.({})
 
     await waitForMockCalls(fetchImpl, 2)
     expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toMatchObject({
       text: '结果如下： 请确认。',
+    })
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+      segmentId: 'voice-1-tts-2',
+    }))
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('interaction.status', expect.objectContaining({
+      interactionId: 'voice-1',
+      status: 'completed',
+    }))
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'voice-1',
+      segmentId: 'voice-1-tts-1',
     })
     await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
       event === 'audio.enqueue' && (payload as { segmentId?: string })?.segmentId === 'voice-1-tts-2',
@@ -699,9 +1017,410 @@ describe('GlobalAgentServer', () => {
     expect(agentSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
       interactionId: 'voice-1',
       segmentId: 'voice-1-tts-2',
-      url: expect.stringMatching(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.pcm$/),
+      url: expect.stringMatching(/^\/api\/hermes\/mcu\/audio\/[a-f0-9-]+\.adpcm$/),
       completionManagedByServer: true,
     }))
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('interaction.status', expect.objectContaining({
+      interactionId: 'voice-1',
+      status: 'completed',
+    }))
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'voice-1',
+      segmentId: 'voice-1-tts-2',
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'interaction.status' && (payload as { status?: string })?.status === 'completed',
+    )
+  })
+
+  it('keeps MCU background work non-blocking and speaks only the final autonomous agent response', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(Buffer.from('pcm-audio'), {
+      status: 200,
+      headers: { 'Content-Type': 'audio/x-pcm' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-background',
+      transcript: '后台查询天气',
+      clientId: 'device-1',
+    })
+    const localSocket = clientSocketMocks.localSockets.at(-1)
+    localSocket.__handlers.get('connect')?.()
+    startPrimaryMockRun(localSocket, 'run-parent')
+    localSocket.__handlers.get('delegation.updated')?.({
+      delegation_id: 'delegation-1',
+      status: 'running',
+      background_pending: 1,
+    })
+    localSocket.__handlers.get('run.completed')?.({
+      run_id: 'run-parent',
+      output: '',
+      background_pending: 1,
+    })
+
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'interaction.status'
+      && (payload as { interactionId?: string; status?: string })?.interactionId === 'voice-background'
+      && (payload as { status?: string })?.status === 'completed',
+    )
+    expect(localSocket.disconnect).not.toHaveBeenCalled()
+    expect(fetchImpl).not.toHaveBeenCalled()
+
+    agentSocket.emit.mockClear()
+    localSocket.__handlers.get('run.started')?.({
+      run_id: 'run-background-delivery',
+      autonomous: true,
+      delegation_id: 'delegation-1',
+    })
+    localSocket.__handlers.get('message.delta')?.({
+      run_id: 'run-background-delivery',
+      delta: '厦门明天晴，最高温度 30 度。',
+    })
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('interaction.status', expect.objectContaining({ status: 'thinking' }))
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('audio.enqueue', expect.anything())
+
+    localSocket.__handlers.get('run.completed')?.({
+      run_id: 'run-background-delivery',
+      autonomous: true,
+      delegation_id: 'delegation-1',
+      output: '厦门明天晴，最高温度 30 度。',
+      background_pending: 0,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toMatchObject({
+      text: '厦门明天晴，最高温度 30 度。',
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'audio.enqueue'
+      && (payload as { interactionId?: string })?.interactionId === 'mcu-background-delegation-1',
+    )
+    expect(agentSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+      interactionId: 'mcu-background-delegation-1',
+      segmentId: 'mcu-background-delegation-1-tts-1',
+      completionManagedByServer: true,
+    }))
+    expect(localSocket.disconnect).toHaveBeenCalled()
+
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'mcu-background-delegation-1',
+      segmentId: 'mcu-background-delegation-1-tts-1',
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'interaction.status'
+      && (payload as { interactionId?: string; status?: string })?.interactionId === 'mcu-background-delegation-1'
+      && (payload as { status?: string })?.status === 'completed',
+    )
+  })
+
+  it('does not abort idle background work when a new MCU recording starts', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, { localBaseUrl: 'http://127.0.0.1:8647' })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-parent',
+      transcript: '启动后台任务',
+      clientId: 'device-1',
+    })
+    const parentSocket = clientSocketMocks.localSockets.at(-1)
+    parentSocket.__handlers.get('connect')?.()
+    startPrimaryMockRun(parentSocket, 'run-parent')
+    parentSocket.__handlers.get('run.completed')?.({
+      run_id: 'run-parent',
+      output: '',
+      background_pending: 1,
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'interaction.status'
+      && (payload as { interactionId?: string; status?: string })?.interactionId === 'voice-parent'
+      && (payload as { status?: string })?.status === 'completed',
+    )
+
+    agentSocket.__handlers.get('mcu.interrupt')?.({
+      interactionId: 'voice-parent',
+      profile: 'research',
+    })
+    await new Promise(resolve => setTimeout(resolve, 320))
+    expect(parentSocket.emit).not.toHaveBeenCalledWith('abort', { session_id: 'mcu-device-1-research' })
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-follow-up',
+      transcript: '继续聊另一个问题',
+      clientId: 'device-1',
+    })
+    const followUpSocket = clientSocketMocks.localSockets.at(-1)
+    followUpSocket.__handlers.get('connect')?.()
+
+    expect(parentSocket.disconnect).not.toHaveBeenCalled()
+    expect(followUpSocket.emit).not.toHaveBeenCalledWith('abort', { session_id: 'mcu-device-1-research' })
+    expect(followUpSocket.emit).toHaveBeenCalledWith('run', expect.objectContaining({
+      input: '继续聊另一个问题',
+      session_id: 'mcu-device-1-research',
+    }))
+  })
+
+  it('isolates a queued MCU voice turn from a background result returning on the same session', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    const fetchImpl = vi.fn(async () => new Response(Buffer.from('pcm-audio'), {
+      status: 200,
+      headers: { 'Content-Type': 'audio/x-pcm' },
+    }))
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-parent',
+      transcript: '启动后台任务',
+      clientId: 'device-1',
+    })
+    const parentSocket = clientSocketMocks.localSockets.at(-1)
+    parentSocket.__handlers.get('connect')?.()
+    const parentQueueId = startPrimaryMockRun(parentSocket, 'run-parent')
+    parentSocket.__handlers.get('run.completed')?.({
+      run_id: 'run-parent',
+      queue_id: parentQueueId,
+      output: '',
+      background_pending: 1,
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) => (
+      event === 'interaction.status'
+      && (payload as { interactionId?: string; status?: string })?.interactionId === 'voice-parent'
+      && (payload as { status?: string })?.status === 'completed'
+    ))
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-follow-up',
+      transcript: '继续问一个问题',
+      clientId: 'device-1',
+    })
+    const followUpSocket = clientSocketMocks.localSockets.at(-1)
+    followUpSocket.__handlers.get('connect')?.()
+    const followUpRun = followUpSocket.emit.mock.calls
+      .filter(([event]: [string]) => event === 'run')
+      .at(-1)?.[1]
+    const followUpQueueId = followUpRun?.queue_id
+    expect(followUpQueueId).toMatch(/^mcu_/)
+    followUpSocket.__handlers.get('run.queued')?.({
+      queued_messages: [{ id: followUpQueueId }],
+    })
+    expect(parentSocket.disconnect).not.toHaveBeenCalled()
+
+    const autonomousStarted = {
+      run_id: 'run-background-delivery',
+      queue_id: 'delegation_delegation-1',
+      autonomous: true,
+      delegation_id: 'delegation-1',
+    }
+    parentSocket.__handlers.get('run.started')?.(autonomousStarted)
+    followUpSocket.__handlers.get('run.started')?.(autonomousStarted)
+    parentSocket.__handlers.get('message.delta')?.({ delta: '后台结果。' })
+    followUpSocket.__handlers.get('message.delta')?.({ delta: '后台结果。' })
+    const autonomousCompleted = {
+      ...autonomousStarted,
+      output: '后台结果。',
+      background_pending: 0,
+    }
+    parentSocket.__handlers.get('run.completed')?.(autonomousCompleted)
+    followUpSocket.__handlers.get('run.completed')?.(autonomousCompleted)
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(parentSocket.disconnect).toHaveBeenCalled()
+    expect(followUpSocket.disconnect).not.toHaveBeenCalled()
+
+    followUpSocket.__handlers.get('run.started')?.({
+      run_id: 'run-follow-up',
+      queue_id: followUpQueueId,
+    })
+    followUpSocket.__handlers.get('run.completed')?.({
+      run_id: 'run-follow-up',
+      queue_id: followUpQueueId,
+      output: '',
+      background_pending: 0,
+    })
+
+    await waitForMockCalls(fetchImpl, 1)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toMatchObject({ text: '后台结果。' })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) => (
+      event === 'interaction.status'
+      && (payload as { interactionId?: string; status?: string })?.interactionId === 'voice-follow-up'
+      && (payload as { status?: string })?.status === 'completed'
+    ))
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) => (
+      event === 'audio.enqueue'
+      && (payload as { interactionId?: string })?.interactionId === 'mcu-background-delegation-1'
+    ))
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('interaction.status', expect.objectContaining({
+      interactionId: 'voice-follow-up',
+      status: 'failed',
+    }))
+
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'mcu-background-delegation-1',
+      segmentId: 'mcu-background-delegation-1-tts-1',
+    })
+  })
+
+  it('starts later MCU TTS synthesis early but triggers MCU playback one segment at a time', async () => {
+    authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+    authMocks.userCanAccessProfile.mockReturnValue(true)
+    let resolveFirstTts: ((response: Response) => void) | undefined
+    const firstTts = new Promise<Response>((resolve) => {
+      resolveFirstTts = resolve
+    })
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || '{}'))
+      if (body.text === '第一句。') return firstTts
+      return new Response(Buffer.from([2, 0, 2, 0]), {
+        status: 200,
+        headers: { 'Content-Type': 'audio/x-pcm' },
+      })
+    })
+    const nsp = createMockNamespace()
+    const io = { of: vi.fn(() => nsp) }
+    const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+    const server = new GlobalAgentServer(io as any, {
+      fetchImpl: fetchImpl as any,
+      localBaseUrl: 'http://127.0.0.1:8647',
+    })
+    server.init()
+
+    const agentSocket = createMockSocket('jwt-agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
+    await new Promise<void>((resolve, reject) => {
+      nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+    })
+    nsp.__handlers.get('connection')?.(agentSocket)
+
+    server.startMcuVoiceChatTurn({
+      userToken: 'user-jwt',
+      profile: 'research',
+      interactionId: 'voice-pipeline',
+      transcript: 'hi',
+      clientId: 'device-1',
+    })
+    const localSocket = clientSocketMocks.localSockets.at(-1)
+    localSocket.__handlers.get('connect')?.()
+    startPrimaryMockRun(localSocket)
+    localSocket.__handlers.get('message.delta')?.({ delta: '第一句。\n' })
+    await waitForMockCalls(fetchImpl, 1)
+    localSocket.__handlers.get('message.delta')?.({ delta: '第二句。\n' })
+    localSocket.__handlers.get('run.completed')?.({})
+    await waitForMockCalls(fetchImpl, 2)
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toMatchObject({
+      text: '第二句。',
+    })
+    expect(agentSocket.emit).not.toHaveBeenCalledWith('audio.enqueue', expect.any(Object))
+
+    resolveFirstTts?.(new Response(Buffer.from([1, 0, 1, 0]), {
+      status: 200,
+      headers: { 'Content-Type': 'audio/x-pcm' },
+    }))
+
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'audio.enqueue' && (payload as { segmentId?: string })?.segmentId === 'voice-pipeline-tts-1',
+    )
+    const segmentIds = agentSocket.emit.mock.calls
+      .filter(([event]: [string]) => event === 'audio.enqueue')
+      .map(([, payload]: [string, { segmentId: string }]) => payload.segmentId)
+    expect(segmentIds).toEqual(['voice-pipeline-tts-1'])
+
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'voice-pipeline',
+      segmentId: 'voice-pipeline-tts-1',
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'audio.enqueue' && (payload as { segmentId?: string })?.segmentId === 'voice-pipeline-tts-2',
+    )
+    const segmentIdsAfterFirstDone = agentSocket.emit.mock.calls
+      .filter(([event]: [string]) => event === 'audio.enqueue')
+      .map(([, payload]: [string, { segmentId: string }]) => payload.segmentId)
+    expect(segmentIdsAfterFirstDone).toEqual(['voice-pipeline-tts-1', 'voice-pipeline-tts-2'])
+
+    agentSocket.__handlers.get('audio.done')?.({
+      interactionId: 'voice-pipeline',
+      segmentId: 'voice-pipeline-tts-2',
+    })
+    await waitForMockCallWith(agentSocket.emit, ([event, payload]) =>
+      event === 'interaction.status' && (payload as { status?: string })?.status === 'completed',
+    )
   })
 
   it('aborts in-flight MCU TTS synthesis when the device interrupts playback', async () => {
@@ -744,7 +1463,8 @@ describe('GlobalAgentServer', () => {
     })
     const localSocket = clientSocketMocks.localSockets.at(-1)
     localSocket.__handlers.get('connect')?.()
-    localSocket.__handlers.get('message.delta')?.({ delta: '这段正在合成。' })
+    startPrimaryMockRun(localSocket)
+    localSocket.__handlers.get('message.delta')?.({ delta: '这段正在合成。\n' })
 
     await waitForMockCalls(fetchImpl, 1)
     expect(ttsSignal?.aborted).toBe(false)
@@ -791,6 +1511,7 @@ describe('GlobalAgentServer', () => {
     })
     const localSocket = clientSocketMocks.localSockets.at(-1)
     localSocket.__handlers.get('connect')?.()
+    startPrimaryMockRun(localSocket)
     localSocket.__handlers.get('approval.requested')?.({
       approval_id: 'approval-1',
       choices: ['once', 'session', 'deny'],
@@ -885,7 +1606,12 @@ describe('GlobalAgentServer', () => {
     const server = new GlobalAgentServer(io as any)
     server.init()
 
-    const agentSocket = createMockSocket('agent-socket', { token: server.getAuthToken(), instanceId: 'device-1' })
+    const agentSocket = createMockSocket('agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
     await new Promise<void>((resolve, reject) => {
       nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
     })
@@ -923,6 +1649,46 @@ describe('GlobalAgentServer', () => {
     })
   })
 
+  it('still aborts an active foreground run when MCU starts listening again', async () => {
+    vi.useFakeTimers()
+    try {
+      authMocks.authenticateUserToken.mockResolvedValue({ id: 7, username: 'ada', role: 'user' })
+      authMocks.userCanAccessProfile.mockReturnValue(true)
+      const nsp = createMockNamespace()
+      const io = { of: vi.fn(() => nsp) }
+      const { GlobalAgentServer } = await import('../../packages/server/src/services/global-agent/server')
+
+      const server = new GlobalAgentServer(io as any)
+      server.init()
+      const agentSocket = createMockSocket('agent-socket', {
+        token: 'user-jwt',
+        role: 'hermes-studio',
+        instanceId: 'device-1',
+        profile: 'research',
+      })
+      await new Promise<void>((resolve, reject) => {
+        nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
+      })
+      nsp.__handlers.get('connection')?.(agentSocket)
+
+      const runSocket = { emit: vi.fn() }
+      ;(server as any).mcuSessionRuns.set('mcu-device-1-research', {
+        interactionId: 'run-1',
+        socket: runSocket,
+      })
+
+      agentSocket.__handlers.get('mcu.interrupt')?.({
+        interactionId: 'run-1',
+        profile: 'research',
+      })
+      await vi.advanceTimersByTimeAsync(300)
+
+      expect(runSocket.emit).toHaveBeenCalledWith('abort', { session_id: 'mcu-device-1-research' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('cancels a pending MCU interrupt when session clear arrives in the double-click window', async () => {
     vi.useFakeTimers()
     try {
@@ -935,7 +1701,12 @@ describe('GlobalAgentServer', () => {
       const server = new GlobalAgentServer(io as any)
       server.init()
 
-      const agentSocket = createMockSocket('agent-socket', { token: server.getAuthToken(), instanceId: 'device-1' })
+      const agentSocket = createMockSocket('agent-socket', {
+        token: 'user-jwt',
+        role: 'hermes-studio',
+        instanceId: 'device-1',
+        profile: 'research',
+      })
       await new Promise<void>((resolve, reject) => {
         nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
       })
@@ -984,7 +1755,12 @@ describe('GlobalAgentServer', () => {
     const server = new GlobalAgentServer(io as any)
     server.init()
 
-    const agentSocket = createMockSocket('agent-socket', { token: server.getAuthToken(), instanceId: 'device-1' })
+    const agentSocket = createMockSocket('agent-socket', {
+      token: 'user-jwt',
+      role: 'hermes-studio',
+      instanceId: 'device-1',
+      profile: 'research',
+    })
     await new Promise<void>((resolve, reject) => {
       nsp.__middleware[0](agentSocket, (err?: Error) => err ? reject(err) : resolve())
     })

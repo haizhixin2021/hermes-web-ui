@@ -3,9 +3,13 @@
  */
 
 import type { Server, Socket } from 'socket.io'
-import { updateSessionStats } from '../../../db/hermes/session-store'
+import { updateSession, updateSessionStats } from '../../../db/hermes/session-store'
 import { logger } from '../../logger'
 import { codingAgentRunManager } from '../../agent-runner/coding-agent-run-manager'
+import {
+  abortGlobalEkkoBackgroundTasks,
+  hasGlobalEkkoBackgroundTasks,
+} from '../../ekko-agent/manager'
 import { flushBridgePendingToDb } from './bridge-message'
 import { flushResponseRunToDb } from './response-stream'
 import { replaceState } from './compression'
@@ -18,6 +22,30 @@ function isBridgeRunSource(source?: string): boolean {
   return source === 'cli' || source === 'global_agent' || source === 'workflow'
 }
 
+function settleInterruptedBackgroundTasks(state: SessionState): Array<Record<string, unknown>> {
+  const timestamp = Date.now() / 1000
+  const completed: Array<Record<string, unknown>> = []
+  state.backgroundTasks = state.backgroundTasks || {}
+  for (const [subagentId, task] of Object.entries(state.backgroundTasks)) {
+    if (String(task.status || '').toLowerCase() !== 'running') continue
+    const snapshot = {
+      ...task,
+      subagent_id: subagentId,
+      status: 'interrupted',
+      last_event: 'subagent.complete',
+      updated_at: timestamp,
+      completed_at: timestamp,
+    }
+    state.backgroundTasks[subagentId] = snapshot
+    completed.push({
+      ...snapshot,
+      event: 'subagent.complete',
+      timestamp,
+    })
+  }
+  return completed
+}
+
 export async function handleAbort(
   nsp: ReturnType<Server['of']>,
   socket: Socket,
@@ -28,12 +56,16 @@ export async function handleAbort(
 ) {
   let state = sessionMap.get(sessionId)
   const hasCodingAgentRun = codingAgentRunManager.hasSession(sessionId)
-  if (!state && hasCodingAgentRun) {
+  const hasEkkoBackgroundTasks = hasGlobalEkkoBackgroundTasks(sessionId)
+  if (!state && (hasCodingAgentRun || hasEkkoBackgroundTasks)) {
     state = { messages: [], isWorking: true, events: [], queue: [], source: 'coding_agent' }
     sessionMap.set(sessionId, state)
   }
-  const isCodingAgentRun = state?.source === 'coding_agent' || hasCodingAgentRun
-  if ((!state?.isWorking && !hasCodingAgentRun) || (state && !isCodingAgentRun && !state.runId && !state.abortController)) {
+  const isCodingAgentRun = state?.source === 'coding_agent' || hasCodingAgentRun || hasEkkoBackgroundTasks
+  if (
+    (!state?.isWorking && !hasCodingAgentRun && !hasEkkoBackgroundTasks) ||
+    (state && !isCodingAgentRun && !state.runId && !state.abortController)
+  ) {
     logger.info({ sessionId }, '[chat-run-socket][abort] ignored: no active run')
     if (state) {
       state.isWorking = false
@@ -67,17 +99,46 @@ export async function handleAbort(
   })
   logger.info({ sessionId, runId }, '[chat-run-socket][abort] started')
 
+  // Workflow sessions can be backed either by Hermes bridge runs or by scoped
+  // coding-agent runners. Prefer the coding-agent runtime when it owns the
+  // session; otherwise source='workflow' is misclassified as a bridge run and
+  // bridge.interrupt returns "unknown session" while the coding agent keeps
+  // running.
+  const shouldAbortThroughBridge = isBridgeRunSource(activeState.source) && !isCodingAgentRun
+
   // Flush in-memory assistant text to DB before aborting the stream.
-  if (isBridgeRunSource(activeState.source)) {
+  if (shouldAbortThroughBridge) {
     flushBridgePendingToDb(activeState, sessionId)
   } else {
     flushResponseRunToDb(activeState, sessionId)
   }
 
-  if (isBridgeRunSource(activeState.source)) {
+  if (shouldAbortThroughBridge) {
     let interruptResult: any = null
     try {
       interruptResult = await bridge.interrupt(sessionId, 'Aborted by user', activeState.profile)
+      const interruptedDelegationIds = Array.isArray(interruptResult?.background_delegation_ids)
+        ? interruptResult.background_delegation_ids.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+        : []
+      for (const delegationId of interruptedDelegationIds) {
+        activeState.backgroundDelegations = activeState.backgroundDelegations || {}
+        const previous = activeState.backgroundDelegations[delegationId]
+        activeState.backgroundDelegations[delegationId] = {
+          delegationId,
+          status: 'interrupted',
+          profile: previous?.profile || activeState.profile || 'default',
+          updatedAt: Date.now(),
+        }
+        emitToSession(nsp, socket, sessionId, 'delegation.updated', {
+          event: 'delegation.updated',
+          delegation_id: delegationId,
+          status: 'interrupted',
+          delivery_status: 'cancelled',
+        })
+      }
+      for (const task of settleInterruptedBackgroundTasks(activeState)) {
+        emitToSession(nsp, socket, sessionId, 'subagent.complete', task)
+      }
     } catch (err) {
       logger.warn(err, '[chat-run-socket][abort] failed to interrupt CLI bridge for session %s', sessionId)
     }
@@ -109,9 +170,15 @@ export async function handleAbort(
       await markAbortCompleted(nsp, socket, sessionId, runId || 'bridge_abort_timeout', sessionMap, runQueuedItem, false)
       return
     }
-  } else if (activeState.source === 'coding_agent') {
+  } else if (isCodingAgentRun) {
     activeState.abortController?.abort()
     codingAgentRunManager.stop(sessionId, { reportClosed: false })
+    if (hasEkkoBackgroundTasks) {
+      await abortGlobalEkkoBackgroundTasks(sessionId)
+      for (const task of settleInterruptedBackgroundTasks(activeState)) {
+        emitToSession(nsp, socket, sessionId, 'subagent.complete', task)
+      }
+    }
   } else if (activeState.abortController) {
     activeState.abortController.abort()
   }
@@ -173,6 +240,15 @@ export async function markAbortCompleted(
     state.events = []
     runQueuedItem(socket, sessionId, next, profile || 'default')
     return
+  }
+
+  try {
+    updateSession(sessionId, {
+      ended_at: Math.floor(Date.now() / 1000),
+      end_reason: 'abort',
+    })
+  } catch (err) {
+    logger.warn(err, '[chat-run-socket][abort] failed to write cancellation end marker for session %s', sessionId)
   }
 
   state.events = []

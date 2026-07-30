@@ -6,13 +6,14 @@ import {
   type CodingAgentId as ExternalCodingAgentId,
 } from '../../coding-agents'
 import { getOrCreateSession } from './compression'
-import { contentBlocksToString } from './content-blocks'
+import { contentBlocksToString, convertContentBlocksForCodingAgent } from './content-blocks'
 import type { ContentBlock, SessionState } from './types'
 import type { ChatCodingAgentId } from './types'
 import { writeModelRunProfileToken } from './model-run-prompt'
 import type { AuthenticatedUser } from '../../../middleware/user-auth'
 import { getSystemPrompt } from '../../../lib/llm-prompt'
-import { getSession } from '../../../db/hermes/session-store'
+import { getSession, updateSession } from '../../../db/hermes/session-store'
+import { logger } from '../../logger'
 
 export interface CodingAgentRunSocketData {
   input: string | ContentBlock[]
@@ -24,6 +25,7 @@ export interface CodingAgentRunSocketData {
   agent_id?: ChatCodingAgentId
   mode?: 'scoped' | 'global'
   workspace?: string | null
+  category_id?: number | null
   source?: string
   baseUrl?: string
   base_url?: string
@@ -93,18 +95,41 @@ export async function handleCodingAgentRun(
     runId = started.agentSessionId
   }
 
+  if (data.category_id !== undefined) {
+    updateSession(sessionId, { category_id: data.category_id })
+  }
+
   state.isWorking = true
   state.runId = runId
+  try {
+    updateSession(sessionId, {
+      ended_at: null,
+      end_reason: null,
+      last_active: Math.floor(Date.now() / 1000),
+    })
+  } catch (err) {
+    logger.warn(err, '[chat-run-socket] failed to reopen coding-agent session %s', sessionId)
+  }
 
   try {
-    const inputText = contentBlocksToString(data.input)
+    const codingInput = convertContentBlocksForCodingAgent(data.input)
     const socketUser = socket.data?.user as AuthenticatedUser | undefined
     await writeModelRunProfileToken(socketUser, profile)
     const includeBaseSystemPrompt = agentId === 'claude-code' || agentId === 'codex'
     const runPrompt = [
       includeBaseSystemPrompt ? getSystemPrompt(undefined, { source: data.session_source || data.source }) : '',
     ].filter(Boolean).join('\n')
-    await sendCodingAgentRunInput(sessionId, inputText, runPrompt)
+    if (Array.isArray(data.input)) {
+      await sendCodingAgentRunInput(
+        sessionId,
+        codingInput.text,
+        runPrompt,
+        codingInput.images,
+        contentBlocksToString(data.input),
+      )
+    } else {
+      await sendCodingAgentRunInput(sessionId, codingInput.text, runPrompt)
+    }
   } catch (err) {
     if (!codingAgentRunManager.isSessionProcessing(sessionId)) {
       state.isWorking = false
@@ -114,6 +139,14 @@ export async function handleCodingAgentRun(
       state.activeRunMarker = undefined
       state.events = []
       state.responseRun = undefined
+      try {
+        updateSession(sessionId, {
+          ended_at: Math.floor(Date.now() / 1000),
+          end_reason: 'error',
+        })
+      } catch (updateErr) {
+        logger.warn(updateErr, '[chat-run-socket] failed to write coding-agent send error end marker for %s', sessionId)
+      }
     }
     throw err
   }

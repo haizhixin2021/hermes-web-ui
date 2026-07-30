@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
-import { NButton, NModal, useMessage } from "naive-ui";
+import { NButton, NModal, useMessage, NTag } from "naive-ui";
 import { useAppStore } from "@/stores/hermes/app";
 import { usePersistentRecord } from '@/composables/usePersistentRecord'
 import RouteLinkItem from '@/components/common/RouteLinkItem.vue'
@@ -12,7 +12,8 @@ import LanguageSwitch from "@/components/layout/LanguageSwitch.vue";
 import ThemeSwitch from "@/components/layout/ThemeSwitch.vue";
 import VersionManagementModal from "@/components/layout/VersionManagementModal.vue";
 import { changelog } from "@/data/changelog";
-import { getStoredUsername, isStoredSuperAdmin } from "@/api/client";
+import { getStoredUserId, getStoredUsername, isStoredSuperAdmin } from "@/api/client";
+import { clearThemeBackgroundCache } from '@/api/theme'
 
 const { t } = useI18n();
 const message = useMessage();
@@ -30,6 +31,8 @@ const isDesktopShell = computed(() =>
 );
 const showChangelog = ref(false);
 const showVersionManagement = ref(false);
+const showDockerUpdateTip = ref(false);
+const isDockerRuntime = computed(() => appStore.isDocker);
 
 function hasRoute(name: string): boolean {
   return router.hasRoute(name);
@@ -76,7 +79,9 @@ function handleReloadClient() {
   appStore.reloadClient();
 }
 
-function handleLogout() {
+async function handleLogout() {
+  const userId = getStoredUserId()
+  if (userId) await clearThemeBackgroundCache(userId)
   localStorage.clear();
   window.location.reload();
 }
@@ -87,6 +92,18 @@ function openChangelog() {
 
 function openVersionManagement() {
   showVersionManagement.value = true;
+}
+
+function handleDockerUpdateTip() {
+  showDockerUpdateTip.value = true;
+}
+
+function handleUpdateClick() {
+  if (isDockerRuntime.value) {
+    handleDockerUpdateTip();
+    return;
+  }
+  void handleUpdate();
 }
 </script>
 
@@ -245,6 +262,15 @@ function openVersionManagement() {
           </svg>
         </div>
         <div v-show="!isGroupCollapsed('tools')" class="nav-group-items">
+          <RouteLinkItem v-if="isDesktopShell && hasRoute('hermes.browser')" class="nav-item" :to="{ name: 'hermes.browser' }" :active="selectedKey === 'hermes.browser'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M3 9h18" />
+              <path d="M9 3c-2 5-2 13 0 18" />
+              <path d="M15 3c2 5 2 13 0 18" />
+            </svg>
+            <span>{{ t("sidebar.browser") }}</span>
+          </RouteLinkItem>
           <RouteLinkItem v-if="hasRoute('hermes.codingAgents')" class="nav-item" :to="{ name: 'hermes.codingAgents' }" :active="selectedKey === 'hermes.codingAgents'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="16 18 22 12 16 6" />
@@ -286,6 +312,15 @@ function openVersionManagement() {
           </svg>
         </div>
         <div v-show="!isGroupCollapsed('system')" class="nav-group-items">
+          <RouteLinkItem class="nav-item" :to="{ name: 'hermes.theme' }" :active="selectedKey === 'hermes.theme'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="13.5" cy="6.5" r="2.5" />
+              <circle cx="17.5" cy="10.5" r="2.5" />
+              <circle cx="8.5" cy="7.5" r="2.5" />
+              <path d="M12 3a9 9 0 1 0 9 9c0-1.1-.9-2-2-2h-1.2a2.8 2.8 0 0 1-2.8-2.8V5c0-1.1-.9-2-2-2h-1z" />
+            </svg>
+            <span>{{ t("sidebar.theme") }}</span>
+          </RouteLinkItem>
           <RouteLinkItem v-if="isSuperAdmin" class="nav-item" :to="{ name: 'hermes.profiles' }" :active="selectedKey === 'hermes.profiles'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
@@ -355,14 +390,35 @@ function openVersionManagement() {
         </span>
         <ThemeSwitch />
       </div>
-      <NButton v-if="isDesktopShell" type="primary" size="tiny" block class="update-btn" @click="openVersionManagement">
-        {{ t('sidebar.versionManagement') }}
+      <NButton
+        v-if="isDesktopShell"
+        type="primary"
+        size="tiny"
+        block
+        class="update-btn version-management-btn"
+        :class="{ 'has-update': appStore.updateAvailable }"
+        @click="openVersionManagement"
+      >
+        <span class="version-management-label">
+          {{ t('sidebar.versionManagement') }}
+          <span class="version-update-label">{{ t('sidebar.updateAvailableLabel') }}</span>
+        </span>
       </NButton>
       <NButton v-if="appStore.clientOutdated" type="warning" size="tiny" block class="update-btn" @click="handleReloadClient">
         {{ t('sidebar.reloadClientVersion', { version: appStore.serverVersion }) }}
       </NButton>
-      <NButton v-if="appStore.updateAvailable" type="primary" size="tiny" block class="update-btn" :loading="appStore.updating" @click="handleUpdate">
-        {{ appStore.updating ? t('sidebar.updating') : t('sidebar.updateVersion', { version: appStore.latestVersion }) }}
+      <NButton
+        v-else-if="appStore.updateAvailable"
+        type="primary"
+        size="tiny"
+        block
+        class="update-btn"
+        :loading="!isDockerRuntime && appStore.updating"
+        @click="handleUpdateClick"
+      >
+        {{ !isDockerRuntime && appStore.updating
+          ? t('sidebar.updating')
+          : t('sidebar.updateVersion', { version: appStore.latestVersion }) }}
       </NButton>
     </div>
 
@@ -396,6 +452,19 @@ function openVersionManagement() {
       </div>
     </NModal>
     <VersionManagementModal v-if="isDesktopShell" v-model:show="showVersionManagement" />
+
+    <NModal v-model:show="showDockerUpdateTip" preset="dialog" :title="t('sidebar.dockerUpdateTitle')" style="width: 480px;">
+      <div class="docker-update-modal">
+        <p>{{ t('sidebar.dockerUpdateGuide') }}</p>
+        <div class="docker-update-commands">
+          <code class="docker-command">docker compose pull</code>
+          <code class="docker-command">docker compose up -d --force-recreate</code>
+        </div>
+        <p class="docker-update-note">
+          <NTag size="small" type="info" :bordered="false">{{ t('sidebar.dockerUpdateNote') }}</NTag>
+        </p>
+      </div>
+    </NModal>
   </aside>
 </template>
 
@@ -405,12 +474,18 @@ function openVersionManagement() {
 .sidebar {
   position: relative;
   width: $sidebar-width;
-  height: calc(100 * var(--vh));
-  background-color: $bg-sidebar;
-  border-right: 1px solid $border-color;
+  height: auto;
+  min-height: 0;
+  align-self: stretch;
+  margin: 10px;
+  background-color: $bg-sidebar-surface;
+  border: 1px solid $border-color;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
   display: flex;
   flex-direction: column;
   padding: 8px 12px 20px;
+  overflow: hidden;
   flex-shrink: 0;
   transition: width $transition-normal;
 }
@@ -655,6 +730,28 @@ function openVersionManagement() {
   border-radius: $radius-sm;
 }
 
+.version-management-btn {
+  .version-management-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .version-update-label {
+    display: none;
+    flex: 0 0 auto;
+    color: inherit;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  &.has-update .version-update-label {
+    display: inline;
+  }
+}
+
 .changelog-list {
   max-height: min(70vh, 640px);
   overflow-y: auto;
@@ -828,10 +925,13 @@ function openVersionManagement() {
 @media (max-width: $breakpoint-mobile) {
   .sidebar {
     position: fixed;
-    left: 0;
-    top: 0;
+    left: 10px;
+    top: 10px;
+    bottom: 10px;
+    margin: 0;
+    height: auto;
     z-index: 1000;
-    transform: translateX(-100%);
+    transform: translateX(calc(-100% - 10px));
     transition: transform $transition-normal;
     padding-top: env(safe-area-inset-top, 0px);
 
@@ -849,4 +949,38 @@ function openVersionManagement() {
     }
   }
 }
+
+.docker-update-modal {
+  p {
+    margin: 12px 0;
+    font-size: 14px;
+    line-height: 1.6;
+    color: $text-secondary;
+  }
+
+  .docker-update-commands {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 16px 0;
+  }
+
+  .docker-command {
+    display: block;
+    padding: 10px 14px;
+    background: $code-bg;
+    border-radius: $radius-sm;
+    font-family: $font-code;
+    font-size: 13px;
+    color: $text-primary;
+    user-select: all;
+    cursor: text;
+    border: 1px solid $border-color;
+  }
+
+  .docker-update-note {
+    margin-top: 16px;
+  }
+}
+
 </style>

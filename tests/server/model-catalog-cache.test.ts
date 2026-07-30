@@ -10,6 +10,7 @@ const {
   mockGetProfileDir,
   mockReadAppConfig,
   mockResolveCopilotOAuthToken,
+  mockFetchCopilotModelsWithOAuthToken,
   mockGlobalFetch,
 } = vi.hoisted(() => ({
   mockReadFile: vi.fn(),
@@ -21,6 +22,7 @@ const {
   mockGetProfileDir: vi.fn(),
   mockReadAppConfig: vi.fn(),
   mockResolveCopilotOAuthToken: vi.fn(),
+  mockFetchCopilotModelsWithOAuthToken: vi.fn(),
   mockGlobalFetch: vi.fn(),
 }))
 
@@ -71,12 +73,6 @@ vi.mock('../../packages/server/src/shared/providers', () => ({
       models: ['anthropic/claude-opus-4.8'],
     },
     {
-      value: 'google-gemini-cli',
-      label: 'Google Gemini OAuth',
-      base_url: 'cloudcode-pa://google',
-      models: ['gemini-3.1-pro-preview', 'gemini-3-pro-preview'],
-    },
-    {
       value: 'claude-oauth',
       label: 'Claude OAuth',
       base_url: 'https://api.anthropic.com',
@@ -93,7 +89,6 @@ vi.mock('../../packages/server/src/services/config-helpers', () => ({
     'xai-oauth': { api_key_env: '', base_url_env: '' },
     copilot: { api_key_env: 'GITHUB_TOKEN', base_url_env: '' },
     nous: { api_key_env: '', base_url_env: '' },
-    'google-gemini-cli': { api_key_env: '', base_url_env: '' },
     'claude-oauth': { api_key_env: '', base_url_env: '' },
   },
   fetchProviderModels: mockFetchProviderModels,
@@ -106,6 +101,7 @@ vi.mock('../../packages/server/src/services/app-config', () => ({
 
 vi.mock('../../packages/server/src/services/hermes/copilot-models', () => ({
   resolveCopilotOAuthToken: mockResolveCopilotOAuthToken,
+  fetchCopilotModelsWithOAuthToken: mockFetchCopilotModelsWithOAuthToken,
 }))
 
 vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
@@ -141,6 +137,7 @@ describe('model catalog cache', () => {
     })
     mockReadAppConfig.mockResolvedValue({})
     mockResolveCopilotOAuthToken.mockResolvedValue('')
+    mockFetchCopilotModelsWithOAuthToken.mockResolvedValue([])
     mockFetchProviderModels.mockResolvedValue([])
     mockGlobalFetch.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) })
     vi.stubGlobal('fetch', mockGlobalFetch)
@@ -168,6 +165,102 @@ describe('model catalog cache', () => {
         ],
       }
     })
+  })
+
+  it('resolves cached catalogs by source and authoritative manifest presence', async () => {
+    const { providerModelCatalogKey, resolveProviderCatalogModels } = await import(
+      '../../packages/server/src/services/hermes/model-catalog-cache'
+    )
+    const provider = 'xai'
+    const baseUrl = 'https://api.x.ai/v1'
+    const key = providerModelCatalogKey(provider, baseUrl)
+    const cachedModels = ['grok-4.3', 'grok-imagine-image']
+    const currentModels = ['grok-build-0.1', 'grok-4.3']
+    const fallbackEntry = {
+      provider,
+      label: 'xAI',
+      base_url: baseUrl,
+      models: cachedModels,
+      source: 'fallback' as const,
+      updated_at: '2026-01-01T00:00:00.000Z',
+    }
+    const fallbackCache = {
+      version: 1 as const,
+      updated_at: fallbackEntry.updated_at,
+      providers: { [key]: fallbackEntry },
+    }
+
+    expect(resolveProviderCatalogModels(
+      fallbackCache,
+      provider,
+      baseUrl,
+      currentModels,
+      { hasStaticManifest: true },
+    )).toEqual(currentModels)
+    expect(resolveProviderCatalogModels(
+      fallbackCache,
+      provider,
+      baseUrl,
+      [],
+      { hasStaticManifest: true },
+    )).toEqual([])
+    expect(resolveProviderCatalogModels(
+      fallbackCache,
+      provider,
+      baseUrl,
+      [],
+      { hasStaticManifest: false },
+    )).toEqual(cachedModels)
+    expect(resolveProviderCatalogModels(
+      { ...fallbackCache, providers: { [key]: { ...fallbackEntry, source: 'live' as const } } },
+      provider,
+      baseUrl,
+      currentModels,
+      { hasStaticManifest: true },
+    )).toEqual(cachedModels)
+    expect(resolveProviderCatalogModels(
+      { ...fallbackCache, providers: {} },
+      provider,
+      baseUrl,
+      currentModels,
+      { hasStaticManifest: true },
+    )).toEqual(currentModels)
+  })
+
+  it('preserves the last-good live catalog when a refresh returns no models', async () => {
+    const { providerModelCatalogKey, refreshProviderModelCatalog } = await import(
+      '../../packages/server/src/services/hermes/model-catalog-cache'
+    )
+    const provider = 'deepseek'
+    const baseUrl = 'https://api.deepseek.com/v1'
+    const key = providerModelCatalogKey(provider, baseUrl)
+    const lastGood = {
+      provider,
+      label: 'DeepSeek',
+      base_url: baseUrl,
+      models: ['deepseek-last-good'],
+      source: 'live' as const,
+      updated_at: '2026-06-01T12:00:00.000Z',
+      profiles: ['default'],
+    }
+    cacheText = JSON.stringify({
+      version: 1,
+      updated_at: lastGood.updated_at,
+      providers: { [key]: lastGood },
+    })
+    mockFetchProviderModels.mockResolvedValueOnce([])
+
+    await refreshProviderModelCatalog({
+      provider,
+      label: 'DeepSeek',
+      base_url: baseUrl,
+      api_key: 'failed-refresh-key',
+      fallback_models: ['deepseek-chat'],
+      profiles: ['default'],
+    })
+
+    const after = JSON.parse(cacheText)
+    expect(after.providers[key]).toEqual(lastGood)
   })
 
   it('refreshes providers from all profiles and deduplicates identical catalogs', async () => {
@@ -200,10 +293,57 @@ describe('model catalog cache', () => {
     })
   })
 
+  it('clears a stale profile catalog after a successful global refresh', async () => {
+    mockListProfileNamesFromDisk.mockReturnValue(['default'])
+    mockFetchProviderModels.mockImplementation(async (baseUrl: string) => (
+      baseUrl === 'https://openrouter.ai/api/v1'
+        ? ['openrouter/fresh-from-global']
+        : []
+    ))
+    const {
+      providerModelCatalogKey,
+      refreshConfiguredProviderModelCatalogs,
+      resolveProviderCatalogModels,
+      writeProviderModelCatalogEntry,
+    } = await import('../../packages/server/src/services/hermes/model-catalog-cache')
+    const scopedKey = providerModelCatalogKey(
+      'openrouter',
+      'https://openrouter.ai/api/v1',
+      true,
+      'default',
+    )
+    await writeProviderModelCatalogEntry({
+      provider: 'openrouter',
+      label: 'OpenRouter',
+      base_url: 'https://openrouter.ai/api/v1',
+      models: ['openrouter/stale-from-card'],
+      source: 'live',
+      free_only: true,
+      profile: 'default',
+      profiles: ['default'],
+    })
+
+    await refreshConfiguredProviderModelCatalogs({ force: true })
+
+    const cache = JSON.parse(cacheText)
+    expect(cache.providers[scopedKey]).toBeUndefined()
+    expect(resolveProviderCatalogModels(
+      cache,
+      'openrouter',
+      'https://openrouter.ai/api/v1',
+      [],
+      { freeOnly: true, profile: 'default' },
+    )).toEqual(['openrouter/fresh-from-global'])
+  })
+
   it('adds authorized providers to the catalog cache and fetches live models for compatible auth providers', async () => {
     mockListProfileNamesFromDisk.mockReturnValue(['default'])
     mockReadAppConfig.mockResolvedValue({ copilotEnabled: true })
     mockResolveCopilotOAuthToken.mockResolvedValue('gho-copilot')
+    mockFetchCopilotModelsWithOAuthToken.mockResolvedValue([
+      { id: 'gpt-5.6-copilot', preview: false, disabled: false },
+      { id: 'claude-sonnet-4.6', preview: false, disabled: false },
+    ])
     mockGlobalFetch.mockImplementation(async (url: string) => {
       if (url === 'https://chatgpt.com/backend-api/codex/models?client_version=1.0.0') {
         return {
@@ -213,17 +353,6 @@ describe('model catalog cache', () => {
               { slug: 'hidden-codex', visibility: 'hidden', priority: 0 },
               { slug: 'gpt-5.4-mini', priority: 20 },
               { slug: 'gpt-5.5', priority: 10 },
-            ],
-          }),
-        }
-      }
-      if (url === 'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota') {
-        return {
-          ok: true,
-          json: async () => ({
-            buckets: [
-              { modelId: 'gemini-3.1-pro-preview' },
-              { modelId: 'gemini-3-flash-preview' },
             ],
           }),
         }
@@ -245,11 +374,6 @@ describe('model catalog cache', () => {
         return JSON.stringify({
           providers: {
             'openai-codex': { tokens: { access_token: 'codex-token' } },
-            'google-gemini-cli': {
-              access_token: 'gemini-access-token',
-              refresh_token: 'gemini-refresh-token',
-              base_url: 'cloudcode-pa://google',
-            },
             'claude-oauth': {
               tokens: {
                 access_token: 'claude-access-token',
@@ -271,15 +395,26 @@ describe('model catalog cache', () => {
     })
     mockReadConfigYamlForProfile.mockResolvedValue({})
 
-    const { refreshConfiguredProviderModelCatalogs, providerModelCatalogKey } = await import(
+    const {
+      providerModelCatalogKey,
+      refreshConfiguredProviderModelCatalogs,
+      resolveProviderCatalogRefreshTarget,
+    } = await import(
       '../../packages/server/src/services/hermes/model-catalog-cache'
     )
 
     await refreshConfiguredProviderModelCatalogs({ force: true })
 
+    await expect(resolveProviderCatalogRefreshTarget('default', 'openai-codex')).resolves.toMatchObject({
+      provider: 'openai-codex',
+      api_key: 'codex-token',
+      credential_kind: 'oauth',
+      profile: 'default',
+    })
     expect(mockFetchProviderModels).toHaveBeenCalledTimes(2)
     expect(mockFetchProviderModels).toHaveBeenCalledWith('https://inference-api.nousresearch.com/v1', 'nous-agent-key', false)
     expect(mockFetchProviderModels).toHaveBeenCalledWith('https://api.x.ai/v1', 'xai-access-token', false)
+    expect(mockFetchCopilotModelsWithOAuthToken).toHaveBeenCalledWith('gho-copilot')
     const cache = JSON.parse(cacheText)
     expect(cache.providers[providerModelCatalogKey('openai-codex', 'https://chatgpt.com/backend-api/codex')]).toMatchObject({
       provider: 'openai-codex',
@@ -295,19 +430,13 @@ describe('model catalog cache', () => {
     })
     expect(cache.providers[providerModelCatalogKey('copilot', 'https://api.githubcopilot.com')]).toMatchObject({
       provider: 'copilot',
-      models: ['gpt-5.5', 'claude-sonnet-4.6'],
-      source: 'fallback',
+      models: ['gpt-5.6-copilot', 'claude-sonnet-4.6'],
+      source: 'live',
       profiles: ['default'],
     })
     expect(cache.providers[providerModelCatalogKey('nous', 'https://inference-api.nousresearch.com/v1')]).toMatchObject({
       provider: 'nous',
       models: ['nous/live-a', 'nous/live-b'],
-      source: 'live',
-      profiles: ['default'],
-    })
-    expect(cache.providers[providerModelCatalogKey('google-gemini-cli', 'cloudcode-pa://google')]).toMatchObject({
-      provider: 'google-gemini-cli',
-      models: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview'],
       source: 'live',
       profiles: ['default'],
     })

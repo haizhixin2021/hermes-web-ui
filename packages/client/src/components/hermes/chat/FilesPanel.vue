@@ -1,21 +1,34 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { defineAsyncComponent, ref, onMounted, watch } from 'vue'
 import { useFilesStore } from '@/stores/hermes/files'
 import { useI18n } from 'vue-i18n'
-import { NButton } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import FileTree from '@/components/hermes/files/FileTree.vue'
 import FileBreadcrumb from '@/components/hermes/files/FileBreadcrumb.vue'
 import FileToolbar from '@/components/hermes/files/FileToolbar.vue'
 import FileList from '@/components/hermes/files/FileList.vue'
 import FileContextMenu from '@/components/hermes/files/FileContextMenu.vue'
-import FileEditor from '@/components/hermes/files/FileEditor.vue'
-import FilePreview from '@/components/hermes/files/FilePreview.vue'
 import FileUploadModal from '@/components/hermes/files/FileUploadModal.vue'
 import FileRenameModal from '@/components/hermes/files/FileRenameModal.vue'
 import type { FileEntry } from '@/api/hermes/files'
+import { fetchSessionWorkspaceAttachmentBlob } from '@/api/hermes/sessions'
+import { fetchGroupWorkspaceAttachmentBlob } from '@/api/hermes/group-chat'
+
+const FileEditor = defineAsyncComponent(async () => (await import('@/components/hermes/files/FileEditor.vue')).default)
 
 const filesStore = useFilesStore()
 const { t } = useI18n()
+const message = useMessage()
+
+const props = defineProps<{
+  workspaceSessionId?: string | null
+  workspaceRoomId?: string | null
+  workspace?: string | null
+}>()
+
+const emit = defineEmits<{
+  (e: 'attach', file: File): void
+}>()
 
 const contextMenuRef = ref<InstanceType<typeof FileContextMenu> | null>(null)
 const showUpload = ref(false)
@@ -24,6 +37,7 @@ const renameMode = ref<'newFile' | 'newFolder' | 'rename'>('newFile')
 const renameEntry = ref<FileEntry | null>(null)
 const renameTargetPath = ref<string | null>(null)
 const showSidebar = ref(false)
+const lastStandardPath = ref('')
 
 function handleContextMenu(e: MouseEvent, entry: FileEntry) {
   contextMenuRef.value?.show(e, entry)
@@ -57,8 +71,46 @@ function handleRename(entry: FileEntry) {
   showRenameModal.value = true
 }
 
+async function handleAttach(entry: FileEntry) {
+  if (entry.isDir) return
+  try {
+    const blob = props.workspaceSessionId
+      ? await fetchSessionWorkspaceAttachmentBlob(props.workspaceSessionId, entry.path)
+      : props.workspaceRoomId
+        ? await fetchGroupWorkspaceAttachmentBlob(props.workspaceRoomId, entry.path)
+        : null
+    if (!blob) return
+    emit('attach', new File([blob], entry.name, {
+      type: blob.type || 'application/octet-stream',
+      lastModified: Date.parse(entry.modTime) || Date.now(),
+    }))
+  } catch {
+    message.error(t('files.attachFailed'))
+  }
+}
+
+watch(
+  () => [props.workspaceSessionId, props.workspaceRoomId, props.workspace] as const,
+  ([workspaceSessionId, workspaceRoomId, workspace]) => {
+    if ((workspaceSessionId || workspaceRoomId) && workspace) {
+      if (!filesStore.currentWorkspaceSessionId && !filesStore.currentWorkspaceRoomId) lastStandardPath.value = filesStore.currentPath
+      void filesStore.fetchEntries('', { workspaceSessionId, workspaceRoomId })
+      return
+    }
+    if (filesStore.currentWorkspaceSessionId || filesStore.currentWorkspaceRoomId) {
+      void filesStore.fetchEntries(lastStandardPath.value, { profile: null, workspaceSessionId: null, workspaceRoomId: null })
+    }
+  },
+)
+
 onMounted(() => {
-  filesStore.fetchEntries('', { profile: null })
+  if ((props.workspaceSessionId || props.workspaceRoomId) && props.workspace) {
+    void filesStore.fetchEntries('', { workspaceSessionId: props.workspaceSessionId, workspaceRoomId: props.workspaceRoomId })
+  } else if (filesStore.currentWorkspaceSessionId || filesStore.currentWorkspaceRoomId) {
+    void filesStore.fetchEntries(lastStandardPath.value, { profile: null, workspaceSessionId: null, workspaceRoomId: null })
+  } else if (!filesStore.entries.length && !filesStore.loading) {
+    void filesStore.fetchEntries('', { profile: null, workspaceSessionId: null, workspaceRoomId: null })
+  }
 })
 </script>
 
@@ -73,7 +125,7 @@ onMounted(() => {
       class="files-tree-panel"
       :class="{ 'mobile-visible': showSidebar }"
     >
-      <FileTree />
+      <FileTree :workspace-key="workspace" />
     </div>
     <div class="files-main-panel">
       <div class="main-toolbar">
@@ -91,20 +143,26 @@ onMounted(() => {
           {{ t('files.fileTree') }}
         </NButton>
         <FileToolbar
+          :allow-upload="!workspace"
           @show-new-file="handleShowNewFile"
           @show-new-folder="handleShowNewFolder"
           @show-upload="showUpload = true"
         />
       </div>
+      <div v-if="workspace" class="workspace-context" :title="workspace">
+        <span class="workspace-context-label">{{ t('chat.workspace') }}</span>
+        <span class="workspace-context-path">{{ workspace }}</span>
+      </div>
       <FileBreadcrumb />
       <div class="files-content">
         <FileEditor v-if="filesStore.editingFile" />
-        <FilePreview v-else-if="filesStore.previewFile" />
         <FileList v-else @contextmenu-entry="handleContextMenu" />
       </div>
     </div>
     <FileContextMenu
       ref="contextMenuRef"
+      :allow-attach="Boolean(workspaceSessionId || workspaceRoomId)"
+      @attach="handleAttach"
       @rename="handleRename"
       @new-folder="handleContextNewFolder"
     />
@@ -193,6 +251,30 @@ onMounted(() => {
     padding: 8px 8px;
     flex-wrap: wrap;
   }
+}
+
+.workspace-context {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 16px 4px;
+  color: $text-secondary;
+  font-size: 12px;
+}
+
+.workspace-context-label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: $text-muted;
+}
+
+.workspace-context-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: $font-code;
 }
 
 .sidebar-toggle {

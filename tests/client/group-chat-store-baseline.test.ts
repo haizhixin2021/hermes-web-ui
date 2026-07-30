@@ -15,6 +15,22 @@ const groupChatApiMock = vi.hoisted(() => {
       handlers.set(event, existing)
       return socket
     }),
+    once: vi.fn((event: string, cb: Function) => {
+      const wrapped = (...args: any[]) => {
+        socket.off(event, wrapped)
+        cb(...args)
+      }
+      return socket.on(event, wrapped)
+    }),
+    off: vi.fn((event: string, cb?: Function) => {
+      if (!cb) {
+        handlers.delete(event)
+        return socket
+      }
+      const existing = handlers.get(event) || []
+      handlers.set(event, existing.filter(handler => handler !== cb))
+      return socket
+    }),
     emit: vi.fn((event: string, data?: any, ack?: Function) => {
       if (event === 'join' && ack) ack(joinAck)
       if (event === 'message' && ack) ack({ id: data?.id })
@@ -41,6 +57,7 @@ const groupChatApiMock = vi.hoisted(() => {
     cloneRoom: vi.fn(),
     deleteRoom: vi.fn(),
     clearRoomContext: vi.fn(),
+    updateInviteCode: vi.fn(),
   }
 })
 const clientApiMock = vi.hoisted(() => ({
@@ -130,7 +147,10 @@ describe('group chat store baseline lifecycle', () => {
     clientApiMock.getStoredUsername.mockReturnValue(null)
     authApiMock.fetchCurrentUser.mockRejectedValue(new Error('not signed in'))
     fetchMock.mockReset()
+    groupChatApiMock.socket.connected = true
     groupChatApiMock.socket.on.mockClear()
+    groupChatApiMock.socket.once.mockClear()
+    groupChatApiMock.socket.off.mockClear()
     groupChatApiMock.socket.emit.mockReset()
     groupChatApiMock.socket.emit.mockImplementation((event: string, data?: any, ack?: Function) => {
       if (event === 'join' && ack) ack({ members: [], agents: [], typingUsers: [], contextStatuses: [] })
@@ -192,6 +212,109 @@ describe('group chat store baseline lifecycle', () => {
     expect(store.contextStatuses.get('Agent')).toEqual({ agentName: 'Agent', status: 'replying' })
   })
 
+  it('persists the create-form member profile with a new room', async () => {
+    const store = await loadStore()
+    groupChatApiMock.createRoom.mockResolvedValue({
+      room,
+      agents: [],
+    })
+
+    await store.createNewRoom(
+      'Family Room',
+      'ROOM1',
+      undefined,
+      undefined,
+      undefined,
+      { name: '妈妈', description: 'family profile' },
+    )
+
+    expect(groupChatApiMock.createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Family Room',
+      inviteCode: 'ROOM1',
+      memberName: '妈妈',
+      memberDescription: 'family profile',
+    }))
+  })
+
+  it('updates only the current room member profile through the joined socket', async () => {
+    const store = await loadStore()
+    groupChatApiMock.socket.emit.mockImplementation((event: string, data?: any, ack?: Function) => {
+      if (event === 'join' && ack) {
+        ack({
+          roomName: 'Family Room',
+          members: [{ ...member, name: 'alice-login', description: '' }],
+          agents: [],
+          typingUsers: [],
+          contextStatuses: [],
+        })
+      }
+      if (event === 'update_member_profile' && ack) {
+        ack({
+          members: [{ ...member, name: data.name, description: data.description }],
+        })
+      }
+      return groupChatApiMock.socket
+    })
+
+    await store.connect()
+    await store.joinRoom('room-1')
+    await store.updateCurrentMemberProfile(' 妈妈 ', ' family profile ')
+
+    expect(groupChatApiMock.socket.emit).toHaveBeenCalledWith(
+      'update_member_profile',
+      {
+        roomId: 'room-1',
+        name: '妈妈',
+        description: 'family profile',
+      },
+      expect.any(Function),
+    )
+    expect(store.userName).toBe('妈妈')
+    expect(store.members[0]).toEqual(expect.objectContaining({
+      name: '妈妈',
+      description: 'family profile',
+    }))
+    expect(localStorage.getItem('gc_user_name')).toBe('妈妈')
+  })
+
+  it('joins invite rooms over realtime before fetching protected detail when the socket starts disconnected', async () => {
+    const store = await loadStore()
+    const order: string[] = []
+
+    groupChatApiMock.socket.connected = false
+    groupChatApiMock.getSocket.mockImplementation((options?: { requireConnected?: boolean }) => (
+      groupChatApiMock.socket.connected || options?.requireConnected === false ? groupChatApiMock.socket : null
+    ))
+    groupChatApiMock.socket.once.mockImplementation((event: string, cb: Function) => {
+      if (event === 'connect') {
+        setTimeout(() => {
+          groupChatApiMock.socket.connected = true
+          cb()
+        }, 0)
+      }
+      return groupChatApiMock.socket
+    })
+    groupChatApiMock.socket.emit.mockImplementation((event: string, data?: any, ack?: Function) => {
+      if (event === 'join' && ack) {
+        order.push(data?.inviteCode ? 'invite-join' : 'detail-join')
+        ack({ roomName: 'Realtime Room', members: [member], agents: [], typingUsers: [], contextStatuses: [] })
+      }
+      return groupChatApiMock.socket
+    })
+    groupChatApiMock.joinRoomByCode.mockResolvedValue({ room })
+    groupChatApiMock.getRoomDetail.mockImplementation(async () => {
+      order.push('detail')
+      return { room, messages: [], agents: [], members: [member], total: 0, hasMore: false }
+    })
+
+    await store.joinByCode('ROOM1')
+
+    expect(groupChatApiMock.connectGroupChat).toHaveBeenCalled()
+    expect(groupChatApiMock.getRoomDetail).toHaveBeenCalledWith('room-1')
+    expect(order).toEqual(['invite-join', 'detail', 'detail-join'])
+    expect(store.currentRoomId).toBe('room-1')
+  })
+
   it('sends text-only messages through the room socket', async () => {
     const store = await loadStore()
     await store.connect()
@@ -204,6 +327,32 @@ describe('group chat store baseline lifecycle', () => {
       content: 'hello room',
     }), expect.any(Function))
     expect(store.error).toBeNull()
+  })
+
+  it('sends a group reference with explicit agent markup and clears the draft reference', async () => {
+    const store = await loadStore()
+    await store.connect()
+    await store.joinRoom('room-1')
+    store.setMessageReference('room-1', {
+      id: 'quoted-1',
+      role: 'assistant',
+      content: '@Agent previous answer',
+      sender: 'Agent',
+    })
+
+    await store.sendMessage('@Agent continue')
+
+    expect(groupChatApiMock.socket.emit).toHaveBeenCalledWith('message', expect.objectContaining({
+      roomId: 'room-1',
+      content: [
+        '<quoted_message sender="Agent">',
+        '@Agent previous answer',
+        '</quoted_message>',
+        '',
+        '@Agent continue',
+      ].join('\n'),
+    }), expect.any(Function))
+    expect(store.activeMessageReference).toBeNull()
   })
 
   it('clears local room context from API response and room_cleared event', async () => {

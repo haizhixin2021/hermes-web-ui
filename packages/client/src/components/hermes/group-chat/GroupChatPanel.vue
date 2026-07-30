@@ -1,33 +1,58 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useMessage, NInput, NButton, NSpace, NSelect, NPopover, NPopconfirm, NInputNumber, NDropdown, type DropdownOption } from 'naive-ui'
+import { useMessage, NInput, NButton, NSpace, NSelect, NPopover, NPopconfirm, NInputNumber, NDropdown, NModal, type DropdownOption } from 'naive-ui'
 import { useGroupChatStore } from '@/stores/hermes/group-chat'
+import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import { updateRoomConfig, forceCompress } from '@/api/hermes/group-chat'
 import GroupMessageList from './GroupMessageList.vue'
 import GroupChatInput from './GroupChatInput.vue'
+import FolderPicker from '@/components/hermes/chat/FolderPicker.vue'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
 import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
 import SettingsCircuitBadge from '@/components/layout/SettingsCircuitBadge.vue'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { Attachment } from '@/stores/hermes/chat'
-import type { RoomAgent } from '@/api/hermes/group-chat'
+import type { RoomAgent, RoomInfo } from '@/api/hermes/group-chat'
+import { useFilesStore } from '@/stores/hermes/files'
+import { useToolPanelStore } from '@/stores/hermes/tool-panel'
+import { hasDesktopBrowserBridge } from '@/utils/desktop-bridge'
+import { OPEN_DESKTOP_BROWSER_PANEL_EVENT } from '@/utils/desktop-browser'
+
+const FilesPanel = defineAsyncComponent(async () => (await import('@/components/hermes/chat/FilesPanel.vue')).default)
+const FilePreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/FilePreview.vue')).default)
+const WorkspaceDiffPreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/WorkspaceDiffPreview.vue')).default)
+const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('@/components/hermes/chat/DesktopBrowserPanel.vue')).default)
 
 const { t } = useI18n()
 const router = useRouter()
 const message = useMessage()
+const appStore = useAppStore()
 const store = useGroupChatStore()
 const profilesStore = useProfilesStore()
+const filesStore = useFilesStore()
+const toolPanelStore = useToolPanelStore()
 
 const showSidebar = ref(window.innerWidth > 768)
+watch(
+    showSidebar,
+    expanded => appStore.setPageSidebarExpanded(expanded),
+    { immediate: true },
+)
 const showCreateModal = ref(false)
 const showCloneModal = ref(false)
 const showAddAgentModal = ref(false)
 const showCompressionModal = ref(false)
+const showUserProfileModal = ref(false)
+const userProfileName = ref('')
+const userProfileDescription = ref('')
+const isSavingUserProfile = ref(false)
 const compressionConfig = ref({ triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 })
 const isCompressing = ref(false)
+const inviteCodeDraft = ref('')
+const isSavingInviteCode = ref(false)
 const selectedProfile = ref<string | null>(null)
 const agentName = ref('')
 const agentDescription = ref('')
@@ -41,6 +66,19 @@ const roomContextMenuY = ref(0)
 const groupChatInputRef = ref<(InstanceType<typeof GroupChatInput> & { addFiles?: (files: File[]) => void }) | null>(null)
 const chatDropCounter = ref(0)
 const isChatDropActive = ref(false)
+const groupChatContentWrapperRef = ref<HTMLElement | null>(null)
+const showWorkspacePanel = ref(false)
+const activeWorkspacePanel = ref<'files' | 'browser'>('files')
+const desktopBrowserAvailable = hasDesktopBrowserBridge()
+const workspacePanelMobile = ref(window.innerWidth <= 768)
+const WORKSPACE_PANEL_MIN_WIDTH = 360
+const WORKSPACE_PANEL_DEFAULT_WIDTH = 560
+const WORKSPACE_PANEL_STORAGE_KEY = 'hermes.groupChat.workspacePanelWidth'
+const workspacePanelWidth = ref(loadWorkspacePanelWidth())
+const workspaceResizeStart = ref<{ x: number; width: number } | null>(null)
+const workspacePanelStyle = computed(() => ({
+    width: workspacePanelMobile.value ? '100%' : `${workspacePanelWidth.value}px`,
+}))
 
 const profileOptions = computed(() =>
     profilesStore.profiles.map(p => ({ label: p.name, value: p.name }))
@@ -56,6 +94,21 @@ function agentAvatarName(agent: RoomAgent): string {
 }
 
 const hasRoom = computed(() => !!store.currentRoomId)
+const currentRoom = computed(() => store.rooms.find(room => room.id === store.currentRoomId) || null)
+const contextRoom = computed(() => store.rooms.find(room => room.id === contextRoomId.value) || null)
+function canManageRoom(room: Pick<RoomInfo, 'canManage'> | null | undefined): boolean {
+    return room?.canManage === true
+}
+const currentRoomCanManage = computed(() => canManageRoom(currentRoom.value))
+const visibleApproval = computed(() => currentRoomCanManage.value ? store.activePendingApproval : null)
+const currentWorkspaceLabel = computed(() => workspaceBasename(currentRoom.value?.workspace || ''))
+const canUpdateInviteCode = computed(() => {
+    const nextCode = inviteCodeDraft.value.trim()
+    return currentRoomCanManage.value && !isSavingInviteCode.value && !!nextCode && nextCode !== (currentRoom.value?.inviteCode || '')
+})
+const showWorkspaceModal = ref(false)
+const workspaceRoomId = ref<string | null>(null)
+const workspaceValue = ref('')
 
 /** Resolve the current user's custom avatar — first from the member list, then from the cached current-user value. */
 const userMemberAvatar = computed(() => {
@@ -69,15 +122,143 @@ const userMemberAvatar = computed(() => {
     } catch { /* malformed JSON — fall through to multiavatar */ }
     return null
 })
-const visibleApproval = computed(() => store.activePendingApproval)
 
 function formatTokens(tokens: number): string {
     if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k tokens`
     return `${tokens} tokens`
 }
 
+function workspaceBasename(path: string): string {
+    const trimmed = String(path || '').trim().replace(/[\\/]+$/, '')
+    if (!trimmed) return ''
+    return trimmed.split(/[\\/]/).pop() || trimmed
+}
+
 function toggleSidebar() {
     showSidebar.value = !showSidebar.value
+}
+
+function loadWorkspacePanelWidth(): number {
+    const saved = Number.parseInt(window.localStorage.getItem(WORKSPACE_PANEL_STORAGE_KEY) || '', 10)
+    return Number.isFinite(saved) ? saved : WORKSPACE_PANEL_DEFAULT_WIDTH
+}
+
+function workspacePanelMaxWidth(): number {
+    if (workspacePanelMobile.value) return window.innerWidth
+    const available = groupChatContentWrapperRef.value?.clientWidth || window.innerWidth
+    return Math.max(320, Math.min(Math.floor(available * 0.88), available - 120))
+}
+
+function clampWorkspacePanelWidth(width: number): number {
+    const maxWidth = workspacePanelMaxWidth()
+    return Math.min(maxWidth, Math.max(Math.min(WORKSPACE_PANEL_MIN_WIDTH, maxWidth), Math.round(width)))
+}
+
+function handleWorkspacePanelResize(): void {
+    workspacePanelMobile.value = window.innerWidth <= 768
+    if (!workspacePanelMobile.value) workspacePanelWidth.value = clampWorkspacePanelWidth(workspacePanelWidth.value)
+}
+
+function handleWorkspaceResizeMove(event: PointerEvent): void {
+    if (!workspaceResizeStart.value) return
+    workspacePanelWidth.value = clampWorkspacePanelWidth(
+        workspaceResizeStart.value.width + workspaceResizeStart.value.x - event.clientX,
+    )
+}
+
+function stopWorkspaceResize(): void {
+    if (!workspaceResizeStart.value) return
+    workspaceResizeStart.value = null
+    window.removeEventListener('pointermove', handleWorkspaceResizeMove)
+    window.removeEventListener('pointerup', stopWorkspaceResize)
+    document.body.style.userSelect = ''
+    document.body.style.cursor = ''
+    if (!workspacePanelMobile.value) {
+        window.localStorage.setItem(WORKSPACE_PANEL_STORAGE_KEY, String(workspacePanelWidth.value))
+    }
+}
+
+function startWorkspaceResize(event: PointerEvent): void {
+    if (workspacePanelMobile.value) return
+    event.preventDefault()
+    workspaceResizeStart.value = { x: event.clientX, width: workspacePanelWidth.value }
+    window.addEventListener('pointermove', handleWorkspaceResizeMove)
+    window.addEventListener('pointerup', stopWorkspaceResize)
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+}
+
+function closeWorkspacePanel(): void {
+    if (toolPanelStore.workspaceDiff?.editable && filesStore.hasUnsavedChanges) {
+        message.warning(t('files.unsavedChanges'))
+        return
+    }
+    if (toolPanelStore.workspaceDiff?.editable && filesStore.editingFile) filesStore.closeEditor()
+    filesStore.closePreview()
+    toolPanelStore.closeWorkspaceDiff()
+    showWorkspacePanel.value = false
+}
+
+function toggleWorkspacePanel(): void {
+    if (!currentRoom.value?.workspace) return
+    if (showWorkspacePanel.value && activeWorkspacePanel.value === 'files') {
+        closeWorkspacePanel()
+        return
+    }
+    activeWorkspacePanel.value = 'files'
+    showWorkspacePanel.value = true
+}
+
+function selectWorkspacePanel(panel: 'files' | 'browser'): void {
+    if (panel === 'browser') {
+        if (!desktopBrowserAvailable) return
+        if (toolPanelStore.workspaceDiff?.editable && filesStore.hasUnsavedChanges) {
+            message.warning(t('files.unsavedChanges'))
+            return
+        }
+        if (toolPanelStore.workspaceDiff?.editable && filesStore.editingFile) filesStore.closeEditor()
+        filesStore.closePreview()
+        toolPanelStore.closeWorkspaceDiff()
+    }
+    activeWorkspacePanel.value = panel
+    showWorkspacePanel.value = true
+}
+
+function handleOpenDesktopBrowserPanelRequest(): void {
+    selectWorkspacePanel('browser')
+}
+
+function handleBrowserAttachment(payload: { file: File }): void {
+    groupChatInputRef.value?.addFiles?.([payload.file])
+}
+
+function groupWorkspacePreviewPath(filePath: string): string | null {
+    const workspace = currentRoom.value?.workspace?.replace(/\\/g, '/').replace(/\/+$/, '')
+    let decodedPath = filePath
+    try { decodedPath = decodeURIComponent(filePath) } catch { /* server validates malformed input */ }
+    const normalizedPath = decodedPath.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (!normalizedPath) return null
+    if (!(normalizedPath.startsWith('/') || /^[a-zA-Z]:\//.test(normalizedPath))) return normalizedPath
+    if (!workspace) return normalizedPath
+    const ignoreCase = /^[a-zA-Z]:\//.test(workspace)
+    const comparableWorkspace = ignoreCase ? workspace.toLowerCase() : workspace
+    const comparablePath = ignoreCase ? normalizedPath.toLowerCase() : normalizedPath
+    if (comparablePath.startsWith(`${comparableWorkspace}/`)) return normalizedPath.slice(workspace.length + 1)
+    return normalizedPath
+}
+
+function handleWorkspaceFilePreviewRequest(event: Event): void {
+    const customEvent = event as CustomEvent<{ path?: string; fileName?: string }>
+    const roomId = store.currentRoomId
+    const path = groupWorkspacePreviewPath(typeof customEvent.detail?.path === 'string' ? customEvent.detail.path : '')
+    if (!roomId || !path || !currentRoomCanManage.value) return
+    customEvent.preventDefault()
+    const fileName = customEvent.detail?.fileName || path.split('/').pop() || path
+    toolPanelStore.closeWorkspaceDiff()
+    filesStore.closePreview()
+    void filesStore.openGroupWorkspacePreview(roomId, path, fileName).catch(error => {
+        message.error(error instanceof Error ? error.message : t('files.previewFailed'))
+    })
 }
 
 function openPageSidebar() {
@@ -126,6 +307,10 @@ function handleChatDrop(event: DragEvent) {
     groupChatInputRef.value?.addFiles?.(files)
 }
 
+function handleWorkspaceFileAttach(file: File) {
+    groupChatInputRef.value?.addFiles?.([file])
+}
+
 function generateCode(): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     let code = ''
@@ -157,10 +342,17 @@ function extractApiErrorMessage(err: any): string {
     return raw || t('common.saveFailed')
 }
 
-async function handleCreateRoom(name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }) {
+async function handleCreateRoom(name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }, workspace: string) {
     try {
         store.setUserInfo(userName, description)
-        const res = await store.createNewRoom(name, inviteCode, undefined, compression)
+        const res = await store.createNewRoom(
+            name,
+            inviteCode,
+            undefined,
+            compression,
+            workspace,
+            { name: userName, description },
+        )
         showCreateModal.value = false
         const failureMessage = formatAgentFailures(res.agentResults)
         if (failureMessage) message.warning(failureMessage)
@@ -172,6 +364,8 @@ async function handleCreateRoom(name: string, inviteCode: string, userName: stri
 }
 
 async function handleDeleteRoom(roomId: string) {
+    const room = store.rooms.find(r => r.id === roomId)
+    if (!canManageRoom(room)) return
     try {
         await store.deleteRoom(roomId)
         if (store.currentRoomId === roomId) {
@@ -194,10 +388,14 @@ async function copyRoomLink(roomId: string) {
     else message.error(t('common.copied') + ' ✗')
 }
 
-const roomContextMenuOptions = computed<DropdownOption[]>(() => [
-    { label: t('groupChat.copyRoomLink'), key: 'copy-link' },
-    { label: t('groupChat.cloneRoom'), key: 'clone-room' },
-])
+const roomContextMenuOptions = computed<DropdownOption[]>(() => {
+    const options: DropdownOption[] = [{ label: t('groupChat.copyRoomLink'), key: 'copy-link' }]
+    if (canManageRoom(contextRoom.value)) {
+        options.push({ label: t('chat.setWorkspace'), key: 'set-workspace' })
+        options.push({ label: t('groupChat.cloneRoom'), key: 'clone-room' })
+    }
+    return options
+})
 
 function handleRoomContextMenu(event: MouseEvent, roomId: string) {
     event.preventDefault()
@@ -217,13 +415,18 @@ function handleRoomContextSelect(key: string) {
     if (!roomId) return
     if (key === 'copy-link') {
         void copyRoomLink(roomId)
+    } else if (key === 'set-workspace') {
+        if (!canManageRoom(contextRoom.value)) return
+        handleOpenWorkspacePicker(roomId)
     } else if (key === 'clone-room') {
+        if (!canManageRoom(contextRoom.value)) return
         handleOpenCloneRoom(roomId)
     }
 }
 
 function handleOpenCloneRoom(roomId: string) {
     const room = store.rooms.find(r => r.id === roomId)
+    if (!canManageRoom(room)) return
     cloneSourceRoomId.value = roomId
     cloneRoomName.value = room?.name ? `${room.name} Copy` : ''
     cloneInviteCode.value = generateCode()
@@ -252,6 +455,7 @@ async function confirmCloneRoom() {
 
 async function handleClearRoomContext() {
     if (!store.currentRoomId) return
+    if (!currentRoomCanManage.value) return
     if (store.contextStatuses.size > 0) {
         message.warning(t('groupChat.compressingInProgress'))
         return
@@ -282,12 +486,17 @@ async function handleSendMessage(content: string, attachments?: Attachment[]) {
 }
 
 async function handleAddAgent() {
+    if (!currentRoomCanManage.value) return
     await profilesStore.fetchProfiles()
     showAddAgentModal.value = true
 }
 
 onMounted(() => {
     window.addEventListener('hermes:open-page-sidebar', openPageSidebar)
+    window.addEventListener('hermes:preview-workspace-file', handleWorkspaceFilePreviewRequest)
+    window.addEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest)
+    window.addEventListener('resize', handleWorkspacePanelResize)
+    handleWorkspacePanelResize()
     if (profilesStore.profiles.length === 0) {
         void profilesStore.fetchProfiles()
     }
@@ -295,6 +504,36 @@ onMounted(() => {
 
 onUnmounted(() => {
     window.removeEventListener('hermes:open-page-sidebar', openPageSidebar)
+    window.removeEventListener('hermes:preview-workspace-file', handleWorkspaceFilePreviewRequest)
+    window.removeEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest)
+    window.removeEventListener('resize', handleWorkspacePanelResize)
+    stopWorkspaceResize()
+    if (showWorkspacePanel.value) closeWorkspacePanel()
+    else toolPanelStore.closeWorkspaceDiff()
+})
+
+watch(() => store.currentRoomId, (roomId, previousRoomId) => {
+    if (roomId !== previousRoomId && (filesStore.previewFile || toolPanelStore.workspaceDiff || showWorkspacePanel.value)) closeWorkspacePanel()
+})
+
+watch(() => filesStore.previewFile, previewFile => {
+    if (previewFile?.workspaceRoomId === store.currentRoomId) {
+        activeWorkspacePanel.value = 'files'
+        showWorkspacePanel.value = true
+    }
+})
+
+watch(() => toolPanelStore.workspaceDiff, workspaceDiff => {
+    if (workspaceDiff) {
+        activeWorkspacePanel.value = 'files'
+        showWorkspacePanel.value = true
+    }
+})
+
+watch(showWorkspacePanel, async visible => {
+    if (!visible || workspacePanelMobile.value) return
+    await nextTick()
+    handleWorkspacePanelResize()
 })
 
 async function confirmAddAgent() {
@@ -323,9 +562,62 @@ async function confirmAddAgent() {
     }
 }
 
-function handleOpenCompressionConfig() {
+function handleOpenWorkspacePicker(roomId = store.currentRoomId || '') {
+    if (!roomId) return
+    const room = store.rooms.find(r => r.id === roomId)
+    if (!canManageRoom(room)) return
+    workspaceRoomId.value = roomId
+    workspaceValue.value = room?.workspace || ''
+    showWorkspaceModal.value = true
+}
+
+async function handleSaveWorkspace() {
+    const roomId = workspaceRoomId.value || store.currentRoomId
+    if (!roomId) return
+    const room = store.rooms.find(r => r.id === roomId)
+    if (!canManageRoom(room)) return
+    try {
+        await store.setRoomWorkspace(roomId, String(workspaceValue.value || '').trim())
+        showWorkspaceModal.value = false
+        workspaceRoomId.value = null
+        message.success(t('chat.workspaceSet'))
+    } catch (err: any) {
+        message.error(err?.message || t('chat.workspaceSetFailed'))
+    }
+}
+
+async function handleClearWorkspace() {
+    workspaceValue.value = ''
+    await handleSaveWorkspace()
+}
+
+function handleOpenUserProfile() {
+    const member = store.members.find(item => item.userId === store.userId)
+    userProfileName.value = member?.name || store.userName || ''
+    userProfileDescription.value = member?.description || ''
+    showUserProfileModal.value = true
+}
+
+async function handleSaveUserProfile() {
+    const name = userProfileName.value.trim()
+    if (!name || isSavingUserProfile.value) return
+    isSavingUserProfile.value = true
+    try {
+        await store.updateCurrentMemberProfile(name, userProfileDescription.value)
+        showUserProfileModal.value = false
+        message.success(t('common.saved'))
+    } catch {
+        message.error(t('common.saveFailed'))
+    } finally {
+        isSavingUserProfile.value = false
+    }
+}
+
+function handleOpenRoomSettings() {
+    if (!currentRoomCanManage.value) return
     const room = store.rooms.find(r => r.id === store.currentRoomId)
     if (room) {
+        inviteCodeDraft.value = room.inviteCode || ''
         compressionConfig.value = {
             triggerTokens: room.triggerTokens ?? 100000,
             maxHistoryTokens: room.maxHistoryTokens ?? 32000,
@@ -335,8 +627,24 @@ function handleOpenCompressionConfig() {
     showCompressionModal.value = true
 }
 
+async function handleSaveInviteCode() {
+    if (!store.currentRoomId || !currentRoomCanManage.value || isSavingInviteCode.value || !canUpdateInviteCode.value) return
+    const nextCode = inviteCodeDraft.value.trim()
+    isSavingInviteCode.value = true
+    try {
+        await store.setRoomInviteCode(store.currentRoomId, nextCode)
+        inviteCodeDraft.value = nextCode
+        message.success(t('groupChat.inviteCodeUpdated'))
+    } catch (err: any) {
+        message.error(err?.message || t('groupChat.inviteCodeUpdateFailed'))
+    } finally {
+        isSavingInviteCode.value = false
+    }
+}
+
 async function handleSaveCompressionConfig() {
     if (!store.currentRoomId) return
+    if (!currentRoomCanManage.value) return
     try {
         const res = await updateRoomConfig(store.currentRoomId, { ...compressionConfig.value })
         const idx = store.rooms.findIndex(r => r.id === store.currentRoomId)
@@ -350,6 +658,7 @@ async function handleSaveCompressionConfig() {
 
 async function handleForceCompress() {
     if (!store.currentRoomId || isCompressing.value) return
+    if (!currentRoomCanManage.value) return
     if (store.contextStatuses.size > 0) {
         message.warning(t('groupChat.compressingInProgress'))
         return
@@ -367,6 +676,7 @@ async function handleForceCompress() {
 
 async function handleRemoveAgent(agentId: string) {
     if (!store.currentRoomId) return
+    if (!currentRoomCanManage.value) return
     try {
         await store.removeAgentFromRoom(store.currentRoomId, agentId)
     } catch {
@@ -375,6 +685,7 @@ async function handleRemoveAgent(agentId: string) {
 }
 
 async function handleInterruptAgent(agentName: string) {
+    if (!currentRoomCanManage.value) return
     try {
         await store.interruptAgent(agentName)
     } catch (err: any) {
@@ -383,6 +694,7 @@ async function handleInterruptAgent(agentName: string) {
 }
 
 async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
+    if (!currentRoomCanManage.value) return
     try {
         await store.respondApproval(choice)
     } catch (err: any) {
@@ -422,7 +734,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                         <span v-if="room.inviteCode" class="room-code">{{ room.inviteCode }}</span>
                         <span class="room-tokens">{{ formatTokens(room.totalTokens || 0) }}</span>
                     </div>
-                    <NPopconfirm @positive-click="handleDeleteRoom(room.id)">
+                    <NPopconfirm v-if="canManageRoom(room)" @positive-click="handleDeleteRoom(room.id)">
                         <template #trigger>
                             <button class="room-action-btn danger" @click.stop>
                                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -461,24 +773,42 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
         <!-- Main chat area -->
         <div
             class="chat-main"
-            :class="{ 'chat-main--drop-active': isChatDropActive }"
+            :class="{ 'chat-main--sidebar-collapsed': !showSidebar }"
             @dragover="handleChatDragOver"
             @dragenter="handleChatDragEnter"
             @dragleave="handleChatDragLeave"
             @drop="handleChatDrop"
         >
             <div class="chat-header">
-                <button class="icon-btn header-sidebar-toggle" @click="toggleSidebar">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="9" y1="3" x2="9" y2="21" />
-                    </svg>
-                </button>
-                <span class="room-title-text">{{ store.roomName || (store.currentRoomId || t('groupChat.title')) }}</span>
+                <div class="header-left">
+                    <button class="icon-btn header-sidebar-toggle" @click="toggleSidebar">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="9" y1="3" x2="9" y2="21" />
+                        </svg>
+                    </button>
+                    <span class="room-title-text">{{ store.roomName || (store.currentRoomId || t('groupChat.title')) }}</span>
+                    <button
+                        v-if="currentRoom?.workspace"
+                        class="workspace-badge"
+                        type="button"
+                        :title="currentRoom.workspace"
+                        @click="toggleWorkspacePanel"
+                    >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                        </svg>
+                        <span>{{ currentWorkspaceLabel }}</span>
+                    </button>
+                </div>
                 <div class="header-info">
                     <!-- Stacked avatars (user + agents) -->
                     <NPopover v-if="store.agents.length" trigger="click" placement="bottom-end" :width="220">
                         <template #trigger>
-                            <div class="avatar-stack-inner">
+                            <button
+                                type="button"
+                                class="avatar-stack-inner avatar-stack-trigger"
+                                :aria-label="`${t('groupChat.agents')} (${store.agents.length})`"
+                            >
                                 <!-- User avatar first -->
                                 <span class="avatar-stack-item" :style="{ zIndex: store.agents.length + 1 }">
                                     <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
@@ -492,7 +822,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                     <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="profileAvatarFor(agent.profile)" :size="24" />
                                 </span>
                                 <span v-if="store.agents.length > 4" class="avatar-stack-more">+{{ store.agents.length - 4 }}</span>
-                            </div>
+                            </button>
                         </template>
                         <div class="agent-popover">
                             <div class="agent-popover-item" style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--n-border-color, #efeff5);">
@@ -509,7 +839,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                     <span class="agent-popover-name">{{ agent.name }}</span>
                                     <span class="agent-popover-profile">{{ agent.profile }}</span>
                                 </div>
-                                <button class="agent-popover-remove" @click="handleRemoveAgent(agent.id)">
+                                <button v-if="currentRoomCanManage" class="agent-popover-remove" @click="handleRemoveAgent(agent.id)">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                                 </button>
                             </div>
@@ -521,13 +851,33 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                             <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
                         </span>
                     </div>
-                    <button class="icon-btn" :title="t('groupChat.addAgent')" @click="handleAddAgent">
+                    <button v-if="hasRoom" class="icon-btn" :title="t('groupChat.yourName')" @click="handleOpenUserProfile">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" />
+                        </svg>
+                    </button>
+                    <button v-if="currentRoomCanManage" class="icon-btn" :title="t('groupChat.addAgent')" @click="handleAddAgent">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                     </button>
-                    <button class="icon-btn" :title="t('groupChat.compressionConfig')" @click="handleOpenCompressionConfig">
+                    <button
+                        v-if="currentRoom?.workspace && currentRoomCanManage"
+                        class="icon-btn workspace-panel-toggle"
+                        :class="{ active: showWorkspacePanel }"
+                        :title="t('chat.workspace')"
+                        :aria-label="t('chat.workspace')"
+                        :aria-pressed="showWorkspacePanel"
+                        @click="toggleWorkspacePanel"
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <rect x="3" y="3" width="18" height="18" rx="2" />
+                            <line x1="15" y1="3" x2="15" y2="21" />
+                        </svg>
+                    </button>
+                    <button v-if="currentRoomCanManage" class="icon-btn compression-settings-button" :title="t('groupChat.roomSettings')" @click="handleOpenRoomSettings">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 4.6a1.65 1.65 0 0 0 1.51 1V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1z"/></svg>
                     </button>
-                    <NPopconfirm @positive-click="handleClearRoomContext">
+                    <NPopconfirm v-if="currentRoomCanManage" @positive-click="handleClearRoomContext">
                         <template #trigger>
                             <button class="icon-btn" :title="t('groupChat.clearContext')">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -544,73 +894,150 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                 </div>
             </div>
 
-            <div v-if="hasRoom" class="group-chat-surface">
-                <div class="group-message-shell">
-                    <GroupMessageList />
-                    <Transition name="approval-float">
-                        <div v-if="visibleApproval" class="approval-float-panel">
-                            <div class="approval-float-header">
-                                <span class="approval-float-icon" aria-hidden="true">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
-                                        <path d="m9 12 2 2 4-4" />
-                                    </svg>
+            <div
+                v-if="hasRoom"
+                ref="groupChatContentWrapperRef"
+                class="group-chat-content-wrapper"
+                :class="{ 'chat-main--drop-active': isChatDropActive }"
+            >
+                <div class="group-chat-surface">
+                    <div class="group-message-shell">
+                        <GroupMessageList />
+                        <Transition name="approval-float">
+                            <div v-if="visibleApproval" class="approval-float-panel">
+                                <div class="approval-float-header">
+                                    <span class="approval-float-icon" aria-hidden="true">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
+                                            <path d="m9 12 2 2 4-4" />
+                                        </svg>
+                                    </span>
+                                    <span>{{ t('chat.approvalKicker') }}</span>
+                                </div>
+                                <div class="approval-float-title">
+                                    <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
+                                </div>
+                                <div class="approval-float-desc">{{ visibleApproval.description }}</div>
+                                <code class="approval-float-command">{{ visibleApproval.command }}</code>
+                                <div class="approval-float-actions">
+                                    <NButton v-if="visibleApproval.isMemoryWrite" size="small" type="primary" @click="handleApproval('once')">
+                                        {{ t('chat.approvalAgree') }}
+                                    </NButton>
+                                    <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
+                                        {{ t('chat.approvalAllowOnce') }}
+                                    </NButton>
+                                    <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
+                                        {{ t('chat.approvalAllowSession') }}
+                                    </NButton>
+                                    <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
+                                        {{ t('chat.approvalAlways') }}
+                                    </NButton>
+                                    <NButton v-if="visibleApproval.isMemoryWrite || visibleApproval.choices.includes('deny')" size="small" type="error" secondary @click="handleApproval('deny')">
+                                        {{ t('chat.approvalDeny') }}
+                                    </NButton>
+                                </div>
+                            </div>
+                        </Transition>
+                    </div>
+                    <div v-if="store.contextStatuses.size > 0 || (store.typingText && store.contextStatuses.size === 0)" class="status-bar">
+                        <div v-if="store.contextStatuses.size > 0" class="context-status-list">
+                            <div v-for="[name, status] in store.contextStatuses" :key="name" class="context-status">
+                                <span class="typing-dots">
+                                    <span /><span /><span />
                                 </span>
-                                <span>{{ t('chat.approvalKicker') }}</span>
-                            </div>
-                            <div class="approval-float-title">
-                                <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
-                            </div>
-                            <div class="approval-float-desc">{{ visibleApproval.description }}</div>
-                            <code class="approval-float-command">{{ visibleApproval.command }}</code>
-                            <div class="approval-float-actions">
-                                <NButton v-if="visibleApproval.isMemoryWrite" size="small" type="primary" @click="handleApproval('once')">
-                                    {{ t('chat.approvalAgree') }}
-                                </NButton>
-                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
-                                    {{ t('chat.approvalAllowOnce') }}
-                                </NButton>
-                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
-                                    {{ t('chat.approvalAllowSession') }}
-                                </NButton>
-                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
-                                    {{ t('chat.approvalAlways') }}
-                                </NButton>
-                                <NButton v-if="visibleApproval.isMemoryWrite || visibleApproval.choices.includes('deny')" size="small" type="error" secondary @click="handleApproval('deny')">
-                                    {{ t('chat.approvalDeny') }}
-                                </NButton>
+                                <span v-if="status.status === 'compressing'">
+                                    @{{ status.agentName }} {{ t('groupChat.agentCompressing') }}
+                                </span>
+                                <span v-else>
+                                    @{{ status.agentName }} {{ t('groupChat.agentReplying') }}
+                                </span>
+                                <button v-if="currentRoomCanManage" class="context-stop-btn" :title="t('common.cancel')" @click="handleInterruptAgent(status.agentName)">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                        <line x1="18" y1="6" x2="6" y2="18" />
+                                        <line x1="6" y1="6" x2="18" y2="18" />
+                                    </svg>
+                                </button>
                             </div>
                         </div>
-                    </Transition>
-                </div>
-                <div v-if="store.contextStatuses.size > 0 || (store.typingText && store.contextStatuses.size === 0)" class="status-bar">
-                    <div v-if="store.contextStatuses.size > 0" class="context-status-list">
-                        <div v-for="[name, status] in store.contextStatuses" :key="name" class="context-status">
+                        <div v-else-if="store.typingText" class="typing-indicator">
                             <span class="typing-dots">
                                 <span /><span /><span />
                             </span>
-                            <span v-if="status.status === 'compressing'">
-                                @{{ status.agentName }} {{ t('groupChat.agentCompressing') }}
-                            </span>
-                            <span v-else>
-                                @{{ status.agentName }} {{ t('groupChat.agentReplying') }}
-                            </span>
-                            <button class="context-stop-btn" :title="t('common.cancel')" @click="handleInterruptAgent(status.agentName)">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            {{ store.typingText }}
+                        </div>
+                    </div>
+                    <GroupChatInput ref="groupChatInputRef" @send="handleSendMessage" />
+                </div>
+                <aside
+                    v-if="showWorkspacePanel && (activeWorkspacePanel === 'browser' ? desktopBrowserAvailable : (toolPanelStore.workspaceDiff || currentRoom?.workspace || filesStore.previewFile?.workspaceRoomId === store.currentRoomId))"
+                    class="group-workspace-panel"
+                    :style="workspacePanelStyle"
+                >
+                    <div class="group-workspace-resize-handle" @pointerdown="startWorkspaceResize" />
+                    <div class="group-workspace-panel-inner">
+                        <div
+                            v-if="desktopBrowserAvailable && !toolPanelStore.workspaceDiff && !filesStore.previewFile"
+                            class="group-workspace-panel-tabs"
+                            role="tablist"
+                        >
+                            <button
+                                type="button"
+                                role="tab"
+                                :class="{ active: activeWorkspacePanel === 'files' }"
+                                :aria-selected="activeWorkspacePanel === 'files'"
+                                @click="selectWorkspacePanel('files')"
+                            >
+                                {{ t('drawer.files') }}
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                :class="{ active: activeWorkspacePanel === 'browser' }"
+                                :aria-selected="activeWorkspacePanel === 'browser'"
+                                @click="selectWorkspacePanel('browser')"
+                            >
+                                {{ t('browser.title') }}
+                            </button>
+                            <button class="group-workspace-panel-close" type="button" :title="t('files.closePreview')" @click="closeWorkspacePanel">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <line x1="18" y1="6" x2="6" y2="18" />
                                     <line x1="6" y1="6" x2="18" y2="18" />
                                 </svg>
                             </button>
                         </div>
+                        <DesktopBrowserPanel
+                            class="group-browser-panel"
+                            v-if="desktopBrowserAvailable && activeWorkspacePanel === 'browser'"
+                            @attach="handleBrowserAttachment"
+                        />
+                        <WorkspaceDiffPreview
+                            v-else-if="toolPanelStore.workspaceDiff"
+                            :custom-close="closeWorkspacePanel"
+                        />
+                        <FilePreview
+                            v-else-if="filesStore.previewFile?.workspaceRoomId === store.currentRoomId"
+                            :custom-close="closeWorkspacePanel"
+                        />
+                        <template v-else-if="currentRoom?.workspace">
+                            <div v-if="!desktopBrowserAvailable" class="group-workspace-panel-header">
+                                <span>{{ t('drawer.files') }}</span>
+                                <button type="button" :title="t('files.closePreview')" @click="closeWorkspacePanel">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <line x1="18" y1="6" x2="6" y2="18" />
+                                        <line x1="6" y1="6" x2="18" y2="18" />
+                                    </svg>
+                                </button>
+                            </div>
+                            <div class="group-workspace-panel-content">
+                                <FilesPanel
+                                    :workspace-room-id="store.currentRoomId"
+                                    :workspace="currentRoom.workspace"
+                                    @attach="handleWorkspaceFileAttach"
+                                />
+                            </div>
+                        </template>
                     </div>
-                    <div v-else-if="store.typingText" class="typing-indicator">
-                        <span class="typing-dots">
-                            <span /><span /><span />
-                        </span>
-                        {{ store.typingText }}
-                    </div>
-                </div>
-                <GroupChatInput ref="groupChatInputRef" @send="handleSendMessage" />
+                </aside>
             </div>
 
             <div v-else class="no-room">
@@ -703,24 +1130,110 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </div>
                 </div>
             </div>
+            <NModal
+                v-model:show="showWorkspaceModal"
+                preset="dialog"
+                :title="t('chat.setWorkspaceTitle')"
+                class="workspace-modal"
+                style="width: 520px; max-width: 92vw"
+            >
+                <FolderPicker v-model="workspaceValue" />
+                <template #action>
+                    <NSpace justify="end">
+                        <NButton @click="showWorkspaceModal = false">{{ t('common.cancel') }}</NButton>
+                        <NButton @click="handleClearWorkspace">{{ t('workflow.workspace.clear') }}</NButton>
+                        <NButton type="primary" @click="handleSaveWorkspace">{{ t('common.save') }}</NButton>
+                    </NSpace>
+                </template>
+            </NModal>
+            <NModal
+                v-model:show="showUserProfileModal"
+                preset="dialog"
+                :title="t('groupChat.yourName')"
+                style="width: 460px; max-width: 92vw"
+            >
+                <div class="form-group">
+                    <label class="form-label">{{ t('groupChat.yourName') }}</label>
+                    <NInput
+                        v-model:value="userProfileName"
+                        :placeholder="t('groupChat.yourNamePlaceholder')"
+                        :maxlength="120"
+                        @keyup.enter="handleSaveUserProfile"
+                    />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ t('groupChat.yourDescription') }}</label>
+                    <NInput
+                        v-model:value="userProfileDescription"
+                        type="textarea"
+                        :rows="3"
+                        :maxlength="2000"
+                        :placeholder="t('groupChat.yourDescriptionPlaceholder')"
+                    />
+                </div>
+                <template #action>
+                    <NSpace justify="end">
+                        <NButton @click="showUserProfileModal = false">{{ t('common.cancel') }}</NButton>
+                        <NButton
+                            type="primary"
+                            :disabled="!userProfileName.trim()"
+                            :loading="isSavingUserProfile"
+                            @click="handleSaveUserProfile"
+                        >
+                            {{ t('common.save') }}
+                        </NButton>
+                    </NSpace>
+                </template>
+            </NModal>
             <div v-if="showCompressionModal" class="modal-backdrop" @click.self="showCompressionModal = false">
-                <div class="modal">
-                    <h3>{{ t('groupChat.compressionConfig') }}</h3>
-                    <div class="form-group">
-                        <label class="form-label">{{ t('groupChat.triggerTokens') }}</label>
-                        <NInputNumber v-model:value="compressionConfig.triggerTokens" :min="1000" :step="10000" style="width: 100%" />
-                        <p class="form-hint">{{ t('groupChat.triggerTokensDesc') }}</p>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">{{ t('groupChat.maxHistoryTokens') }}</label>
-                        <NInputNumber v-model:value="compressionConfig.maxHistoryTokens" :min="1000" :step="1000" style="width: 100%" />
-                        <p class="form-hint">{{ t('groupChat.maxHistoryTokensDesc') }}</p>
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">{{ t('groupChat.tailMessageCount') }}</label>
-                        <NInputNumber v-model:value="compressionConfig.tailMessageCount" :min="1" :step="5" style="width: 100%" />
-                        <p class="form-hint">{{ t('groupChat.tailMessageCountDesc') }}</p>
-                    </div>
+                <div class="modal room-settings-modal">
+                    <h3>{{ t('groupChat.roomSettings') }}</h3>
+                    <section class="settings-section">
+                        <h4>{{ t('groupChat.inviteCodeSettings') }}</h4>
+                        <div class="form-group">
+                            <label class="form-label">{{ t('groupChat.inviteCode') }}</label>
+                            <div class="code-row invite-code-row">
+                                <NInput
+                                    v-model:value="inviteCodeDraft"
+                                    :placeholder="t('groupChat.inviteCodePlaceholder')"
+                                    :disabled="isSavingInviteCode"
+                                    @keyup.enter="handleSaveInviteCode"
+                                />
+                                <NButton size="small" :disabled="isSavingInviteCode" :title="t('groupChat.generateInviteCode')" @click="inviteCodeDraft = generateCode()">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                                        <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                                    </svg>
+                                </NButton>
+                                <NButton
+                                    type="primary"
+                                    :disabled="!canUpdateInviteCode"
+                                    :loading="isSavingInviteCode"
+                                    @click="handleSaveInviteCode"
+                                >
+                                    {{ t('common.update') }}
+                                </NButton>
+                            </div>
+                            <p class="form-hint">{{ t('groupChat.inviteCodeRotateHint') }}</p>
+                        </div>
+                    </section>
+                    <section class="settings-section">
+                        <h4>{{ t('groupChat.compressionSettings') }}</h4>
+                        <div class="form-group">
+                            <label class="form-label">{{ t('groupChat.triggerTokens') }}</label>
+                            <NInputNumber v-model:value="compressionConfig.triggerTokens" :min="1000" :step="10000" style="width: 100%" />
+                            <p class="form-hint">{{ t('groupChat.triggerTokensDesc') }}</p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">{{ t('groupChat.maxHistoryTokens') }}</label>
+                            <NInputNumber v-model:value="compressionConfig.maxHistoryTokens" :min="1000" :step="1000" style="width: 100%" />
+                            <p class="form-hint">{{ t('groupChat.maxHistoryTokensDesc') }}</p>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">{{ t('groupChat.tailMessageCount') }}</label>
+                            <NInputNumber v-model:value="compressionConfig.tailMessageCount" :min="1" :step="5" style="width: 100%" />
+                            <p class="form-hint">{{ t('groupChat.tailMessageCountDesc') }}</p>
+                        </div>
+                    </section>
                     <div style="margin-top: 8px">
                         <NButton
                             block
@@ -734,12 +1247,13 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     <div class="modal-actions">
                         <NSpace justify="end">
                             <NButton @click="showCompressionModal = false">{{ t('common.cancel') }}</NButton>
-                            <NButton type="primary" @click="handleSaveCompressionConfig">{{ t('common.save') }}</NButton>
+                            <NButton type="primary" @click="handleSaveCompressionConfig">{{ t('groupChat.saveCompression') }}</NButton>
                         </NSpace>
                     </div>
                 </div>
             </div>
         </Teleport>
+
     </div>
 </template>
 
@@ -760,6 +1274,7 @@ export default defineComponent({ components: { CreateRoomForm } })
     position: relative;
     min-width: 0;
     max-width: 100%;
+    background-color: $bg-card;
 }
 
 .sidebar-backdrop {
@@ -1002,10 +1517,17 @@ export default defineComponent({ components: { CreateRoomForm } })
 
 .room-sidebar {
     width: $sidebar-width;
+    min-height: 0;
+    align-self: stretch;
+    margin: 10px;
+    background: $bg-sidebar-surface;
+    border: 1px solid $border-color;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
     flex-shrink: 0;
-    border-right: 1px solid $border-color;
     display: flex;
     flex-direction: column;
+    overflow: hidden;
 }
 
 .sidebar-header {
@@ -1048,6 +1570,7 @@ export default defineComponent({ components: { CreateRoomForm } })
         background: rgba(var(--accent-primary-rgb), 0.06);
         color: $text-primary;
     }
+
 }
 
 .conversation-switch {
@@ -1107,6 +1630,10 @@ export default defineComponent({ components: { CreateRoomForm } })
 
     &.active {
         background-color: rgba(var(--accent-primary-rgb), 0.12);
+    }
+
+    &.active .room-name {
+        color: $text-primary;
     }
 
     .room-icon {
@@ -1227,8 +1754,27 @@ export default defineComponent({ components: { CreateRoomForm } })
     display: flex;
     flex-direction: column;
     min-width: 0;
-    background-color: transparent;
+    margin: 10px 10px 10px 0;
+    overflow: hidden;
+    background-color: $bg-main-surface;
+    border: 1px solid $border-color;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
     position: relative;
+
+    &--sidebar-collapsed {
+        margin-left: 10px;
+    }
+}
+
+.group-chat-content-wrapper {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    max-width: 100%;
 }
 
 .group-chat-surface {
@@ -1237,8 +1783,181 @@ export default defineComponent({ components: { CreateRoomForm } })
     min-width: 0;
     display: flex;
     flex-direction: column;
-    background-color: $bg-card;
+    background-color: $bg-main-surface;
     animation: group-chat-surface-fade-in 1.5s ease both;
+}
+
+.workspace-panel-toggle.active {
+    color: var(--accent-primary);
+    background: rgba(var(--accent-primary-rgb), 0.1);
+}
+
+.group-workspace-panel {
+    position: relative;
+    flex: 0 0 auto;
+    min-width: 320px;
+    max-width: 100%;
+    min-height: 0;
+    overflow: visible;
+    display: flex;
+    background: $bg-card;
+    border-left: 1px solid $border-color;
+}
+
+.group-workspace-resize-handle {
+    position: absolute;
+    left: -7px;
+    top: 0;
+    bottom: 0;
+    width: 14px;
+    cursor: col-resize;
+    z-index: 20;
+
+    &::after {
+        content: '';
+        position: absolute;
+        left: 6px;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        background:
+            linear-gradient($border-color, $border-color) top / 1px calc(50% - 26px) no-repeat,
+            linear-gradient($border-color, $border-color) bottom / 1px calc(50% - 26px) no-repeat;
+    }
+
+    &::before {
+        content: '';
+        position: absolute;
+        left: 1px;
+        top: 50%;
+        width: 12px;
+        height: 38px;
+        transform: translateY(-50%);
+        border-radius: 6px;
+        border: 1px solid $border-color;
+        background:
+            linear-gradient($text-muted, $text-muted) center 12px / 6px 1px no-repeat,
+            linear-gradient($text-muted, $text-muted) center 19px / 6px 1px no-repeat,
+            linear-gradient($text-muted, $text-muted) center 26px / 6px 1px no-repeat,
+            $bg-card;
+    }
+
+    &:hover::before {
+        border-color: var(--accent-primary);
+        background:
+            linear-gradient(var(--accent-primary), var(--accent-primary)) center 12px / 6px 1px no-repeat,
+            linear-gradient(var(--accent-primary), var(--accent-primary)) center 19px / 6px 1px no-repeat,
+            linear-gradient(var(--accent-primary), var(--accent-primary)) center 26px / 6px 1px no-repeat,
+            $bg-card;
+    }
+}
+
+.group-workspace-panel-inner {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.group-workspace-panel-tabs {
+    height: 47px;
+    padding: 8px 12px;
+    border-bottom: 1px solid $border-color;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    box-sizing: border-box;
+
+    button {
+        height: 30px;
+        padding: 0 10px;
+        border: 0;
+        border-radius: $radius-sm;
+        color: $text-secondary;
+        background: transparent;
+        cursor: pointer;
+
+        &:hover,
+        &.active {
+            color: var(--accent-primary);
+            background: rgba(var(--accent-primary-rgb), 0.1);
+        }
+    }
+
+    .group-workspace-panel-close {
+        width: 30px;
+        padding: 0;
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+}
+
+.group-browser-panel {
+    flex: 1;
+    min-height: 0;
+}
+
+.group-workspace-panel-header {
+    height: 47px;
+    padding: 8px 12px;
+    border-bottom: 1px solid $border-color;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-sizing: border-box;
+    color: $text-primary;
+    font-size: 13px;
+    font-weight: 500;
+
+    button {
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 0;
+        border-radius: $radius-sm;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: $text-secondary;
+        background: transparent;
+        cursor: pointer;
+
+        &:hover {
+            color: $text-primary;
+            background: rgba(var(--accent-primary-rgb), 0.08);
+        }
+    }
+}
+
+.group-workspace-panel-content {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+
+    > * {
+        height: 100%;
+        min-height: 0;
+    }
+}
+
+@media (max-width: $breakpoint-mobile) {
+    .group-workspace-panel {
+        position: absolute;
+        inset: 0;
+        z-index: 70;
+        width: 100% !important;
+        min-width: 0;
+        border-left: none;
+    }
+
+    .group-workspace-resize-handle {
+        display: none;
+    }
 }
 
 @keyframes group-chat-surface-fade-in {
@@ -1290,14 +2009,23 @@ export default defineComponent({ components: { CreateRoomForm } })
         margin-left: -10px;
     }
 
+    .header-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        overflow: hidden;
+        flex: 1;
+        min-width: 0;
+    }
+
     .room-title-text {
         font-size: 16px;
         font-weight: 600;
         color: $text-primary;
-        flex: 1;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        min-width: 0;
     }
 
     .header-info {
@@ -1305,6 +2033,39 @@ export default defineComponent({ components: { CreateRoomForm } })
         align-items: center;
         gap: 8px;
         flex-shrink: 0;
+    }
+
+    .workspace-badge {
+        border: 0;
+        font-size: 11px;
+        line-height: 16px;
+        color: $text-muted;
+        background: rgba(255, 255, 255, 0.05);
+        padding: 2px 8px;
+        border-radius: 4px;
+        max-width: 160px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        overflow: hidden;
+        cursor: pointer;
+        flex-shrink: 0;
+
+        svg {
+            flex: 0 0 auto;
+        }
+
+        span {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        &:hover {
+            color: $text-secondary;
+            background: rgba(var(--accent-primary-rgb), 0.06);
+        }
     }
 
     .member-count {
@@ -1322,6 +2083,15 @@ export default defineComponent({ components: { CreateRoomForm } })
 .avatar-stack-inner {
     display: flex;
     align-items: center;
+}
+
+.avatar-stack-trigger {
+    padding: 0;
+    border: 0;
+    color: inherit;
+    background: transparent;
+    cursor: pointer;
+    -webkit-app-region: no-drag;
 }
 
 .avatar-stack-item {
@@ -1514,6 +2284,21 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
+.room-settings-modal {
+    width: 480px;
+}
+
+.settings-section {
+    margin-bottom: 18px;
+
+    h4 {
+        margin: 0 0 12px;
+        font-size: 13px;
+        font-weight: 600;
+        color: $text-primary;
+    }
+}
+
 .form-group {
     margin-bottom: 16px;
 }
@@ -1530,6 +2315,10 @@ export default defineComponent({ components: { CreateRoomForm } })
     display: flex;
     gap: 8px;
     align-items: center;
+}
+
+.invite-code-row :deep(.n-input) {
+    flex: 1;
 }
 
 .modal-actions {
@@ -1566,14 +2355,21 @@ export default defineComponent({ components: { CreateRoomForm } })
 // ─── Mobile ──────────────────────────────────────────────
 
 @media (max-width: $breakpoint-mobile) {
+    .chat-main {
+        margin: 0;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+    }
+
     .room-sidebar {
         position: absolute;
-        left: 0;
-        top: 0;
-        bottom: 0;
+        left: 10px;
+        top: 10px;
+        bottom: 10px;
+        height: auto;
+        margin: 0;
         z-index: 100;
-        background-color: $bg-card;
-        box-shadow: 4px 0 16px rgba(0, 0, 0, 0.1);
     }
 
     .chat-header {

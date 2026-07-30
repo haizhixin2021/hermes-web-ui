@@ -1,9 +1,12 @@
-import type { AgentMessage, ModelClient, ModelRequest } from '../model/types'
+import type { AgentMessage, ModelClient, ModelRequest, ModelUsage } from '../model/types'
 import type { AgentMessageInput, AgentOutputMessage } from '../model/messages'
 import type { AgentSkill } from '../skills/types'
 import type { AgentToolRegistry } from '../tools/registry'
 import type { AgentToolContext, AgentToolResult } from '../tools/types'
 import type { AgentRuntimeEvent } from './events'
+import type { MemoryContext } from '../memory/types'
+import type { MemoryService } from '../memory/service'
+import type { SkillReviewUsageEvent } from '../skills/review'
 
 export interface AgentRuntimeContextEstimate {
   contextTokens: number
@@ -18,8 +21,16 @@ export interface AgentRuntimeContextEstimate {
 
 export interface AgentRuntimeOptions {
   modelClient?: ModelClient
+  /** Disable every tool source, including built-ins, MCP, memory, and skill tools. */
+  toolsEnabled?: boolean
   tools?: AgentToolRegistry
+  /** Disable every skill source, including constructor and per-run skills. */
+  skillsEnabled?: boolean
   skills?: AgentSkill[]
+  /** Fixed directory used by this agent instance for skill discovery and management. */
+  skillDirectory?: string
+  /** Trigger a background skill review after this many tool calls in one session. Set to 0 to disable. */
+  skillReviewEveryToolCalls?: number
   systemPrompt?: string
   runtimeInstructions?: string[]
   maxSteps?: number
@@ -29,6 +40,7 @@ export interface AgentRuntimeOptions {
   toolContext?: AgentToolContext
   modelDefaults?: Omit<ModelRequest, 'messages' | 'tools' | 'stream'>
   contextKey?: string
+  memory?: MemoryService
 }
 
 export interface AgentRuntimeRunInput {
@@ -44,11 +56,21 @@ export interface AgentRuntimeRunInput {
   model?: string
   temperature?: number
   maxTokens?: number
+  reasoningEffort?: ModelRequest['reasoningEffort']
+  reasoningSummary?: ModelRequest['reasoningSummary']
   metadata?: Record<string, unknown>
   modelClient?: ModelClient
   modelDefaults?: Omit<ModelRequest, 'messages' | 'tools' | 'stream'>
   contextKey?: string
   context?: unknown
+  memoryEnabled?: boolean
+  onMemoryUsage?: (input: {
+    purpose: 'ekko-memory-summary'
+    usage: ModelUsage
+    model?: string
+    callIndex: number
+  }) => void
+  onSkillReviewUsage?: (input: SkillReviewUsageEvent) => void
   onEvent?: (event: AgentRuntimeEvent) => void
 }
 
@@ -64,4 +86,5 @@ export interface AgentRuntimeRunResult {
   events: AgentRuntimeEvent[]
   context?: unknown
   contextEstimate?: AgentRuntimeContextEstimate
+  memoryContext?: MemoryContext
 }

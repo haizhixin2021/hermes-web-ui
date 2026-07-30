@@ -19,11 +19,16 @@ export type AgentMessageRole = 'system' | 'user' | 'assistant' | 'tool'
 export interface AgentMessage {
   role: AgentMessageRole
   content: string
+  contentParts?: AgentMessageContentPart[]
   reasoning?: string
   name?: string
   toolCallId?: string
   toolCalls?: AgentToolCall[]
 }
+
+export type AgentMessageContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
 
 export interface AgentToolDefinition {
   name: string
@@ -42,7 +47,21 @@ export interface ModelUsage {
   inputTokens?: number
   outputTokens?: number
   totalTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
 }
+
+export type ModelReasoningEffort =
+  | 'none'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+
+export type ModelReasoningSummary = 'auto' | 'concise' | 'detailed'
 
 export interface ModelRequest {
   model?: string
@@ -50,6 +69,8 @@ export interface ModelRequest {
   signal?: AbortSignal
   temperature?: number
   maxTokens?: number
+  reasoningEffort?: ModelReasoningEffort
+  reasoningSummary?: ModelReasoningSummary
   tools?: AgentToolDefinition[]
   toolChoice?: 'auto' | 'none' | 'required'
   stream?: boolean

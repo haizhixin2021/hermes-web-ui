@@ -14,6 +14,7 @@ const chatApi = vi.hoisted(() => ({
   sessionCommandHandlers: [] as Array<(event: any) => void>,
   peerUserMessageHandlers: [] as Array<(event: any) => void>,
   sessionTitleUpdatedHandlers: [] as Array<(event: any) => void>,
+  sessionWorkspaceUpdatedHandlers: [] as Array<(event: any) => void>,
 }))
 
 vi.mock('@/api/hermes/chat', () => ({
@@ -34,6 +35,10 @@ vi.mock('@/api/hermes/chat', () => ({
   }),
   onSessionTitleUpdated: vi.fn((handler: (event: any) => void) => {
     chatApi.sessionTitleUpdatedHandlers.push(handler)
+    return vi.fn()
+  }),
+  onSessionWorkspaceUpdated: vi.fn((handler: (event: any) => void) => {
+    chatApi.sessionWorkspaceUpdatedHandlers.push(handler)
     return vi.fn()
   }),
 }))
@@ -163,6 +168,31 @@ describe('chat store session.command fanout', () => {
 
     expect(store.sessions[0].title).toBe('Generated Title')
     expect(store.activeSession?.title).toBe('Generated Title')
+  })
+
+  it('forwards maximum reasoning effort from the active session to the run request', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.source = 'cli'
+    session.reasoningEffort = 'max'
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    await store.sendMessage('use the maximum reasoning budget')
+
+    expect(chatApi.startRunViaSocket).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: 'use the maximum reasoning budget',
+        session_id: 'session-1',
+        reasoning_effort: 'max',
+      }),
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
+      undefined,
+      expect.any(Object),
+    )
   })
 
   it('does not show a thinking/streaming state while submitting terminal fork commands', async () => {

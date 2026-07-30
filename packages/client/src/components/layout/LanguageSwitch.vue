@@ -16,11 +16,11 @@ const options = [
   { label: 'Deutsch', value: 'de' },
   { label: 'Português', value: 'pt' },
   { label: 'Русский', value: 'ru' },
+  { label: 'العربية', value: 'ar' },
 ]
 
-function handleChange(val: string) {
-  switchLocale(val)
-  localStorage.setItem('hermes_locale', val)
+async function handleChange(val: string) {
+  await switchLocale(val)
 }
 </script>
 

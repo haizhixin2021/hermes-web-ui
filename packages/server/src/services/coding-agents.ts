@@ -1,5 +1,5 @@
 import { execFile } from 'child_process'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { existsSync, readdirSync, realpathSync } from 'fs'
 import { chmod, mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { homedir } from 'os'
@@ -10,7 +10,7 @@ import { PROVIDER_ENV_MAP, readConfigYamlForProfile, safeReadFile } from './conf
 import { getCompatibleCustomProviders } from './hermes/custom-providers-compat'
 import { registerClaudeCodeProxyTarget } from './agent-runner/proxies/claude-code-proxy'
 import { registerCodexProxyTarget } from './agent-runner/proxies/codex-proxy'
-import type { ApiMode } from './agent-runner/types'
+import type { ApiMode, CodingAgentImageInput } from './agent-runner/types'
 import { PROVIDER_PRESETS } from '../shared/providers'
 import { getModelContextLength } from './hermes/model-context'
 import { getProfileDir } from './hermes/hermes-profile'
@@ -19,6 +19,7 @@ import { codingAgentRunManager } from './agent-runner/coding-agent-run-manager'
 import { getSession, updateSession, type HermesSessionRow } from '../db/hermes/session-store'
 import type { SessionState } from './hermes/run-chat/types'
 import { normalizeWindowsCommandPath, windowsCmdShimExecution, windowsCommandNeedsShell, type WindowsCommandExecution } from './windows-command'
+import { assertScopedCodingAgentProviderAllowed } from './coding-agent-provider-policy'
 
 const execFileAsync = promisify(execFile)
 const LAUNCH_API_MODES = new Set<ApiMode>(['chat_completions', 'codex_responses', 'anthropic_messages'])
@@ -28,14 +29,14 @@ const CODEX_CATALOG_BASE_INSTRUCTIONS = 'You are Codex, a coding agent. Be preci
 const NODE_ENVIRONMENT_MISSING_CODE = 'node_environment_missing'
 const POSIX_LAUNCHER_FILE = 'launch.sh'
 const WINDOWS_LAUNCHER_FILE = 'launch.ps1'
-const CODING_AGENT_SCOPED_AUTH_PROVIDERS = new Set(['openai-codex', 'copilot', 'xai-oauth', 'nous', 'google-gemini-cli', 'claude-oauth'])
 const CLAUDE_CODE_SKIP_PERMISSIONS_ARGS = ['--dangerously-skip-permissions']
 const CLAUDE_CODE_ROOT_PERMISSION_ARGS = ['--permission-mode', 'auto']
-const HERMES_MCP_SERVERS = [
+const HERMES_MCP_SERVERS: ReadonlyArray<{ name: string; toolset: string }> = [
   { name: 'hermes-studio-api', toolset: 'api' },
+  { name: 'hermes-studio-browser', toolset: 'browser' },
   { name: 'hermes-studio-devices', toolset: 'devices' },
   { name: 'hermes-studio-use', toolset: 'use' },
-] as const
+]
 const HERMES_MCP_SERVER_NAMES: Set<string> = new Set(HERMES_MCP_SERVERS.map(server => server.name))
 const LEGACY_HERMES_MCP_SERVER_NAMES = new Set(['hermes-studio', 'hermes-studio-mcp', 'hermes-web-ui-mcp'])
 const LEGACY_HERMES_MCP_COMMANDS = new Set([
@@ -166,7 +167,7 @@ const TOOL_DEFINITIONS: CodingAgentDefinition[] = [
 const CONFIG_FILE_DEFINITIONS: Record<CodingAgentId, Array<Omit<CodingAgentConfigFileDefinition, 'absolutePath'> & { scopedPath: string }>> = {
   'claude-code': [
     { key: 'settings', path: '~/.claude/settings.json', scopedPath: 'settings.json', language: 'json' },
-    { key: 'mcp', path: '~/.claude.json', scopedPath: 'mcp.json', language: 'json' },
+    { key: 'mcp', path: '~/.claude/mcp.json', scopedPath: 'mcp.json', language: 'json' },
     { key: 'prompt', path: '~/.claude/hermes-rules.md', scopedPath: 'hermes-rules.md', language: 'markdown' },
   ],
   codex: [
@@ -385,6 +386,21 @@ function normalizeScopeSegment(value: string | undefined, fallback: string, labe
   return segment
 }
 
+function normalizeProviderIdentity(value: string | undefined): string {
+  const provider = String(value || '').trim() || 'default'
+  if (/[\x00-\x1f\x7f-\x9f]/.test(provider)) {
+    const err = new Error('Invalid provider')
+    ;(err as any).status = 400
+    throw err
+  }
+  if (provider.length > 128) {
+    const err = new Error('provider is too long')
+    ;(err as any).status = 400
+    throw err
+  }
+  return provider
+}
+
 function normalizeConfigScope(scope: CodingAgentConfigScope = {}): Required<CodingAgentConfigScope> {
   return {
     profile: normalizeScopeSegment(scope.profile, 'default', 'profile'),
@@ -479,19 +495,6 @@ function belongsToDifferentBuiltinProvider(provider: string, baseUrl: string): b
     item.value !== providerKey &&
     providerPresetHost(item.base_url) === inputHost
   ))
-}
-
-function isScopedCodingAgentAuthProvider(provider: string, apiKey = ''): boolean {
-  const providerKey = String(provider || '').trim().toLowerCase()
-  return CODING_AGENT_SCOPED_AUTH_PROVIDERS.has(providerKey)
-}
-
-function assertScopedCodingAgentProviderAllowed(mode: CodingAgentLaunchResult['mode'], provider: string, apiKey = ''): void {
-  if (mode === 'global') return
-  if (!isScopedCodingAgentAuthProvider(provider, apiKey)) return
-  const err = new Error('Coding agent scoped mode does not support OAuth/subscription providers. Use global mode or select an API-key provider.')
-  ;(err as any).status = 400
-  throw err
 }
 
 async function resolveStoredProviderLaunchInput(
@@ -616,6 +619,21 @@ function getScopedConfigRoot(id: CodingAgentId, scope: Required<CodingAgentConfi
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'model', scope.profile, scope.provider, id)
 }
 
+function getScopedRuntimeConfigRoot(
+  id: CodingAgentId,
+  scope: Required<CodingAgentConfigScope>,
+  input: Pick<CodingAgentLaunchInput, 'sessionId' | 'agentSessionId'>,
+): string {
+  const rootDir = getScopedConfigRoot(id, scope)
+  const sessionId = String(input.sessionId || '').trim()
+  const agentSessionId = String(input.agentSessionId || '').trim()
+  if (!sessionId || !agentSessionId) return rootDir
+  const runtimeKey = createHash('sha256')
+    .update(JSON.stringify([sessionId, agentSessionId]))
+    .digest('hex')
+  return join(rootDir, 'runs', runtimeKey)
+}
+
 function getScopedWorkspaceRoot(scope: Required<CodingAgentConfigScope>): string {
   return join(getWebUiHome(), CODING_AGENT_HOME_DIR, 'workspace', scope.profile, scope.provider)
 }
@@ -660,6 +678,7 @@ function codexCatalogEntry(input: {
       { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
       { effort: 'high', description: 'Greater reasoning depth for complex problems' },
       { effort: 'xhigh', description: 'Extra high reasoning depth for complex problems' },
+      { effort: 'max', description: 'Maximum reasoning depth for the hardest quality-first tasks' },
     ],
     shell_type: 'shell_command',
     visibility: 'list',
@@ -694,7 +713,7 @@ function codexCatalogEntry(input: {
     max_context_window: input.contextWindow,
     effective_context_window_percent: 95,
     experimental_supported_tools: [],
-    input_modalities: ['text'],
+    input_modalities: ['text', 'image'],
     supports_search_tool: true,
   }
 }
@@ -868,31 +887,105 @@ function isManagedHermesMcpServer(value: unknown): boolean {
   return typeof server.command === 'string' && LEGACY_HERMES_MCP_COMMANDS.has(server.command)
 }
 
+function normalizeClaudeMcpServer(server: unknown): unknown {
+  if (!server || typeof server !== 'object' || Array.isArray(server)) return server
+  const normalized = { ...(server as Record<string, unknown>) }
+  if (normalized.type === 'streamableHttp') normalized.type = 'http'
+  return normalized
+}
+
 function parseClaudeMcpServers(existingContent: string | null | undefined = ''): Record<string, unknown> {
   if (!existingContent?.trim()) return {}
   try {
     const parsed = JSON.parse(existingContent)
     if (!parsed?.mcpServers || typeof parsed.mcpServers !== 'object' || Array.isArray(parsed.mcpServers)) return {}
-    return Object.fromEntries(Object.entries(parsed.mcpServers).filter(([name, server]) => {
-      if (HERMES_MCP_SERVER_NAMES.has(name)) return false
-      if (LEGACY_HERMES_MCP_SERVER_NAMES.has(name)) return false
-      return !isManagedHermesMcpServer(server)
-    }))
+    return Object.fromEntries(Object.entries(parsed.mcpServers)
+      .filter(([name, server]) => {
+        if (HERMES_MCP_SERVER_NAMES.has(name)) return false
+        if (LEGACY_HERMES_MCP_SERVER_NAMES.has(name)) return false
+        return !isManagedHermesMcpServer(server)
+      })
+      .map(([name, server]) => [name, normalizeClaudeMcpServer(server)]))
   } catch {
     return {}
   }
 }
 
-function claudeMcpConfigJson(profile: string, existingContent: string | null | undefined = ''): string {
-  const mcpServers = parseClaudeMcpServers(existingContent)
+function inheritClaudeSettings(existingContent: string | null | undefined = ''): Record<string, unknown> {
+  if (!existingContent?.trim()) return {}
+  try {
+    const parsed = JSON.parse(existingContent)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const inherited: Record<string, unknown> = {}
+    const enabledServers = (parsed as any).enabledMcpjsonServers
+    if (Array.isArray(enabledServers)) inherited.enabledMcpjsonServers = enabledServers.map(String).filter(Boolean)
+    const plugins = (parsed as any).plugins
+    if (plugins && typeof plugins === 'object' && !Array.isArray(plugins)) inherited.plugins = plugins
+    const enabledPlugins = (parsed as any).enabledPlugins
+    if (enabledPlugins && typeof enabledPlugins === 'object' && !Array.isArray(enabledPlugins)) inherited.enabledPlugins = enabledPlugins
+    return inherited
+  } catch {
+    return {}
+  }
+}
+
+function claudeMcpConfigJson(profile: string, ...existingContents: Array<string | null | undefined>): string {
+  const mcpServers: Record<string, unknown> = {}
+  for (const content of existingContents) {
+    Object.assign(mcpServers, parseClaudeMcpServers(content))
+  }
   for (const server of HERMES_MCP_SERVERS) {
     mcpServers[server.name] = hermesMcpServerConfig(profile, server.name, server.toolset)
   }
   return `${JSON.stringify({ mcpServers }, null, 2)}\n`
 }
 
-function codexMcpConfigToml(profile: string): string {
-  const blocks: string[] = []
+function parseCodexExternalMcpBlocks(...contents: Array<string | null | undefined>): string[] {
+  const blockByServer = new Map<string, string>()
+
+  for (const content of contents) {
+    if (!content?.trim()) continue
+    let currentServer = ''
+    let currentLines: string[] = []
+    const flush = () => {
+      if (!currentServer || currentLines.length === 0) return
+      const block = currentLines.join('\n').trim()
+      const isManaged = block.includes(`${HERMES_MCP_MANAGED_ENV_KEY}`)
+      if (!HERMES_MCP_SERVER_NAMES.has(currentServer) && !LEGACY_HERMES_MCP_SERVER_NAMES.has(currentServer) && !isManaged) {
+        blockByServer.set(currentServer, block)
+      }
+    }
+
+    for (const line of content.split(/\r?\n/)) {
+      const mcpMatch = line.match(/^\s*\[mcp_servers\.([^\].]+)(\.[^\]]+)?\]\s*$/)
+      if (mcpMatch) {
+        const nextServer = mcpMatch[1]
+        const isSubtable = Boolean(mcpMatch[2])
+        if (currentServer && nextServer === currentServer && isSubtable) {
+          currentLines.push(line)
+          continue
+        }
+        flush()
+        currentServer = nextServer
+        currentLines = [line]
+        continue
+      }
+      if (/^\s*\[/.test(line)) {
+        flush()
+        currentServer = ''
+        currentLines = []
+        continue
+      }
+      if (currentServer) currentLines.push(line)
+    }
+    flush()
+  }
+
+  return Array.from(blockByServer.values()).filter(Boolean)
+}
+
+function codexMcpConfigToml(profile: string, ...externalContents: Array<string | null | undefined>): string {
+  const blocks: string[] = [...parseCodexExternalMcpBlocks(...externalContents)]
   for (const item of HERMES_MCP_SERVERS) {
     const server = hermesMcpServerConfig(profile, item.name, item.toolset)
     const lines = [
@@ -1121,13 +1214,18 @@ function getLiveConfigFileDefinition(id: string, key: string): CodingAgentConfig
   }
 }
 
-function getScopedConfigFileDefinition(id: string, key: string, scopeInput: CodingAgentConfigScope = {}): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
+function getScopedConfigFileDefinition(
+  id: string,
+  key: string,
+  scopeInput: CodingAgentConfigScope = {},
+  rootDirOverride?: string,
+): (CodingAgentConfigFileDefinition & Required<CodingAgentConfigScope> & { rootDir: string }) | null {
   const tool = getCodingAgentDefinition(id)
   if (!tool) return null
   const definition = CONFIG_FILE_DEFINITIONS[tool.id].find(file => file.key === key)
   if (!definition) return null
   const scope = normalizeConfigScope(scopeInput)
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const rootDir = rootDirOverride || getScopedConfigRoot(tool.id, scope)
   return {
     key: definition.key,
     path: definition.path,
@@ -1570,11 +1668,11 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     }
   }
 
-  const provider = normalizeScopeSegment(input.provider, 'default', 'provider')
+  const provider = normalizeProviderIdentity(input.provider)
   const scope = normalizeConfigScope({ profile: input.profile, provider })
   const model = String(input.model || '').trim()
   const apiKey = String(input.apiKey || '').trim()
-  assertScopedCodingAgentProviderAllowed(mode, provider, apiKey)
+  assertScopedCodingAgentProviderAllowed(mode, provider)
   if (!model) {
     const err = new Error('Model is required')
     ;(err as any).status = 400
@@ -1585,14 +1683,14 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   const preset = PROVIDER_PRESETS.find(item => item.value === provider)
   const apiMode = normalizeLaunchApiMode(input.apiMode, preset?.api_mode || 'chat_completions')
   const reasoningEffort = String(input.reasoningEffort || '').trim()
-  const rootDir = getScopedConfigRoot(tool.id, scope)
+  const rootDir = getScopedRuntimeConfigRoot(tool.id, scope, input)
   const workspaceDir = resolveLaunchWorkspaceRoot(scope, input.workspace)
   await mkdir(rootDir, { recursive: true })
   await mkdir(workspaceDir, { recursive: true })
 
   const files: Array<{ key: string; path: string; absolutePath: string }> = []
   const writeScopedFile = async (key: string, content: string) => {
-    const definition = getScopedConfigFileDefinition(tool.id, key, scope)
+    const definition = getScopedConfigFileDefinition(tool.id, key, scope, rootDir)
     if (!definition) return
     await mkdir(dirname(definition.absolutePath), { recursive: true })
     await writeFile(definition.absolutePath, content, 'utf-8')
@@ -1619,7 +1717,10 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     const claudeBaseUrl = proxyTarget?.baseUrl || baseUrl
     const claudeApiKey = proxyTarget?.token || apiKey
     const modelName = displayNameForModel(model)
+    const globalSettingsPath = getLiveConfigFileDefinition(tool.id, 'settings')?.absolutePath
+    const inheritedSettings = inheritClaudeSettings(globalSettingsPath ? await safeReadFile(globalSettingsPath) : '')
     const settings = {
+      ...inheritedSettings,
       model,
       env: {
         ...(claudeApiKey ? { ANTHROPIC_API_KEY: claudeApiKey } : {}),
@@ -1637,9 +1738,11 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     }
     env = settings.env
     await writeScopedFile('settings', `${JSON.stringify(settings, null, 2)}\n`)
+    const globalMcpPath = getLiveConfigFileDefinition(tool.id, 'mcp')?.absolutePath
     const existingMcpPath = getScopedConfigFileDefinition(tool.id, 'mcp', scope)?.absolutePath
+    const globalMcpConfig = globalMcpPath ? await safeReadFile(globalMcpPath) : ''
     const existingMcpConfig = existingMcpPath ? await safeReadFile(existingMcpPath) : ''
-    await writeScopedFile('mcp', claudeMcpConfigJson(scope.profile, existingMcpConfig))
+    await writeScopedFile('mcp', claudeMcpConfigJson(scope.profile, globalMcpConfig, existingMcpConfig))
     await writeScopedFile('prompt', hermesPromptDocument())
 
     const settingsPath = join(rootDir, 'settings.json')
@@ -1695,7 +1798,11 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
       'requires_openai_auth = false',
       ...(codexApiKey ? [`experimental_bearer_token = ${JSON.stringify(codexApiKey)}`] : []),
       '',
-      codexMcpConfigToml(scope.profile),
+      codexMcpConfigToml(
+        scope.profile,
+        await safeReadFile(getLiveConfigFileDefinition(tool.id, 'config')?.absolutePath || ''),
+        await safeReadFile(getScopedConfigFileDefinition(tool.id, 'config', scope)?.absolutePath || ''),
+      ),
     ].join('\n')
     const catalog = buildCodexModelCatalog({
       profile: scope.profile,
@@ -1739,7 +1846,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
     agentId: tool.id,
     mode,
     profile: scope.profile,
-    provider: scope.provider,
+    provider,
     model,
     apiMode,
     rootDir,
@@ -1774,11 +1881,7 @@ export async function startCodingAgentRun(
   const resolvedInput = await resolveStoredProviderLaunchInput(input, existingSession)
   const requestedMode = resolvedInput.mode === 'global' ? 'global' : 'scoped'
   const requestedProvider = String(resolvedInput.provider || '').trim().toLowerCase()
-  if (requestedMode !== 'global' && CODING_AGENT_SCOPED_AUTH_PROVIDERS.has(requestedProvider)) {
-    const err = new Error('Coding agent scoped mode does not support OAuth/subscription providers. Use global mode or select an API-key provider.')
-    ;(err as any).status = 400
-    throw err
-  }
+  assertScopedCodingAgentProviderAllowed(requestedMode, requestedProvider)
   if (requestedMode !== 'global' && (!String(resolvedInput.baseUrl || '').trim() || !String(resolvedInput.apiKey || '').trim())) {
     const err = new Error('Coding agent provider credentials are missing. Re-select the provider/model or update the provider API key before continuing this session.')
     ;(err as any).status = 400
@@ -1850,8 +1953,14 @@ export async function startCodingAgentRun(
   }
 }
 
-export function sendCodingAgentRunInput(sessionId: string, input: string, systemPrompt?: string): { runId: string } {
-  return codingAgentRunManager.send(sessionId, input, { systemPrompt })
+export function sendCodingAgentRunInput(
+  sessionId: string,
+  input: string,
+  systemPrompt?: string,
+  images: CodingAgentImageInput[] = [],
+  storageInput?: string,
+): { runId: string } {
+  return codingAgentRunManager.send(sessionId, input, { systemPrompt, images, storageInput })
 }
 
 export function stopCodingAgentRun(sessionId: string): { stopped: boolean } {

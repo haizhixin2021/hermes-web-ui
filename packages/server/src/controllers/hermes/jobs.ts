@@ -1,13 +1,23 @@
 import type { Context } from 'koa'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { getHermesBin } from '../../services/hermes/hermes-path'
 import { getActiveProfileName, getProfileDir } from '../../services/hermes/hermes-profile'
-import { execHermesWithBin } from '../../services/hermes/hermes-process'
+import { execHermesWithBin, spawnHermesWithBin } from '../../services/hermes/hermes-process'
+import { readConfigYamlForProfile } from '../../services/config-helpers'
 
 const TIMEOUT_MS = 60_000
 
 type JobRecord = Record<string, any>
+
+interface DeliveryTargetRecord {
+  platform: string
+  id: string
+  name: string
+  type: string | null
+  thread_id: string | null
+  value: string
+}
 
 function resolveProfile(ctx: Context): string {
   const requestedProfile = ctx.state?.profile?.name
@@ -20,6 +30,58 @@ function resolveProfileDir(profile: string): string {
 
 function getJobsPath(profile: string): string {
   return join(resolveProfileDir(profile), 'cron', 'jobs.json')
+}
+
+function getChannelDirectoryPath(profile: string): string {
+  return join(resolveProfileDir(profile), 'channel_directory.json')
+}
+
+function readDeliveryTargets(profile: string): { updated_at: string | null; targets: DeliveryTargetRecord[] } {
+  const directoryPath = getChannelDirectoryPath(profile)
+  if (!existsSync(directoryPath)) return { updated_at: null, targets: [] }
+
+  try {
+    const parsed = JSON.parse(readFileSync(directoryPath, 'utf-8'))
+    const platforms = parsed?.platforms
+    if (!platforms || typeof platforms !== 'object' || Array.isArray(platforms)) {
+      return { updated_at: null, targets: [] }
+    }
+
+    const targets: DeliveryTargetRecord[] = []
+    const seen = new Set<string>()
+    for (const [rawPlatform, rawChannels] of Object.entries(platforms)) {
+      const platform = String(rawPlatform || '').trim().toLowerCase()
+      if (!platform || !Array.isArray(rawChannels)) continue
+
+      for (const rawChannel of rawChannels) {
+        if (!rawChannel || typeof rawChannel !== 'object') continue
+        const channel = rawChannel as Record<string, unknown>
+        const id = String(channel.id ?? channel.chat_id ?? '').trim()
+        if (!id) continue
+
+        const value = `${platform}:${id}`
+        if (seen.has(value)) continue
+        seen.add(value)
+
+        const name = String(channel.name ?? id).trim() || id
+        const type = channel.type == null ? null : String(channel.type).trim() || null
+        const threadId = channel.thread_id == null ? null : String(channel.thread_id).trim() || null
+        targets.push({ platform, id, name, type, thread_id: threadId, value })
+      }
+    }
+
+    targets.sort((a, b) => {
+      const platformOrder = a.platform.localeCompare(b.platform)
+      return platformOrder || a.name.localeCompare(b.name) || a.id.localeCompare(b.id)
+    })
+
+    const updatedAt = typeof parsed.updated_at === 'string' && parsed.updated_at.trim()
+      ? parsed.updated_at
+      : null
+    return { updated_at: updatedAt, targets }
+  } catch {
+    return { updated_at: null, targets: [] }
+  }
 }
 
 function normalizeJob(job: JobRecord): JobRecord {
@@ -53,6 +115,41 @@ function normalizeJob(job: JobRecord): JobRecord {
     origin: job.origin ?? null,
     last_delivery_error: job.last_delivery_error ?? null,
   }
+}
+
+function resolveJobDefaults(jobs: JobRecord[], config: Record<string, any>): JobRecord[] {
+  const modelSection = config.model
+  let defaultModel = ''
+  let defaultProvider = ''
+  if (typeof modelSection === 'object' && modelSection !== null) {
+    defaultModel = String(modelSection.default || '').trim()
+    defaultProvider = String(modelSection.provider || '').trim()
+    // Resolve 'custom' provider from custom_providers matching base_url+model
+    if (defaultProvider === 'custom' && defaultModel) {
+      const cps = Array.isArray(config.custom_providers) ? config.custom_providers : []
+      const match = cps.find((cp: any) =>
+        String(cp.base_url || '').replace(/\/$/, '') === String(modelSection.base_url || '').replace(/\/$/, '')
+        && String(cp.model || '') === defaultModel
+      ) || cps.find((cp: any) =>
+        String(cp.base_url || '').replace(/\/$/, '') === String(modelSection.base_url || '').replace(/\/$/, '')
+      )
+      if (match) defaultProvider = 'custom:' + String(match.name || '').trim()
+    }
+  } else if (typeof modelSection === 'string') {
+    defaultModel = modelSection.trim()
+  }
+  if (!defaultModel && !defaultProvider) return jobs
+  return jobs.map(job => ({
+    ...job,
+    provider: job.provider || defaultProvider || null,
+    model: job.model || defaultModel || null,
+  }))
+}
+
+function writeJobs(profile: string, jobs: JobRecord[], asArray = false): void {
+  const jobsPath = getJobsPath(profile)
+  const payload = asArray ? jobs : { jobs }
+  writeFileSync(jobsPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8')
 }
 
 function readJobs(profile: string, includeDisabled = true): JobRecord[] {
@@ -103,6 +200,45 @@ function hasRepeatField(body: Record<string, any>): boolean {
   return Object.prototype.hasOwnProperty.call(body, 'repeat')
 }
 
+function normalizeOptionalText(value: unknown): string | null {
+  if (value == null) return null
+  const text = String(value).trim()
+  return text ? text : null
+}
+
+function hasOwn(body: Record<string, any>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(body, field)
+}
+
+function buildInferenceUpdates(body: Record<string, any>): Record<string, string | null> {
+  const updates: Record<string, string | null> = {}
+  if (hasOwn(body, 'provider')) updates.provider = normalizeOptionalText(body.provider)
+  if (hasOwn(body, 'model')) updates.model = normalizeOptionalText(body.model)
+  if (hasOwn(body, 'base_url')) updates.base_url = normalizeOptionalText(body.base_url)
+  return updates
+}
+
+function patchJobFields(profile: string, jobId: string, fields: Record<string, any>): JobRecord | null {
+  const updates = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined))
+  if (Object.keys(updates).length === 0) return findJob(profile, jobId)
+
+  const jobsPath = getJobsPath(profile)
+  if (!existsSync(jobsPath)) return null
+  const parsed = JSON.parse(readFileSync(jobsPath, 'utf-8'))
+  const parsedAsArray = Array.isArray(parsed)
+  const rawJobs = parsedAsArray ? parsed : parsed?.jobs
+  if (!Array.isArray(rawJobs)) return null
+
+  const index = rawJobs.findIndex((job: JobRecord) => (job.job_id || job.id) === jobId || job.id === jobId)
+  if (index === -1) return null
+  rawJobs[index] = {
+    ...rawJobs[index],
+    ...updates,
+  }
+  writeJobs(profile, rawJobs, parsedAsArray)
+  return normalizeJob(rawJobs[index])
+}
+
 function getSkills(body: Record<string, any>): string[] | null {
   if (Array.isArray(body.skills)) {
     return body.skills.map((skill) => String(skill || '').trim()).filter(Boolean)
@@ -114,10 +250,10 @@ function getSkills(body: Record<string, any>): string[] | null {
   return null
 }
 
-async function runHermesCron(profile: string, args: string[]): Promise<void> {
+async function runHermesCron(profile: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
   const profileDir = resolveProfileDir(profile)
   try {
-    await execHermesWithBin(getHermesBin(), args, {
+    return await execHermesWithBin(getHermesBin(), args, {
       cwd: process.cwd(),
       env: { ...process.env, HERMES_HOME: profileDir },
       timeout: TIMEOUT_MS,
@@ -129,6 +265,33 @@ async function runHermesCron(profile: string, args: string[]): Promise<void> {
     const stdout = String(error?.stdout || '').trim()
     throw new Error(stderr || stdout || error?.message || 'Hermes cron command failed')
   }
+}
+
+function reportedCommandFailure(result: { stdout: string; stderr: string }): string | null {
+  for (const output of [result.stderr, result.stdout]) {
+    const message = String(output || '').trim()
+    if (/^(?:failed|error)\b/im.test(message)) return message
+  }
+  return null
+}
+
+async function startHermesCronInBackground(profile: string, args: string[]): Promise<void> {
+  const profileDir = resolveProfileDir(profile)
+  const child = spawnHermesWithBin(getHermesBin(), args, {
+    cwd: process.cwd(),
+    env: { ...process.env, HERMES_HOME: profileDir },
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('spawn', () => {
+      child.unref()
+      resolve()
+    })
+  })
 }
 
 function getCronArgs(profile: string, command: string, ...args: string[]): string[] {
@@ -147,20 +310,19 @@ function sendCommandError(ctx: Context, error: any): void {
 
 function findCreatedJob(beforeJobs: JobRecord[], afterJobs: JobRecord[]): JobRecord | null {
   const beforeIds = new Set(beforeJobs.map((job) => job.job_id || job.id))
-  const created = afterJobs.find((job) => !beforeIds.has(job.job_id || job.id))
-  if (created) return created
-
-  return [...afterJobs].sort((a, b) => {
-    const aTime = Date.parse(a.created_at || '') || 0
-    const bTime = Date.parse(b.created_at || '') || 0
-    return bTime - aTime
-  })[0] ?? null
+  return afterJobs.find((job) => !beforeIds.has(job.job_id || job.id)) ?? null
 }
 
 export async function list(ctx: Context) {
   const profile = resolveProfile(ctx)
   const includeDisabled = boolQuery(ctx.query.include_disabled, false)
-  ctx.body = { jobs: readJobs(profile, includeDisabled) }
+  const jobs = readJobs(profile, includeDisabled)
+  const config = await readConfigYamlForProfile(profile)
+  ctx.body = { jobs: resolveJobDefaults(jobs, config) }
+}
+
+export function deliveryTargets(ctx: Context) {
+  ctx.body = readDeliveryTargets(resolveProfile(ctx))
 }
 
 export async function get(ctx: Context) {
@@ -173,19 +335,31 @@ export async function get(ctx: Context) {
 export async function create(ctx: Context) {
   const profile = resolveProfile(ctx)
   const body = getBody(ctx)
+  const name = String(body.name || '').trim()
   const schedule = String(body.schedule || body.schedule_display || '').trim()
   const prompt = String(body.prompt || '').trim()
+  const skills = getSkills(body)
+  const script = String(body.script || '').trim()
 
+  if (!name) {
+    ctx.status = 400
+    ctx.body = { error: { message: 'Name is required' } }
+    return
+  }
   if (!schedule) {
     ctx.status = 400
     ctx.body = { error: { message: 'Schedule is required' } }
     return
   }
+  if (!prompt && !skills?.length && !script) {
+    ctx.status = 400
+    ctx.body = { error: { message: 'Prompt, skill, or script is required' } }
+    return
+  }
 
   const beforeJobs = readJobs(profile, true)
   const args = getCronArgs(profile, 'create')
-  const name = String(body.name || '').trim()
-  if (name) args.push('--name', name)
+  args.push('--name', name)
   if (body.deliver != null && String(body.deliver).trim()) args.push('--deliver', String(body.deliver).trim())
 
   const repeat = getRepeatValue(body.repeat)
@@ -196,10 +370,9 @@ export async function create(ctx: Context) {
     args.push('--repeat', '0')
   }
 
-  const skills = getSkills(body)
   for (const skill of skills || []) args.push('--skill', skill)
 
-  if (body.script != null && String(body.script).trim()) args.push('--script', String(body.script).trim())
+  if (script) args.push('--script', script)
   if (body.workdir != null) args.push('--workdir', String(body.workdir))
   if (body.no_agent === true) args.push('--no-agent')
 
@@ -207,9 +380,20 @@ export async function create(ctx: Context) {
   if (prompt) args.push(prompt)
 
   try {
-    await runHermesCron(profile, args)
+    const result = await runHermesCron(profile, args)
     const job = findCreatedJob(beforeJobs, readJobs(profile, true))
-    ctx.body = { job }
+    if (!job) {
+      const reportedFailure = reportedCommandFailure(result)
+      if (reportedFailure) {
+        ctx.status = 400
+        ctx.body = { error: { message: reportedFailure } }
+        return
+      }
+      throw new Error('Hermes cron command completed without creating a job')
+    }
+    const inferenceUpdates = buildInferenceUpdates(body)
+    const patchedJob = patchJobFields(profile, job.job_id || job.id, inferenceUpdates)
+    ctx.body = { job: patchedJob || job }
   } catch (error: any) {
     sendCommandError(ctx, error)
   }
@@ -251,8 +435,13 @@ export async function update(ctx: Context) {
   if (body.no_agent === false) args.push('--agent')
 
   try {
-    await runHermesCron(profile, args)
-    const job = findJob(profile, ctx.params.id)
+    const inferenceUpdates = buildInferenceUpdates(body)
+    const hasCliUpdates = args.length > 5
+    if (hasCliUpdates) {
+      await runHermesCron(profile, args)
+    }
+    const patchedJob = patchJobFields(profile, ctx.params.id, inferenceUpdates)
+    const job = patchedJob || findJob(profile, ctx.params.id)
     if (!job) return sendJobNotFound(ctx)
     ctx.body = { job }
   } catch (error: any) {
@@ -303,8 +492,9 @@ export async function run(ctx: Context) {
   if (!findJob(profile, ctx.params.id)) return sendJobNotFound(ctx)
 
   try {
-    await runHermesCron(profile, getCronArgs(profile, 'run', ctx.params.id))
+    await startHermesCronInBackground(profile, getCronArgs(profile, 'run', ctx.params.id))
     const job = findJob(profile, ctx.params.id)
+    ctx.status = 202
     ctx.body = { job }
   } catch (error: any) {
     sendCommandError(ctx, error)

@@ -74,6 +74,18 @@ export interface PaginatedHermesSessionDetailResult {
   hasMore: boolean
 }
 
+export interface HermesSessionSummaryGroupPage {
+  source: string
+  sessions: HermesSessionRow[]
+  total: number
+  hasMore: boolean
+}
+
+export interface HermesSessionSummaryGroupsResult {
+  groups: HermesSessionSummaryGroupPage[]
+  included: HermesSessionRow[]
+}
+
 interface HermesSessionInternalRow extends HermesSessionRow {
   parent_session_id: string | null
 }
@@ -394,6 +406,12 @@ function latestSessionInChain(chain: HermesSessionInternalRow[]): HermesSessionI
   }, chain[0])
 }
 
+function compareSessionSummariesNewestFirst(a: HermesSessionRow, b: HermesSessionRow): number {
+  const activityDelta = Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0)
+  if (activityDelta !== 0) return activityDelta
+  return b.id.localeCompare(a.id)
+}
+
 function projectSessionSummary(root: HermesSessionInternalRow, chain: HermesSessionInternalRow[]): HermesSessionRow {
   const latest = latestSessionInChain(chain)
   const firstPreview = chain.map(session => session.preview).find(Boolean) || root.preview
@@ -448,22 +466,91 @@ function loadAllSessions(db: { prepare: (sql: string) => { all: (...params: any[
   return { byId, childrenByParent }
 }
 
-function getLatestContinuationChild(
+type SessionLookupDb = {
+  prepare: (sql: string) => {
+    get: (...params: any[]) => Record<string, unknown> | undefined
+    all: (...params: any[]) => Record<string, unknown>[]
+  }
+}
+
+function loadSessionById(db: SessionLookupDb, sessionId: string): HermesSessionInternalRow | null {
+  const row = db.prepare(`
+    SELECT
+      ${SESSION_SELECT},
+      s.parent_session_id AS parent_session_id
+    FROM sessions s
+    WHERE s.id = ?
+      AND s.source != 'tool'
+      AND s.id NOT LIKE 'compress_%'
+  `).get(sessionId)
+  return row ? mapInternalSessionRow(row) : null
+}
+
+function loadContinuationChildren(db: SessionLookupDb, parentSessionId: string): HermesSessionInternalRow[] {
+  const rows = db.prepare(`
+    SELECT
+      ${SESSION_SELECT},
+      s.parent_session_id AS parent_session_id
+    FROM sessions s
+    WHERE s.parent_session_id = ?
+      AND s.source != 'tool'
+      AND s.id NOT LIKE 'compress_%'
+  `).all(parentSessionId)
+  return rows.map(mapInternalSessionRow)
+}
+
+function selectCompressionContinuationChild(
   parent: HermesSessionInternalRow,
-  idx: SessionIndex,
+  candidates: HermesSessionInternalRow[],
 ): HermesSessionInternalRow | null {
   if (!isCompressionEnded(parent) || parent.ended_at == null) return null
-  const candidates = (idx.childrenByParent.get(parent.id) || [])
-    .map(id => idx.byId.get(id))
-    .filter((c): c is HermesSessionInternalRow => !!c)
-    .filter(c => Number(c.started_at || 0) >= Number(parent.ended_at || 0))
+  return candidates
+    .filter(candidate => Number(candidate.started_at || 0) >= Number(parent.ended_at || 0))
     .sort((a, b) => {
       const aDelta = Number(a.started_at || 0) - Number(parent.ended_at || 0)
       const bDelta = Number(b.started_at || 0) - Number(parent.ended_at || 0)
       if (aDelta !== bDelta) return aDelta - bDelta
       return b.id.localeCompare(a.id)
-    })
-  return candidates[0] || null
+    })[0] || null
+}
+
+function loadSessionChain(db: SessionLookupDb, sessionId: string): HermesSessionInternalRow[] {
+  const requested = loadSessionById(db, sessionId)
+  if (!requested) return []
+
+  const reversed: HermesSessionInternalRow[] = [requested]
+  const ancestorIds = new Set<string>()
+  let current: HermesSessionInternalRow | null = requested
+  for (let depth = 0; current?.parent_session_id && depth < 100 && !ancestorIds.has(current.id); depth += 1) {
+    ancestorIds.add(current.id)
+    const parent = loadSessionById(db, current.parent_session_id)
+    if (!parent || !isCompressionContinuation(parent, current)) break
+    reversed.push(parent)
+    current = parent
+  }
+
+  const chain = reversed.reverse()
+  const chainIds = new Set(chain.map(session => session.id))
+  current = chain[chain.length - 1] || null
+  for (let depth = 0; current && depth < 100; depth += 1) {
+    if (!isCompressionEnded(current) || current.ended_at == null) break
+    const next = selectCompressionContinuationChild(current, loadContinuationChildren(db, current.id))
+    if (!next || chainIds.has(next.id)) break
+    chain.push(next)
+    chainIds.add(next.id)
+    current = next
+  }
+  return chain
+}
+
+function getLatestContinuationChild(
+  parent: HermesSessionInternalRow,
+  idx: SessionIndex,
+): HermesSessionInternalRow | null {
+  const candidates = (idx.childrenByParent.get(parent.id) || [])
+    .map(id => idx.byId.get(id))
+    .filter((c): c is HermesSessionInternalRow => !!c)
+  return selectCompressionContinuationChild(parent, candidates)
 }
 
 function collectCompressionPath(
@@ -641,11 +728,7 @@ export async function getSessionMessagesFromDb(sessionId: string): Promise<{
 export async function getSessionDetailFromDb(sessionId: string): Promise<HermesSessionDetailRow | null> {
   const db = await openSessionDb()
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -668,11 +751,7 @@ export async function getSessionDetailFromDbWithProfile(sessionId: string, profi
   const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -698,11 +777,7 @@ export async function getSessionDetailPaginatedFromDbWithProfile(
 ): Promise<PaginatedHermesSessionDetailResult | null> {
   const db = await openSessionDb(profile)
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -741,8 +816,7 @@ export async function getExactSessionDetailFromDbWithProfile(sessionId: string, 
   const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
+    const requested = loadSessionById(db, sessionId)
     if (!requested) return null
 
     const messageRows = db.prepare(`
@@ -1297,6 +1371,7 @@ export async function getUsageStatsFromDb(
   days = 30,
   nowSeconds = Math.floor(Date.now() / 1000),
   profile?: string,
+  excludedSessionIds: Iterable<string> = [],
 ): Promise<HermesUsageStats> {
   const empty: HermesUsageStats = {
     input_tokens: 0,
@@ -1306,6 +1381,7 @@ export async function getUsageStatsFromDb(
     reasoning_tokens: 0,
     sessions: 0,
     by_model: [],
+    by_agent: [],
     by_day: [],
     cost: 0,
     total_api_calls: 0,
@@ -1314,6 +1390,11 @@ export async function getUsageStatsFromDb(
   const normalizedDays = Number.isFinite(days) ? days : 30
   const safeDays = Math.max(1, Math.floor(normalizedDays))
   const since = nowSeconds - safeDays * 24 * 60 * 60
+  const excludedIds = [...new Set([...excludedSessionIds].map(id => String(id || '').trim()).filter(Boolean))]
+  const exclusionClause = excludedIds.length > 0
+    ? ` AND id NOT IN (SELECT value FROM json_each(?))`
+    : ''
+  const queryParams = excludedIds.length > 0 ? [since, JSON.stringify(excludedIds)] : [since]
   const db = await openSessionDb(profile)
 
   try {
@@ -1331,8 +1412,8 @@ export async function getUsageStatsFromDb(
         COUNT(*) AS sessions,
         ${apiCallsExpr} AS total_api_calls
       FROM sessions
-      WHERE started_at > ?
-    `).get(since) as Record<string, unknown> | undefined
+      WHERE started_at > ?${exclusionClause}
+    `).get(...queryParams) as Record<string, unknown> | undefined
 
     if (!totals) return empty
 
@@ -1346,10 +1427,10 @@ export async function getUsageStatsFromDb(
         COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
         COUNT(*) AS sessions
       FROM sessions
-      WHERE started_at > ? AND model IS NOT NULL
+      WHERE started_at > ? AND model IS NOT NULL${exclusionClause}
       GROUP BY model
       ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC
-    `).all(since).map(row => ({
+    `).all(...queryParams).map(row => ({
       model: String(row.model || ''),
       input_tokens: normalizeNumber(row.input_tokens),
       output_tokens: normalizeNumber(row.output_tokens),
@@ -1369,10 +1450,10 @@ export async function getUsageStatsFromDb(
         COUNT(*) AS sessions,
         COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0) AS cost
       FROM sessions
-      WHERE started_at > ?
+      WHERE started_at > ?${exclusionClause}
       GROUP BY date
       ORDER BY date ASC
-    `).all(since).map(row => ({
+    `).all(...queryParams).map(row => ({
       date: String(row.date || ''),
       input_tokens: normalizeNumber(row.input_tokens),
       output_tokens: normalizeNumber(row.output_tokens),
@@ -1391,6 +1472,17 @@ export async function getUsageStatsFromDb(
       reasoning_tokens: normalizeNumber(totals.reasoning_tokens),
       sessions: normalizeNumber(totals.sessions),
       by_model: byModel,
+      by_agent: normalizeNumber(totals.sessions) > 0
+        ? [{
+            agent: 'hermes',
+            input_tokens: normalizeNumber(totals.input_tokens),
+            output_tokens: normalizeNumber(totals.output_tokens),
+            cache_read_tokens: normalizeNumber(totals.cache_read_tokens),
+            cache_write_tokens: normalizeNumber(totals.cache_write_tokens),
+            reasoning_tokens: normalizeNumber(totals.reasoning_tokens),
+            sessions: normalizeNumber(totals.sessions),
+          }]
+        : [],
       by_day: byDay,
       cost: normalizeNumber(totals.cost),
       total_api_calls: normalizeNumber(totals.total_api_calls),
@@ -1432,8 +1524,50 @@ export async function listSessionSummaries(source?: string, limit = 2000, profil
     const idx = loadAllSessions(db)
     return roots
       .map(root => projectSessionSummary(root, collectSessionChain(root, idx)))
-      .sort((a, b) => Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0))
+      .sort(compareSessionSummariesNewestFirst)
       .slice(0, limit)
+  } finally {
+    db.close()
+  }
+}
+
+export async function listSessionSummaryGroups(
+  limitPerSource = 20,
+  profile?: string,
+  includedSessionIds: string[] = [],
+): Promise<HermesSessionSummaryGroupsResult> {
+  if (!SQLITE_AVAILABLE) {
+    throw new Error(`node:sqlite requires Node >= 22.5, current: ${process.versions.node}`)
+  }
+
+  const db = await openSessionDb(profile)
+  try {
+    const idx = loadAllSessions(db)
+    const grouped = new Map<string, HermesSessionRow[]>()
+    const includedIds = new Set(includedSessionIds)
+    const included = new Map<string, HermesSessionRow>()
+
+    for (const root of idx.byId.values()) {
+      if (root.parent_session_id != null) continue
+      const summary = projectSessionSummary(root, collectSessionChain(root, idx))
+      const sessions = grouped.get(summary.source) || []
+      sessions.push(summary)
+      grouped.set(summary.source, sessions)
+      if (includedIds.has(summary.id)) included.set(summary.id, summary)
+    }
+
+    const normalizedLimit = Math.max(1, limitPerSource)
+    const groups = [...grouped.entries()].map(([source, sessions]) => {
+      sessions.sort(compareSessionSummariesNewestFirst)
+      return {
+        source,
+        sessions: sessions.slice(0, normalizedLimit),
+        total: sessions.length,
+        hasMore: sessions.length > normalizedLimit,
+      }
+    })
+
+    return { groups, included: [...included.values()] }
   } finally {
     db.close()
   }

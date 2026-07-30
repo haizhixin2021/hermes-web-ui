@@ -2,12 +2,12 @@ import { randomUUID } from 'crypto'
 import { mkdir, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { io, type Socket } from 'socket.io-client'
-import WebSocket from 'ws'
 import { config } from '../../config'
 import { clearSessionMessages } from '../../db/hermes/session-store'
 import { getChatRunServer } from '../../routes/hermes/chat-run'
 import { logger } from '../logger'
 import { transcodeToPcmS16le } from '../hermes/stt-providers/audio-convert'
+import { encodeMcuImaAdpcm } from '../hermes/mcu-adpcm'
 import { MCU_TTS_SAMPLE_RATE, mcuPromptText, mcuPromptUrl } from '../hermes/mcu-prompts'
 import { createMcuSpeechSegmenter, normalizeMcuSpeechText } from './mcu-speech-segmenter'
 
@@ -15,6 +15,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const MAX_REQUEST_TIMEOUT_MS = 120_000
 const MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
 const MAX_RESPONSE_BODY_BYTES = 10 * 1024 * 1024
+const GLOBAL_AGENT_NAMESPACE = '/global-agent'
 
 const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'])
 const ALLOWED_REQUEST_HEADERS = new Set([
@@ -46,6 +47,7 @@ const ALLOWED_CHAT_RUN_CLIENT_EVENTS = new Set([
 const CHAT_RUN_SERVER_EVENTS = [
   'run.started',
   'message.delta',
+  'message.interim',
   'reasoning.delta',
   'thinking.delta',
   'reasoning.available',
@@ -75,15 +77,35 @@ const CHAT_RUN_SERVER_EVENTS = [
 ]
 const NON_STREAMING_SUPPRESSED_EVENTS = new Set([
   'message.delta',
+  'message.interim',
   'reasoning.delta',
   'thinking.delta',
   'reasoning.available',
+])
+const SOCKET_IO_RESERVED_EVENTS = new Set([
+  'connect',
+  'connect_error',
+  'disconnect',
+  'disconnecting',
+  'newListener',
+  'removeListener',
 ])
 const MCU_TTS_OPTIONS = {
   mcuPlayback: true,
   sampleRate: MCU_TTS_SAMPLE_RATE,
 } as const
 const MCU_INTERRUPT_DEBOUNCE_MS = 280
+
+function resolveGlobalAgentSocketIoUrl(input: string): string {
+  const url = new URL(input)
+  const path = url.pathname.replace(/\/+$/, '')
+  if (!path) {
+    url.pathname = GLOBAL_AGENT_NAMESPACE
+  } else if (path !== GLOBAL_AGENT_NAMESPACE && !path.endsWith(GLOBAL_AGENT_NAMESPACE)) {
+    url.pathname = `${path}${GLOBAL_AGENT_NAMESPACE}`
+  }
+  return url.toString()
+}
 
 function chooseMcuApprovalChoice(event: Record<string, unknown>): 'once' | 'session' | 'always' | null {
   const rawChoices = Array.isArray(event.choices) ? event.choices.map(choice => String(choice)) : []
@@ -155,15 +177,18 @@ interface StartOutboundRelayClientOptions {
   relayToken?: string
   userToken?: string
   instanceId?: string
+  deviceCode?: string
   localBaseUrl?: string
+  machineInfo?: Record<string, unknown>
   fetchImpl?: typeof fetch
-  relayProtocol?: 'socket.io' | 'websocket'
+  relayProtocol?: 'socket.io' | 'mcu-socket.io'
 }
 
 type OutboundRelayClientOptions =
-  Required<Omit<StartOutboundRelayClientOptions, 'connectionId' | 'relayProtocol' | 'userToken'>> &
+  Required<Omit<StartOutboundRelayClientOptions, 'connectionId' | 'relayProtocol' | 'userToken' | 'machineInfo'>> &
   Pick<StartOutboundRelayClientOptions, 'userToken'>
-type RelayClient = Pick<OutboundRelayClient, 'start' | 'stop'> | PlainWebSocketRelayClient
+  & { machineInfo?: Record<string, unknown> }
+type RelayClient = Pick<OutboundRelayClient, 'start' | 'stop' | 'isConnected' | 'waitForConnected'> | McuSocketIoRelayClient
 
 interface LocalSocketBridge {
   id: string
@@ -181,11 +206,30 @@ interface McuVoiceMeta {
   profile: string
 }
 
-class PlainWebSocketRelayClient {
-  private socket: WebSocket | null = null
-  private reconnectTimer: NodeJS.Timeout | null = null
-  private reconnectDelayMs = 1000
+interface RelayMcuBackgroundListener {
+  socket: Socket
+  close: () => void
+}
+
+interface PendingRelayMcuBackgroundSpeech {
+  profile: string
+  delegationId?: string
+  text: string
+}
+
+interface EnqueuedMcuSpeechSegment {
+  playbackDone: Promise<void>
+}
+
+type McuSpeechSynthesisResult =
+  | { ok: true; audio: { url: string; mimeType: string } }
+  | { ok: false; err: unknown; aborted: boolean }
+
+class McuSocketIoRelayClient {
+  private socket: Socket | null = null
+  private localAgentSocket: Socket | null = null
   private stopped = false
+  private reconnectBlockedReason = ''
   private pendingVoice: McuVoiceMeta | null = null
   private pendingVoiceStream: (McuVoiceMeta & {
     sampleRate: number
@@ -193,99 +237,305 @@ class PlainWebSocketRelayClient {
     bitsPerSample: number
     chunks: Buffer[]
   }) | null = null
+  private localMcuForwardQueue = Promise.resolve()
   private readonly audioWaiters = new Map<string, { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>()
   private readonly activeRuns = new Map<string, { socket: Socket; sessionId: string }>()
   private readonly sessionRuns = new Map<string, { interactionId: string; socket: Socket }>()
+  private readonly backgroundListeners = new Map<string, RelayMcuBackgroundListener>()
+  private readonly pendingBackgroundSpeech = new Map<string, PendingRelayMcuBackgroundSpeech[]>()
+  private readonly backgroundSpeechRuns = new Set<string>()
   private readonly interruptedInteractions = new Set<string>()
   private readonly ttsAbortControllers = new Map<string, Set<AbortController>>()
   private readonly recentlyInterruptedSessions = new Map<string, number>()
   private readonly pendingInterrupts = new Map<string, { profile: string; interactionId: string; timer: NodeJS.Timeout }>()
+  private audioUploadToken = ''
+  private audioUploadPath = '/global-agent/audio'
+  private remoteMcuUserToken = ''
 
   constructor(private readonly options: OutboundRelayClientOptions) {}
 
   start(): void {
-    if (this.socket || this.reconnectTimer) return
+    if (this.socket) return
     this.stopped = false
+    this.reconnectBlockedReason = ''
     this.connect()
   }
 
   stop(): void {
     this.stopped = true
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
-    this.socket?.close()
+    for (const listener of [...this.backgroundListeners.values()]) listener.close()
+    this.backgroundListeners.clear()
+    this.pendingBackgroundSpeech.clear()
+    this.socket?.disconnect()
     this.socket = null
+    this.localAgentSocket?.disconnect()
+    this.localAgentSocket = null
     this.cancelPendingInterrupts()
-    this.rejectAudioWaiters(new Error('MCU websocket stopped'))
+    this.rejectAudioWaiters(new Error('MCU Socket.IO relay stopped'))
+  }
+
+  isConnected(): boolean {
+    return Boolean(this.socket?.connected)
+  }
+
+  waitForConnected(timeoutMs = 5000): Promise<boolean> {
+    const socket = this.socket
+    if (!socket) return Promise.resolve(false)
+    if (socket.connected) return Promise.resolve(true)
+    return new Promise(resolve => {
+      const cleanup = () => {
+        clearTimeout(timer)
+        socket.off('connect', onConnect)
+        socket.off('connect_error', onFailure)
+      }
+      const onConnect = () => {
+        cleanup()
+        resolve(true)
+      }
+      const onFailure = () => {
+        cleanup()
+        resolve(false)
+      }
+      const timer = setTimeout(() => {
+        cleanup()
+        resolve(false)
+      }, timeoutMs)
+      socket.once('connect', onConnect)
+      socket.once('connect_error', onFailure)
+    })
   }
 
   private connect(): void {
     if (this.stopped) return
-    const socket = new WebSocket(this.options.relayUrl)
+    const authPayload: Record<string, unknown> = {
+      token: this.options.relayToken || undefined,
+      instanceId: this.options.instanceId || undefined,
+      role: 'hermes-studio',
+      clientRole: 'web',
+      relayRole: 'web',
+      machine: this.options.machineInfo || undefined,
+    }
+    if (this.options.deviceCode) {
+      authPayload.deviceCode = this.options.deviceCode
+      authPayload.device_code = this.options.deviceCode
+    }
+    const relaySocketUrl = resolveGlobalAgentSocketIoUrl(this.options.relayUrl)
+    const socket: Socket = io(relaySocketUrl, {
+      auth: authPayload,
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 30_000,
+      timeout: 30_000,
+    })
     this.socket = socket
 
-    socket.on('open', () => {
-      this.reconnectDelayMs = 1000
-      logger.info({ relayUrl: this.redactedRelayUrl() }, '[outbound-relay:ws] connected')
-      this.sendJson({
-        type: 'mcu.auth',
-        token: this.options.relayToken || undefined,
-        instanceId: this.options.instanceId || undefined,
-        role: 'hermes-studio',
-      })
+    socket.on('connect', () => {
+      logger.info({ relayUrl: this.redactedRelayUrl() }, '[outbound-relay:mcu-sio] connected')
+      this.connectLocalAgentSocket()
+      for (const sessionId of this.pendingBackgroundSpeech.keys()) void this.flushBackgroundSpeech(sessionId)
     })
 
-    socket.on('message', (data, isBinary) => {
-      if (isBinary) {
-        const audio = this.binaryBuffer(data)
-        if (this.pendingVoiceStream) {
-          this.pendingVoiceStream.chunks.push(audio)
-          this.pendingVoiceStream.bytes += audio.length
-          return
-        }
-        logger.info({
-          relayUrl: this.redactedRelayUrl(),
-          bytes: audio.length,
-          interactionId: this.pendingVoice?.interactionId,
-        }, '[outbound-relay:ws] binary received')
-        void this.handleVoiceAudio(audio)
-        return
+    socket.on('connect_error', (err: Error) => {
+      logger.warn({ err, relayUrl: this.redactedRelayUrl() }, '[outbound-relay:mcu-sio] connection error')
+      if (err.message === 'device_code_not_allowed' || err.message.includes('非官方设备码')) {
+        this.stopped = true
+        this.reconnectBlockedReason = err.message
+        socket.io.opts.reconnection = false
       }
-      const text = Buffer.isBuffer(data) ? data.toString('utf-8') : String(data)
-      this.handleText(text)
     })
 
-    socket.on('error', (err) => {
-      logger.warn({ err, relayUrl: this.redactedRelayUrl() }, '[outbound-relay:ws] connection error')
-    })
-
-    socket.on('close', (code, reason) => {
-      if (this.socket === socket) this.socket = null
-      this.rejectAudioWaiters(new Error('MCU websocket disconnected'))
+    socket.on('disconnect', (reason: string) => {
+      this.localAgentSocket?.disconnect()
+      this.localAgentSocket = null
+      this.rejectAudioWaiters(new Error('MCU Socket.IO relay disconnected'))
       logger.info({
-        code,
-        reason: reason.toString(),
+        reason,
+        reconnectBlockedReason: this.reconnectBlockedReason || undefined,
         relayUrl: this.redactedRelayUrl(),
-      }, '[outbound-relay:ws] disconnected')
-      this.scheduleReconnect()
+      }, '[outbound-relay:mcu-sio] disconnected')
+    })
+
+    socket.on('http.request', (request: RelayHttpRequest, ack?: (response: RelayHttpResponse) => void) => {
+      void this.handleHttpRequest(request)
+        .then((response) => this.respond(response, ack))
+        .catch((err) => this.respond(relayError(request?.id, 'relay_internal_error', err instanceof Error ? err.message : String(err), 500), ack))
+    })
+
+    socket.onAny((eventName: string, payload: unknown) => {
+      if (SOCKET_IO_RESERVED_EVENTS.has(eventName)) return
+      if (eventName === 'http.request') return
+      this.handleRemoteEvent(eventName, payload)
     })
   }
 
-  private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer) return
-    const delay = this.reconnectDelayMs
-    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000)
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      this.connect()
-    }, delay)
+  private async handleHttpRequest(request: RelayHttpRequest): Promise<RelayHttpResponse> {
+    const method = normalizeMethod(request.method)
+    if (!method) {
+      return relayError(request.id, 'method_not_allowed', 'Relay request method is not allowed', 405)
+    }
+
+    const path = normalizeRelayPath(request.path)
+    if (!path) {
+      return relayError(request.id, 'path_not_allowed', 'Relay request path is not allowed', 403)
+    }
+    if (path !== '/api/auth/mcu-login') {
+      return relayError(request.id, 'path_not_allowed', 'MCU relay only allows the MCU login endpoint', 403)
+    }
+
+    const headers = normalizeHeaders(request.headers)
+    const normalizedBody = normalizeRequestBody(request, method, headers)
+    if (isRelayHttpResponse(normalizedBody)) return normalizedBody
+    if (normalizedBody.contentType) headers.set('content-type', normalizedBody.contentType)
+    if (path === '/api/auth/mcu-login') {
+      headers.set('x-hermes-relay-forwarded', 'mcu-socket.io')
+    }
+
+    const timeoutMs = normalizeTimeout(request.timeoutMs)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+      const response = await this.options.fetchImpl(`${this.options.localBaseUrl.replace(/\/$/, '')}${path}`, {
+        method,
+        headers,
+        body: normalizedBody.body,
+        signal: controller.signal,
+      })
+      const body = await readResponseBody(response)
+      if (path === '/api/auth/mcu-login' && response.ok && typeof body.body === 'string') {
+        this.rememberRemoteMcuLoginToken(body.body)
+      }
+      return {
+        id: request.id,
+        status: response.status,
+        headers: responseHeaders(response),
+        ...body,
+      }
+    } catch (err) {
+      const aborted = controller.signal.aborted
+      return relayError(
+        request.id,
+        aborted ? 'request_timeout' : 'local_request_failed',
+        aborted ? `Local relay request timed out after ${timeoutMs}ms` : err instanceof Error ? err.message : String(err),
+        aborted ? 504 : 502,
+      )
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  private respond(response: RelayHttpResponse, ack?: (response: RelayHttpResponse) => void): void {
+    if (ack) {
+      ack(response)
+      return
+    }
+    this.socket?.emit('http.response', response)
+  }
+
+  private connectLocalAgentSocket(): void {
+    const userToken = this.options.userToken || ''
+    if (this.localAgentSocket || !userToken) return
+    const localBaseUrl = this.options.localBaseUrl.replace(/\/$/, '')
+    const socket: Socket = io(`${localBaseUrl}/global-agent`, {
+      auth: {
+        token: userToken,
+        role: 'hermes-studio',
+        instanceId: this.options.instanceId || this.options.deviceCode || undefined,
+      },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 30_000,
+      timeout: 30_000,
+    })
+    this.localAgentSocket = socket
+    socket.on('connect', () => {
+      logger.info({
+        relayUrl: this.redactedRelayUrl(),
+        localBaseUrl,
+        instanceId: this.options.instanceId || this.options.deviceCode || undefined,
+      }, '[outbound-relay:mcu-sio] local global-agent bridge connected')
+    })
+    socket.on('connect_error', (err: Error) => {
+      logger.warn({ err, localBaseUrl }, '[outbound-relay:mcu-sio] local global-agent bridge connection failed')
+    })
+    socket.on('disconnect', (reason: string) => {
+      logger.info({ reason, localBaseUrl }, '[outbound-relay:mcu-sio] local global-agent bridge disconnected')
+      if (this.localAgentSocket === socket) this.localAgentSocket = null
+    })
+    socket.onAny((eventName: string, payload: unknown) => {
+      if (SOCKET_IO_RESERVED_EVENTS.has(eventName)) return
+      this.localMcuForwardQueue = this.localMcuForwardQueue
+        .then(() => this.forwardLocalMcuEventToRelay(eventName, payload))
+        .catch((err) => {
+          logger.warn({
+            err,
+            relayUrl: this.redactedRelayUrl(),
+            eventName,
+          }, '[outbound-relay:mcu-sio] failed to forward local MCU event to relay')
+        })
+    })
+  }
+
+  private emitLocalMcuEvent(eventName: string, payload: Record<string, unknown>): void {
+    this.connectLocalAgentSocket()
+    this.localAgentSocket?.emit(eventName, this.payloadForLocalMcuSocket(payload))
+  }
+
+  private payloadForLocalMcuSocket(payload: Record<string, unknown>): Record<string, unknown> {
+    const userToken = this.options.userToken || ''
+    if (!this.remoteMcuUserToken || !userToken) return payload
+    const next: Record<string, unknown> = { ...payload, apiToken: userToken }
+    delete next.api_token
+    delete next.authorization
+    return next
+  }
+
+  private rememberRemoteMcuLoginToken(body: string): void {
+    let token = ''
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>
+      token = typeof parsed.token === 'string' ? parsed.token.trim() : ''
+    } catch {
+      return
+    }
+    if (!token || token === this.remoteMcuUserToken) return
+    this.remoteMcuUserToken = token
+  }
+
+  private async forwardLocalMcuEventToRelay(eventName: string, payload: unknown): Promise<void> {
+    if (this.stopped) return
+    const body = isRecord(payload)
+      ? { ...payload, type: typeof payload.type === 'string' && payload.type ? payload.type : eventName }
+      : { type: eventName, payload }
+    const out = await this.prepareMcuRelayPayload(body)
+    this.sendJson(out)
+  }
+
+  private async prepareMcuRelayPayload(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (payload.type !== 'audio.enqueue') return payload
+    const url = typeof payload.url === 'string' ? payload.url.trim() : ''
+    if (!url) return payload
+    const remoteUrl = await this.uploadMcuAudioUrlToRelay(url).catch((err) => {
+      logger.warn({
+        err,
+        relayUrl: this.redactedRelayUrl(),
+        url,
+        interactionId: typeof payload.interactionId === 'string' ? payload.interactionId : undefined,
+        segmentId: typeof payload.segmentId === 'string' ? payload.segmentId : undefined,
+      }, '[outbound-relay:mcu-sio] failed to upload local MCU audio URL to relay')
+      return ''
+    })
+    return remoteUrl ? { ...payload, url: remoteUrl } : payload
   }
 
   private sendJson(payload: Record<string, unknown>): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) return
-    this.socket.send(JSON.stringify(payload))
+    if (!this.socket?.connected || this.stopped) return
+    const type = typeof payload.type === 'string' && payload.type.trim() ? payload.type.trim() : 'mcu.event'
+    this.socket.emit(type, payload)
   }
 
   private rejectAudioWaiters(error: Error): void {
@@ -296,21 +546,90 @@ class PlainWebSocketRelayClient {
     }
   }
 
-  private handleText(text: string): void {
-    let event: Record<string, unknown>
-    try {
-      event = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      logger.warn({ relayUrl: this.redactedRelayUrl(), text: text.slice(0, 300) }, '[outbound-relay:ws] invalid json')
-      return
+  private remoteMcuApiToken(event: Record<string, unknown>): string {
+    const raw = typeof event.apiToken === 'string'
+      ? event.apiToken
+      : typeof event.api_token === 'string'
+        ? event.api_token
+        : typeof event.authorization === 'string'
+          ? event.authorization
+          : ''
+    const trimmed = raw.trim()
+    return trimmed.toLowerCase().startsWith('bearer ') ? trimmed.slice(7).trim() : trimmed
+  }
+
+  private authorizeRemoteMcuEvent(event: Record<string, unknown>): boolean {
+    const expectedToken = this.remoteMcuUserToken || this.options.userToken || ''
+    const providedToken = this.remoteMcuApiToken(event)
+    if (!expectedToken || !providedToken || providedToken !== expectedToken) {
+      logger.warn({
+        relayUrl: this.redactedRelayUrl(),
+        type: typeof event.type === 'string' ? event.type : undefined,
+        interactionId: typeof event.interactionId === 'string' ? event.interactionId : undefined,
+      }, '[outbound-relay:mcu-sio] rejected remote MCU event with invalid API token')
+      void this.sendTokenInvalidPrompt(event)
+      return false
     }
+    return true
+  }
+
+  private async sendTokenInvalidPrompt(event: Record<string, unknown>): Promise<void> {
+    let url = mcuPromptUrl('token-invalid')
+    try {
+      const relayUrl = await this.uploadMcuAudioUrlToRelay(url)
+      if (relayUrl) url = relayUrl
+    } catch (err) {
+      logger.warn({ err, relayUrl: this.redactedRelayUrl() }, '[outbound-relay:mcu-sio] failed to upload token invalid prompt')
+    }
+    this.sendJson({
+      type: 'auth.invalid',
+      event: typeof event.type === 'string' ? event.type : undefined,
+      interactionId: typeof event.interactionId === 'string' ? event.interactionId : undefined,
+      text: mcuPromptText('token-invalid'),
+      url,
+      mimeType: 'audio/x-pcm',
+      channels: 1,
+      sampleRate: MCU_TTS_SAMPLE_RATE,
+    })
+  }
+
+  private handleRemoteEvent(eventName: string, payload: unknown): void {
+    const event: Record<string, unknown> = isRecord(payload)
+      ? { ...payload, type: typeof payload.type === 'string' && payload.type ? payload.type : eventName }
+      : { type: eventName, payload }
     logger.info({
       relayUrl: this.redactedRelayUrl(),
       type: typeof event.type === 'string' ? event.type : undefined,
       status: typeof event.status === 'string' ? event.status : undefined,
       text: typeof event.text === 'string' ? event.text.slice(0, 300) : undefined,
       interactionId: typeof event.interactionId === 'string' ? event.interactionId : undefined,
-    }, '[outbound-relay:ws] event')
+    }, '[outbound-relay:mcu-sio] event')
+    if (event.type === 'mcu.auth.ok') {
+      const audioUpload = isRecord(event.audioUpload) ? event.audioUpload : null
+      const token = typeof audioUpload?.token === 'string' ? audioUpload.token.trim() : ''
+      if (token) {
+        this.audioUploadToken = token
+        this.audioUploadPath = typeof audioUpload?.url === 'string' && audioUpload.url.trim()
+          ? audioUpload.url.trim()
+          : '/global-agent/audio'
+      }
+      return
+    }
+    if (event.type === 'relay.replaced') {
+      this.reconnectBlockedReason = 'replaced'
+      this.stopped = true
+      logger.warn({
+        relayUrl: this.redactedRelayUrl(),
+        deviceCode: typeof event.deviceCode === 'string' ? event.deviceCode : undefined,
+        role: typeof event.role === 'string' ? event.role : undefined,
+      }, '[outbound-relay:mcu-sio] remote relay connection replaced; relay left connected but inactive')
+      this.localAgentSocket?.disconnect()
+      this.localAgentSocket = null
+      this.cancelPendingInterrupts()
+      this.rejectAudioWaiters(new Error('remote relay connection replaced'))
+      return
+    }
+    if (!this.authorizeRemoteMcuEvent(event)) return
     if (event.type === 'voice.recorded') {
       this.pendingVoice = {
         interactionId: typeof event.interactionId === 'string' && event.interactionId.trim() ? event.interactionId.trim() : `mcu-voice-${Date.now()}`,
@@ -324,7 +643,7 @@ class PlainWebSocketRelayClient {
       this.pendingVoice = null
       this.pendingVoiceStream = {
         interactionId: typeof event.interactionId === 'string' && event.interactionId.trim() ? event.interactionId.trim() : `mcu-voice-${Date.now()}`,
-        mimeType: 'audio/wav',
+        mimeType: typeof event.mimeType === 'string' && event.mimeType.trim() ? event.mimeType.trim() : 'audio/pcm',
         bytes: 0,
         profile: typeof event.profile === 'string' && event.profile.trim() ? event.profile.trim() : 'default',
         sampleRate: Number.isFinite(Number(event.sampleRate)) ? Number(event.sampleRate) : MCU_TTS_SAMPLE_RATE,
@@ -332,31 +651,90 @@ class PlainWebSocketRelayClient {
         bitsPerSample: Number(event.bitsPerSample) === 16 ? 16 : 16,
         chunks: [],
       }
+      this.emitLocalMcuEvent('voice.stream.start', event)
+      return
+    }
+    if (event.type === 'voice.stream.chunk') {
+      const data = event.data
+      let audio: Buffer
+      if (typeof data === 'string') {
+        audio = Buffer.from(data, 'base64')
+      } else if (Buffer.isBuffer(data)) {
+        audio = Buffer.from(data)
+      } else if (data instanceof Uint8Array) {
+        audio = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+      } else if (data instanceof ArrayBuffer) {
+        audio = Buffer.from(data)
+      } else {
+        return
+      }
+      if (!audio.length) return
+      if (this.pendingVoiceStream) {
+        const chunkInteractionId = typeof event.interactionId === 'string' ? event.interactionId.trim() : ''
+        if (chunkInteractionId && chunkInteractionId !== this.pendingVoiceStream.interactionId) {
+          logger.warn({
+            relayUrl: this.redactedRelayUrl(),
+            streamInteractionId: this.pendingVoiceStream.interactionId,
+            chunkInteractionId,
+          }, '[outbound-relay:mcu-sio] ignoring stale voice stream chunk')
+          return
+        }
+        const eventOffset = Number(event.offset)
+        const offset = Number.isFinite(eventOffset) && eventOffset >= 0
+          ? Math.floor(eventOffset)
+          : this.pendingVoiceStream.bytes
+        this.pendingVoiceStream.chunks.push(audio)
+        this.pendingVoiceStream.bytes += audio.length
+        this.emitLocalMcuEvent('voice.stream.chunk', {
+          ...event,
+          interactionId: this.pendingVoiceStream.interactionId,
+          offset,
+          bytes: audio.length,
+          seq: Number.isFinite(Number(event.seq)) ? Math.floor(Number(event.seq)) : undefined,
+          crc32: Number.isFinite(Number(event.crc32)) ? Math.floor(Number(event.crc32)) >>> 0 : undefined,
+          data: audio,
+        })
+        return
+      }
+      logger.info({
+        relayUrl: this.redactedRelayUrl(),
+        bytes: audio.length,
+        interactionId: this.pendingVoice?.interactionId,
+      }, '[outbound-relay:mcu-sio] voice chunk received without stream metadata')
+      void this.handleVoiceAudio(audio)
       return
     }
     if (event.type === 'voice.stream.end') {
       const stream = this.pendingVoiceStream
-      this.pendingVoiceStream = null
       if (!stream) {
         this.sendJson({ type: 'interaction.status', status: 'failed', text: 'missing voice stream metadata' })
         return
       }
-      const pcm = Buffer.concat(stream.chunks, stream.bytes)
+      const endInteractionId = typeof event.interactionId === 'string' ? event.interactionId.trim() : ''
+      if (endInteractionId && endInteractionId !== stream.interactionId) {
+        logger.warn({
+          relayUrl: this.redactedRelayUrl(),
+          streamInteractionId: stream.interactionId,
+          endInteractionId,
+        }, '[outbound-relay:mcu-sio] ignoring stale voice stream end')
+        return
+      }
+      this.pendingVoiceStream = null
       logger.info({
         relayUrl: this.redactedRelayUrl(),
-        bytes: pcm.length,
+        bytes: stream.bytes,
         interactionId: stream.interactionId,
-      }, '[outbound-relay:ws] voice stream completed')
-      const wav = this.wrapPcmAsWav(pcm, stream.sampleRate, stream.channels, stream.bitsPerSample)
-      void this.handleVoiceAudio(wav, {
-        interactionId: stream.interactionId,
-        mimeType: 'audio/wav',
-        bytes: wav.length,
-        profile: stream.profile,
-      })
+      }, '[outbound-relay:mcu-sio] voice stream completed')
+      this.emitLocalMcuEvent('voice.stream.end', event)
+      return
+    }
+    if (event.type === 'voice.stream.abort') {
+      this.pendingVoiceStream = null
+      this.emitLocalMcuEvent('voice.stream.abort', event)
       return
     }
     if (event.type === 'audio.done' || event.type === 'audio.interrupted' || event.type === 'audio.dropped') {
+      this.emitLocalMcuEvent(event.type, event)
       if (event.type === 'audio.interrupted' && typeof event.interactionId === 'string') {
         this.abortActiveRun(event.interactionId)
       }
@@ -374,23 +752,16 @@ class PlainWebSocketRelayClient {
       return
     }
     if (event.type === 'mcu.interrupt') {
-      const interactionId = typeof event.interactionId === 'string' ? event.interactionId.trim() : ''
-      const profile = typeof event.profile === 'string' && event.profile.trim() ? event.profile.trim() : 'default'
-      this.scheduleMcuInterrupt(profile, interactionId)
-      this.sendJson({ type: 'mcu.interrupt.ack', interactionId, profile })
+      this.emitLocalMcuEvent('mcu.interrupt', event)
       return
     }
     if (event.type === 'mcu.session.clear') {
-      const profile = typeof event.profile === 'string' && event.profile.trim() ? event.profile.trim() : 'default'
-      const interactionId = typeof event.interactionId === 'string' ? event.interactionId.trim() : ''
-      this.clearMcuSession(profile, interactionId)
+      this.emitLocalMcuEvent('mcu.session.clear', event)
+      return
     }
-  }
-
-  private binaryBuffer(data: WebSocket.RawData): Buffer {
-    if (Buffer.isBuffer(data)) return data
-    if (Array.isArray(data)) return Buffer.concat(data)
-    return Buffer.from(data)
+    if (typeof event.type === 'string' && event.type.trim()) {
+      this.emitLocalMcuEvent(event.type.trim(), event)
+    }
   }
 
   private wrapPcmAsWav(pcm: Buffer, sampleRate: number, channels: number, bitsPerSample: number): Buffer {
@@ -461,6 +832,7 @@ class PlainWebSocketRelayClient {
         })
         return
       }
+      if (payload.accepted === true) return
       const transcript = typeof payload.transcript === 'string' ? payload.transcript : ''
       if (!transcript.trim()) {
         this.sendJson({
@@ -489,6 +861,7 @@ class PlainWebSocketRelayClient {
   ): Promise<void> {
     await new Promise<void>((resolve) => {
       const sessionId = this.mcuSessionId(voice.profile)
+      const primaryQueueId = `mcu_${randomUUID()}`
       this.interruptedInteractions.delete(voice.interactionId)
       const socket: Socket = io(`${this.options.localBaseUrl.replace(/\/$/, '')}/chat-run`, {
         auth: this.options.userToken ? { token: this.options.userToken } : {},
@@ -500,14 +873,45 @@ class PlainWebSocketRelayClient {
       let output = ''
       let segmentIndex = 0
       let ttsQueue = Promise.resolve()
+      const playbackQueue: Promise<void>[] = []
+      let previousPlaybackDone = Promise.resolve()
       let settled = false
+      let primaryFinished = false
+      let primaryResolved = false
+      let primaryTerminalReceived = false
+      let currentRunPrimary = false
+      let currentRunAutonomous = false
+      let currentDelegationId: string | undefined
+      let backgroundOutput = ''
+      let backgroundPending = 0
       const speechSegmenter = createMcuSpeechSegmenter()
+      const ownsBackgroundEvents = () => {
+        const listener = this.backgroundListeners.get(sessionId)
+        return primaryTerminalReceived || listener?.socket === socket
+      }
       const enqueueSpeech = (text: string) => {
         if (this.interruptedInteractions.has(voice.interactionId)) return
         const segmentText = normalizeMcuSpeechText(text)
         if (!segmentText) return
         const segmentId = `${voice.interactionId}-tts-${++segmentIndex}`
-        ttsQueue = ttsQueue.then(() => this.enqueueMcuSpeechSegment(voice.profile, voice.interactionId, segmentId, segmentText))
+        this.sendJson({ type: 'interaction.status', interactionId: voice.interactionId, status: 'speaking' })
+        const controller = this.registerTtsAbortController(voice.interactionId)
+        const audioResult: Promise<McuSpeechSynthesisResult> = this.synthesizeMcuSpeech(
+          segmentText,
+          voice.profile,
+          controller.signal,
+        )
+          .then(audio => ({ ok: true as const, audio }))
+          .catch(err => ({ ok: false as const, err, aborted: controller.signal.aborted }))
+          .finally(() => {
+            this.releaseTtsAbortController(voice.interactionId, controller)
+          })
+        ttsQueue = ttsQueue.then(async () => {
+          await previousPlaybackDone
+          const audio = await this.enqueueMcuSpeechSegment(voice.interactionId, segmentId, segmentText, audioResult)
+          previousPlaybackDone = audio.playbackDone
+          playbackQueue.push(audio.playbackDone)
+        })
           .catch((err) => {
             if (err instanceof Error && err.message === 'audio.interrupted') {
               this.interruptedInteractions.add(voice.interactionId)
@@ -545,16 +949,46 @@ class PlainWebSocketRelayClient {
         const text = speechSegmenter.flush()
         if (text) enqueueSpeech(text)
       }
+      const resolvePrimary = () => {
+        if (primaryResolved) return
+        primaryResolved = true
+        resolve()
+      }
+      const releasePrimaryRun = () => {
+        if (primaryFinished) return
+        primaryFinished = true
+        this.activeRuns.delete(voice.interactionId)
+        const sessionRun = this.sessionRuns.get(sessionId)
+        if (sessionRun?.socket === socket) this.sessionRuns.delete(sessionId)
+        this.interruptedInteractions.delete(voice.interactionId)
+        clearTimeout(timer)
+        resolvePrimary()
+        void this.flushBackgroundSpeech(sessionId)
+      }
       const finish = () => {
         if (settled) return
         settled = true
-        this.activeRuns.delete(voice.interactionId)
-        this.sessionRuns.delete(sessionId)
-        this.interruptedInteractions.delete(voice.interactionId)
-        clearTimeout(timer)
+        releasePrimaryRun()
+        const listener = this.backgroundListeners.get(sessionId)
+        if (listener?.socket === socket) this.backgroundListeners.delete(sessionId)
         socket.removeAllListeners()
         socket.disconnect()
-        resolve()
+      }
+      const keepBackgroundListener = () => {
+        if (settled) return
+        releasePrimaryRun()
+        const existing = this.backgroundListeners.get(sessionId)
+        if (existing && existing.socket !== socket) existing.close()
+        this.backgroundListeners.set(sessionId, { socket, close: finish })
+        logger.info({
+          interactionId: voice.interactionId,
+          sessionId,
+          backgroundPending,
+        }, '[outbound-relay:ws] keeping MCU session listener for background delivery')
+      }
+      const finishPrimaryRun = () => {
+        if (backgroundPending > 0) keepBackgroundListener()
+        else finish()
       }
       const fail = (message: string) => {
         this.sendJson({
@@ -572,6 +1006,15 @@ class PlainWebSocketRelayClient {
       socket.on('connect_error', (err: Error) => {
         fail(err.message || 'chat-run connection failed')
       })
+      socket.on('disconnect', (reason: string) => {
+        if (settled) return
+        if (primaryFinished) {
+          logger.warn({ sessionId, reason }, '[outbound-relay:ws] MCU background session listener disconnected')
+          finish()
+          return
+        }
+        fail(`chat-run disconnected: ${reason}`)
+      })
       socket.on('connect', () => {
         logger.info({
           interactionId: voice.interactionId,
@@ -584,6 +1027,7 @@ class PlainWebSocketRelayClient {
         const runPayload = {
           input: transcript,
           session_id: sessionId,
+          queue_id: primaryQueueId,
           profile: voice.profile,
           source: 'global_agent',
           session_source: 'global_agent',
@@ -597,19 +1041,36 @@ class PlainWebSocketRelayClient {
         }
         socket.emit('run', runPayload)
       })
-      socket.on('run.started', () => {
+      socket.on('run.started', (event: Record<string, unknown> = {}) => {
+        const queueId = typeof event.queue_id === 'string' ? event.queue_id : undefined
+        const autonomous = event.autonomous === true
+        currentRunPrimary = !autonomous && queueId === primaryQueueId
+        currentRunAutonomous = autonomous && ownsBackgroundEvents()
+        currentDelegationId = currentRunAutonomous && typeof event.delegation_id === 'string' && event.delegation_id.trim()
+          ? event.delegation_id.trim()
+          : undefined
+        backgroundOutput = ''
+        if (!currentRunPrimary) return
         this.sendJson({ type: 'interaction.status', interactionId: voice.interactionId, status: 'thinking' })
       })
-      socket.on('run.queued', () => {
+      socket.on('run.queued', (event: Record<string, unknown> = {}) => {
+        const queuedMessages = Array.isArray(event.queued_messages) ? event.queued_messages : []
+        const ownsQueueEvent = event.dequeued_queue_id === primaryQueueId || queuedMessages.some((message) => (
+          typeof message === 'object' && message !== null && (message as Record<string, unknown>).id === primaryQueueId
+        ))
+        if (!ownsQueueEvent) return
+        currentRunPrimary = false
         this.sendJson({ type: 'interaction.status', interactionId: voice.interactionId, status: 'thinking' })
       })
       socket.on('tool.started', (event: Record<string, unknown> = {}) => {
+        if (!currentRunPrimary) return
         flushCompletedAssistantMessage()
         const tool = typeof event.tool === 'string' ? event.tool : typeof event.name === 'string' ? event.name : 'tool'
         const preview = typeof event.preview === 'string' ? event.preview : undefined
         this.sendJson({ type: 'tool.started', interactionId: voice.interactionId, tool, preview })
       })
       const handleToolFinished = (event: Record<string, unknown> = {}, failed = false) => {
+        if (!currentRunPrimary) return
         const tool = typeof event.tool === 'string' ? event.tool : typeof event.name === 'string' ? event.name : 'tool'
         const preview = typeof event.preview === 'string' ? event.preview : undefined
         const error = typeof event.error === 'string'
@@ -623,6 +1084,11 @@ class PlainWebSocketRelayClient {
       socket.on('tool.failed', (event: Record<string, unknown> = {}) => handleToolFinished(event, true))
       socket.on('message.delta', (event: Record<string, unknown> = {}) => {
         if (typeof event.delta === 'string') {
+          if (currentRunAutonomous) {
+            backgroundOutput += event.delta
+            return
+          }
+          if (!currentRunPrimary) return
           output += event.delta
           for (const segment of speechSegmenter.pushDelta(event.delta)) {
             enqueueSpeech(segment)
@@ -630,6 +1096,36 @@ class PlainWebSocketRelayClient {
         }
       })
       socket.on('run.completed', (event: Record<string, unknown> = {}) => {
+        backgroundPending = Math.max(0, Number(event.background_pending) || 0)
+        const autonomous = event.autonomous === true || currentRunAutonomous
+        if (autonomous) {
+          const text = typeof event.output === 'string' && event.output.trim()
+            ? event.output
+            : backgroundOutput
+          if (ownsBackgroundEvents() && text.trim()) {
+            this.queueBackgroundSpeech(sessionId, {
+              profile: voice.profile,
+              delegationId: typeof event.delegation_id === 'string' && event.delegation_id.trim()
+                ? event.delegation_id.trim()
+                : currentDelegationId,
+              text,
+            })
+          }
+          currentRunAutonomous = false
+          currentRunPrimary = false
+          currentDelegationId = undefined
+          backgroundOutput = ''
+          if (primaryFinished && backgroundPending === 0) finish()
+          return
+        }
+        const queueId = typeof event.queue_id === 'string' ? event.queue_id : undefined
+        const isPrimary = currentRunPrimary || queueId === primaryQueueId
+        if (!isPrimary || primaryTerminalReceived) {
+          if (primaryFinished && backgroundPending === 0) finish()
+          return
+        }
+        primaryTerminalReceived = true
+        currentRunPrimary = false
         if (typeof event.output === 'string' && event.output.trim()) {
           if (!output) {
             output = event.output
@@ -645,23 +1141,57 @@ class PlainWebSocketRelayClient {
           }
         }
         flushCompletedAssistantMessage()
-        ttsQueue.finally(() => {
-          if (this.interruptedInteractions.has(voice.interactionId)) {
-            finish()
-            return
-          }
-          this.sendJson({
-            type: 'interaction.status',
-            interactionId: voice.interactionId,
-            status: 'completed',
+        ttsQueue
+          .then(async () => {
+            await Promise.all(playbackQueue)
+            if (this.interruptedInteractions.has(voice.interactionId)) {
+              finish()
+              return
+            }
+            this.sendJson({
+              type: 'interaction.status',
+              interactionId: voice.interactionId,
+              status: 'completed',
+            })
+            finishPrimaryRun()
           })
-          finish()
-        })
+          .catch((err) => {
+            if (this.interruptedInteractions.has(voice.interactionId) || (err instanceof Error && err.message === 'audio.interrupted')) {
+              finish()
+              return
+            }
+            fail(err instanceof Error ? err.message : String(err))
+          })
       })
       socket.on('run.failed', (event: Record<string, unknown> = {}) => {
-        fail(typeof event.error === 'string' ? event.error : 'chat-run failed')
+        backgroundPending = Math.max(0, Number(event.background_pending) || 0)
+        const autonomous = event.autonomous === true || currentRunAutonomous
+        const queueId = typeof event.queue_id === 'string' ? event.queue_id : undefined
+        const isPrimary = currentRunPrimary || queueId === primaryQueueId
+        currentRunAutonomous = false
+        currentRunPrimary = false
+        currentDelegationId = undefined
+        backgroundOutput = ''
+        if (autonomous || !isPrimary || primaryTerminalReceived) {
+          if (primaryFinished && backgroundPending === 0) finish()
+          return
+        }
+        primaryTerminalReceived = true
+        this.sendJson({
+          type: 'interaction.status',
+          interactionId: voice.interactionId,
+          status: 'failed',
+          text: typeof event.error === 'string' ? event.error : 'chat-run failed',
+        })
+        finishPrimaryRun()
+      })
+      socket.on('delegation.updated', (event: Record<string, unknown> = {}) => {
+        if (event.background_pending == null) return
+        backgroundPending = Math.max(0, Number(event.background_pending) || 0)
+        if (primaryFinished && backgroundPending === 0) finish()
       })
       socket.on('approval.requested', (event: Record<string, unknown> = {}) => {
+        if (!currentRunPrimary && !currentRunAutonomous) return
         const approvalId = typeof event.approval_id === 'string' ? event.approval_id : ''
         const choice = chooseMcuApprovalChoice(event)
         if (!approvalId || !choice) {
@@ -674,12 +1204,14 @@ class PlainWebSocketRelayClient {
           approvalId,
           choice,
         }, '[outbound-relay:ws] auto-approving MCU chat-run approval')
-        this.sendJson({
-          type: 'tool.started',
-          interactionId: voice.interactionId,
-          tool: 'approval',
-          preview: choice,
-        })
+        if (!currentRunAutonomous) {
+          this.sendJson({
+            type: 'tool.started',
+            interactionId: voice.interactionId,
+            tool: 'approval',
+            preview: choice,
+          })
+        }
         socket.emit('approval.respond', {
           session_id: sessionId,
           approval_id: approvalId,
@@ -687,6 +1219,7 @@ class PlainWebSocketRelayClient {
         })
       })
       socket.on('approval.resolved', (event: Record<string, unknown> = {}) => {
+        if (!currentRunPrimary) return
         const resolved = event.resolved !== false
         this.sendJson({
           type: 'tool.completed',
@@ -696,9 +1229,87 @@ class PlainWebSocketRelayClient {
         })
       })
       socket.on('clarify.requested', () => {
+        if (!currentRunPrimary) return
         fail('clarification required')
       })
     })
+  }
+
+  private queueBackgroundSpeech(sessionId: string, item: PendingRelayMcuBackgroundSpeech): void {
+    const text = item.text.trim()
+    if (!text) return
+    const queue = this.pendingBackgroundSpeech.get(sessionId) || []
+    if (item.delegationId && queue.some(queued => queued.delegationId === item.delegationId)) return
+    queue.push({ ...item, text })
+    this.pendingBackgroundSpeech.set(sessionId, queue)
+    void this.flushBackgroundSpeech(sessionId)
+  }
+
+  private async flushBackgroundSpeech(sessionId: string): Promise<void> {
+    if (
+      this.stopped
+      || !this.socket?.connected
+      || this.backgroundSpeechRuns.has(sessionId)
+      || this.sessionRuns.has(sessionId)
+    ) return
+    const queue = this.pendingBackgroundSpeech.get(sessionId)
+    if (!queue?.length) return
+
+    this.backgroundSpeechRuns.add(sessionId)
+    try {
+      while (queue.length > 0 && !this.sessionRuns.has(sessionId) && this.socket?.connected) {
+        const item = queue.shift()
+        if (!item) break
+        await this.playBackgroundSpeech(item)
+      }
+    } catch (err) {
+      if (!(err instanceof Error && err.message === 'audio.interrupted')) {
+        logger.warn({ err, sessionId }, '[outbound-relay:ws] failed to deliver MCU background speech')
+      }
+    } finally {
+      this.backgroundSpeechRuns.delete(sessionId)
+      if (queue.length === 0) this.pendingBackgroundSpeech.delete(sessionId)
+    }
+  }
+
+  private async playBackgroundSpeech(item: PendingRelayMcuBackgroundSpeech): Promise<void> {
+    const suffix = (item.delegationId || randomUUID())
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 96) || randomUUID()
+    const interactionId = `mcu-background-${suffix}`
+    const segmenter = createMcuSpeechSegmenter()
+    const segments = segmenter.pushDelta(item.text)
+    const tail = segmenter.flush()
+    if (tail) segments.push(tail)
+
+    let segmentIndex = 0
+    try {
+      for (const rawText of segments) {
+        const text = normalizeMcuSpeechText(rawText)
+        if (!text) continue
+        const segmentId = `${interactionId}-tts-${++segmentIndex}`
+        const controller = this.registerTtsAbortController(interactionId)
+        const audioResult: Promise<McuSpeechSynthesisResult> = this.synthesizeMcuSpeech(
+          text,
+          item.profile,
+          controller.signal,
+        )
+          .then(audio => ({ ok: true as const, audio }))
+          .catch(err => ({ ok: false as const, err, aborted: controller.signal.aborted }))
+          .finally(() => this.releaseTtsAbortController(interactionId, controller))
+        const audio = await this.enqueueMcuSpeechSegment(interactionId, segmentId, text, audioResult)
+        await audio.playbackDone
+        if (this.interruptedInteractions.has(interactionId)) throw new Error('audio.interrupted')
+      }
+
+      if (segmentIndex > 0) {
+        this.sendJson({ type: 'interaction.status', interactionId, status: 'completed' })
+      }
+    } finally {
+      this.interruptedInteractions.delete(interactionId)
+    }
   }
 
   private async enqueuePromptAudioFromVoiceTurn(interactionId: string, payload: Record<string, unknown>): Promise<boolean> {
@@ -778,6 +1389,8 @@ class PlainWebSocketRelayClient {
   }
 
   private forgetMcuSessionRun(sessionId: string, interactionId?: string): void {
+    this.pendingBackgroundSpeech.delete(sessionId)
+    this.backgroundListeners.get(sessionId)?.close()
     const sessionRun = this.sessionRuns.get(sessionId)
     if (sessionRun) {
       this.interruptedInteractions.add(sessionRun.interactionId)
@@ -798,13 +1411,15 @@ class PlainWebSocketRelayClient {
 
   private interruptMcuSession(profile: string, interactionId?: string): void {
     const sessionId = this.mcuSessionId(profile)
-    this.recentlyInterruptedSessions.set(sessionId, Date.now())
-    if (interactionId) {
+    const sessionRun = this.sessionRuns.get(sessionId)
+    const active = interactionId ? this.activeRuns.get(interactionId) : undefined
+    const hasActiveTts = interactionId ? this.ttsAbortControllers.has(interactionId) : false
+    if (interactionId && (sessionRun || active || hasActiveTts)) {
       this.interruptedInteractions.add(interactionId)
       this.abortTts(interactionId)
     }
-    const sessionRun = this.sessionRuns.get(sessionId)
     if (sessionRun) {
+      this.recentlyInterruptedSessions.set(sessionId, Date.now())
       this.interruptedInteractions.add(sessionRun.interactionId)
       this.abortTts(sessionRun.interactionId)
       logger.info({
@@ -816,7 +1431,10 @@ class PlainWebSocketRelayClient {
       this.sessionRuns.delete(sessionId)
       return
     }
-    if (interactionId) this.abortActiveRun(interactionId)
+    if (interactionId && active?.sessionId === sessionId) {
+      this.recentlyInterruptedSessions.set(sessionId, Date.now())
+      this.abortActiveRun(interactionId)
+    }
   }
 
   private registerTtsAbortController(interactionId: string): AbortController {
@@ -879,33 +1497,38 @@ class PlainWebSocketRelayClient {
     return `mcu-${instance}-${profileId}`
   }
 
-  private async enqueueMcuSpeechSegment(profile: string, interactionId: string, segmentId: string, text: string): Promise<void> {
-    if (this.interruptedInteractions.has(interactionId)) return
-    this.sendJson({ type: 'interaction.status', interactionId, status: 'speaking' })
-    const controller = this.registerTtsAbortController(interactionId)
-    try {
-      const audio = await this.synthesizeMcuSpeech(text, profile, controller.signal)
-      if (this.interruptedInteractions.has(interactionId) || controller.signal.aborted) return
-      const waitForDone = this.waitForMcuAudioDone(segmentId, Math.max(90_000, Math.min(text.length * 1200, 300_000)))
-      this.sendJson({
-        type: 'audio.enqueue',
-        interactionId,
-        segmentId,
-        text: '',
-        url: audio.url,
-        mimeType: 'audio/x-pcm',
-        channels: 1,
-        sampleRate: MCU_TTS_SAMPLE_RATE,
-        durationMs: Math.max(1200, Math.min(text.length * 180, 12_000)),
-        completionManagedByServer: true,
-      })
-      await waitForDone
-    } catch (err) {
-      if (controller.signal.aborted) throw new Error('audio.interrupted')
-      throw err
-    } finally {
-      this.releaseTtsAbortController(interactionId, controller)
+  private async enqueueMcuSpeechSegment(
+    interactionId: string,
+    segmentId: string,
+    text: string,
+    audioResult: Promise<McuSpeechSynthesisResult>,
+  ): Promise<EnqueuedMcuSpeechSegment> {
+    if (this.interruptedInteractions.has(interactionId)) {
+      return { playbackDone: Promise.resolve() }
     }
+    const result = await audioResult
+    if (!result.ok) {
+      if (result.aborted) throw new Error('audio.interrupted')
+      throw result.err
+    }
+    if (this.interruptedInteractions.has(interactionId)) {
+      return { playbackDone: Promise.resolve() }
+    }
+    const waitForDone = this.waitForMcuAudioDone(segmentId, Math.max(90_000, Math.min(text.length * 1200, 300_000)))
+    waitForDone.catch(() => undefined)
+    this.sendJson({
+      type: 'audio.enqueue',
+      interactionId,
+      segmentId,
+      text: '',
+      url: result.audio.url,
+      mimeType: result.audio.mimeType,
+      channels: 1,
+      sampleRate: MCU_TTS_SAMPLE_RATE,
+      durationMs: Math.max(1200, Math.min(text.length * 180, 12_000)),
+      completionManagedByServer: true,
+    })
+    return { playbackDone: waitForDone }
   }
 
   private waitForMcuAudioDone(segmentId: string, timeoutMs: number): Promise<void> {
@@ -918,7 +1541,7 @@ class PlainWebSocketRelayClient {
     })
   }
 
-  private async synthesizeMcuSpeech(text: string, profile: string, signal?: AbortSignal): Promise<{ url: string }> {
+  private async synthesizeMcuSpeech(text: string, profile: string, signal?: AbortSignal): Promise<{ url: string; mimeType: string }> {
     if (!this.options.userToken) {
       throw new Error('missing Web UI auth token')
     }
@@ -946,7 +1569,11 @@ class PlainWebSocketRelayClient {
         throw new Error(`${context} returned empty audio`)
       }
       const contentType = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
-      if (contentType === 'audio/x-pcm' || contentType === 'audio/pcm') return audio
+      const sourceBytes = audio.length
+      if (contentType === 'audio/x-pcm' || contentType === 'audio/pcm') {
+        logger.info({ context, contentType, sourceBytes, pcmBytes: audio.length }, '[outbound-relay-client] MCU TTS PCM audio ready')
+        return audio
+      }
 
       const converted = await transcodeToPcmS16le(audio, contentType || 'application/octet-stream', {
         sampleRate: MCU_TTS_SAMPLE_RATE,
@@ -958,6 +1585,13 @@ class PlainWebSocketRelayClient {
       if (!audio.length) {
         throw new Error(`${context} PCM conversion returned empty audio`)
       }
+      logger.info({
+        context,
+        contentType: contentType || 'application/octet-stream',
+        sourceBytes,
+        pcmBytes: audio.length,
+        sampleRate: MCU_TTS_SAMPLE_RATE,
+      }, '[outbound-relay-client] MCU TTS decoded to PCM')
       return audio
     }
 
@@ -979,33 +1613,110 @@ class PlainWebSocketRelayClient {
     try {
       audio = await readPcmAudio(response, 'MCU TTS')
     } catch (err) {
-      logger.warn({ err }, '[outbound-relay-client] MCU TTS audio conversion failed, falling back to Edge TTS')
-      try {
-        const fallback = await this.options.fetchImpl(`${baseUrl}/api/hermes/tts/synthesize`, {
-          method: 'POST',
-          headers,
-          signal,
-          body: JSON.stringify({
-            provider: 'edge',
-            text,
-            options: MCU_TTS_OPTIONS,
-          }),
-        })
-        if (!fallback.ok) {
-          const detail = await fallback.text().catch(() => '')
-          throw new Error(`MCU TTS conversion failed and Edge fallback failed: ${fallback.status}${detail ? ` ${detail.slice(0, 200)}` : ''}`)
-        }
-        audio = await readPcmAudio(fallback, 'MCU Edge TTS fallback')
-      } catch (fallbackError) {
-        throw fallbackError
+      logger.warn({ err }, '[outbound-relay-client] MCU TTS audio decode failed, falling back to Edge TTS')
+      const fallback = await requestTts('edge')
+      if (!fallback.ok) {
+        const detail = await fallback.text().catch(() => '')
+        throw new Error(`MCU TTS decode failed and Edge fallback failed: ${fallback.status}${detail ? ` ${detail.slice(0, 200)}` : ''}`)
       }
+      audio = await readPcmAudio(fallback, 'MCU Edge TTS fallback')
     }
 
     const dir = join(config.appHome, 'mcu-audio')
     await mkdir(dir, { recursive: true })
-    const file = `${randomUUID()}.pcm`
-    await writeFile(join(dir, file), audio)
-    return { url: `${baseUrl}/api/hermes/mcu/audio/${file}` }
+    const file = `${randomUUID()}.adpcm`
+    const encoded = encodeMcuImaAdpcm(audio, MCU_TTS_SAMPLE_RATE)
+    await writeFile(join(dir, file), encoded)
+    logger.info({
+      file,
+      textChars: text.length,
+      pcmBytes: audio.length,
+      adpcmBytes: encoded.length,
+      ratio: audio.length > 0 ? Number((encoded.length / audio.length).toFixed(3)) : 0,
+    }, '[outbound-relay-client] MCU TTS encoded to ADPCM')
+    const localUrl = `${baseUrl}/api/hermes/mcu/audio/${file}`
+    const remoteUrl = await this.uploadMcuAudioToRelay(encoded, 'audio/x-ima-adpcm', signal).catch((err) => {
+      logger.warn({
+        err,
+        relayUrl: this.redactedRelayUrl(),
+        bytes: encoded.length,
+      }, '[outbound-relay:ws] failed to upload MCU audio to relay')
+      return ''
+    })
+    return { url: remoteUrl || localUrl, mimeType: 'audio/x-ima-adpcm' }
+  }
+
+  private relayHttpBaseUrl(): string {
+    const url = new URL(this.options.relayUrl)
+    if (url.protocol === 'ws:') url.protocol = 'http:'
+    if (url.protocol === 'wss:') url.protocol = 'https:'
+    url.pathname = ''
+    url.search = ''
+    url.hash = ''
+    return url.toString().replace(/\/$/, '')
+  }
+
+  private resolveRelayAudioUploadUrl(): string {
+    const baseUrl = this.relayHttpBaseUrl()
+    if (/^https?:\/\//i.test(this.audioUploadPath)) return this.audioUploadPath
+    const path = this.audioUploadPath.startsWith('/') ? this.audioUploadPath : `/${this.audioUploadPath}`
+    return `${baseUrl}${path}`
+  }
+
+  private async uploadMcuAudioToRelay(audio: Buffer, mimeType = 'audio/x-pcm', signal?: AbortSignal): Promise<string> {
+    if (!this.audioUploadToken || !this.options.deviceCode) return ''
+    const uploadUrl = this.resolveRelayAudioUploadUrl()
+    const response = await this.options.fetchImpl(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.audioUploadToken}`,
+        'Content-Type': mimeType,
+        'X-Device-Code': this.options.deviceCode,
+        'X-Audio-Sample-Rate': String(MCU_TTS_SAMPLE_RATE),
+        'X-Audio-Channels': '1',
+      },
+      body: new Uint8Array(audio),
+      signal,
+    })
+    const text = await response.text()
+    let payload: Record<string, unknown> = {}
+    try {
+      payload = text ? JSON.parse(text) as Record<string, unknown> : {}
+    } catch {
+      payload = { error: text }
+    }
+    if (!response.ok || payload.ok === false) {
+      const error = typeof payload.error === 'string' ? payload.error : `relay audio upload failed: ${response.status}`
+      throw new Error(error)
+    }
+    const url = typeof payload.url === 'string' ? payload.url.trim() : ''
+    if (url) return url
+    const path = typeof payload.path === 'string' ? payload.path.trim() : ''
+    if (!path) throw new Error('relay audio upload did not return a URL')
+    return `${this.relayHttpBaseUrl()}${path.startsWith('/') ? path : `/${path}`}`
+  }
+
+  private resolveLocalAudioUrl(url: string): string {
+    if (/^https?:\/\//i.test(url)) return url
+    const path = url.startsWith('/') ? url : `/${url}`
+    return `${this.options.localBaseUrl.replace(/\/$/, '')}${path}`
+  }
+
+  private async uploadMcuAudioUrlToRelay(url: string): Promise<string> {
+    if (!this.audioUploadToken || !this.options.deviceCode) return ''
+    const localUrl = this.resolveLocalAudioUrl(url)
+    const response = await this.options.fetchImpl(localUrl, {
+      method: 'GET',
+      headers: this.options.userToken ? { Authorization: `Bearer ${this.options.userToken}` } : undefined,
+    })
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new Error(`local MCU audio fetch failed: ${response.status}${detail ? ` ${detail.slice(0, 120)}` : ''}`)
+    }
+    const audio = Buffer.from(await response.arrayBuffer())
+    if (!audio.length) throw new Error('local MCU audio fetch returned empty audio')
+    const mimeType = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() || 'audio/x-pcm'
+    return await this.uploadMcuAudioToRelay(audio, mimeType, undefined)
   }
 
   private redactedRelayUrl(): string {
@@ -1205,25 +1916,35 @@ export class OutboundRelayClient {
   private readonly relayUrl: string
   private readonly relayToken: string
   private readonly instanceId: string
+  private readonly deviceCode: string
   private readonly localBaseUrl: string
+  private readonly machineInfo?: Record<string, unknown>
   private readonly fetchImpl: typeof fetch
 
   constructor(options: OutboundRelayClientOptions) {
     this.relayUrl = options.relayUrl
     this.relayToken = options.relayToken
     this.instanceId = options.instanceId
+    this.deviceCode = options.deviceCode
     this.localBaseUrl = options.localBaseUrl.replace(/\/$/, '')
+    this.machineInfo = options.machineInfo
     this.fetchImpl = options.fetchImpl
   }
 
   start(): void {
     if (this.socket) return
+    const auth: Record<string, unknown> = {
+      role: 'hermes-studio',
+    }
+    if (this.relayToken) auth.token = this.relayToken
+    if (this.deviceCode) {
+      auth.deviceCode = this.deviceCode
+      auth.device_code = this.deviceCode
+    }
+    if (this.instanceId) auth.instanceId = this.instanceId
+    if (this.machineInfo) auth.machine = this.machineInfo
     this.socket = io(this.relayUrl, {
-      auth: {
-        token: this.relayToken || undefined,
-        instanceId: this.instanceId || undefined,
-        role: 'hermes-studio',
-      },
+      auth,
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -1241,9 +1962,16 @@ export class OutboundRelayClient {
     })
     this.socket.on('connect_error', (err: Error) => {
       logger.warn({ err, relayUrl: this.redactedRelayUrl() }, '[outbound-relay] connection failed')
+      if (err.message === 'device_code_not_allowed' || err.message.includes('非官方设备码')) {
+        this.stop()
+      }
     })
     this.socket.on('disconnect', (reason: string) => {
       logger.info({ reason, relayUrl: this.redactedRelayUrl() }, '[outbound-relay] disconnected')
+    })
+    this.socket.on('relay.replaced', (payload: unknown) => {
+      logger.warn({ payload, relayUrl: this.redactedRelayUrl() }, '[outbound-relay] remote relay connection replaced; reconnect disabled')
+      this.stop()
     })
     this.socket.on('http.request', (request: RelayHttpRequest, ack?: (response: RelayHttpResponse) => void) => {
       void this.handleHttpRequest(request)
@@ -1268,6 +1996,37 @@ export class OutboundRelayClient {
     this.socketBridges.clear()
     this.socket?.disconnect()
     this.socket = null
+  }
+
+  isConnected(): boolean {
+    return Boolean(this.socket?.connected)
+  }
+
+  waitForConnected(timeoutMs = 5000): Promise<boolean> {
+    const socket = this.socket
+    if (!socket) return Promise.resolve(false)
+    if (socket.connected) return Promise.resolve(true)
+    return new Promise(resolve => {
+      const cleanup = () => {
+        clearTimeout(timer)
+        socket.off('connect', onConnect)
+        socket.off('connect_error', onFailure)
+      }
+      const onConnect = () => {
+        cleanup()
+        resolve(true)
+      }
+      const onFailure = () => {
+        cleanup()
+        resolve(false)
+      }
+      const timer = setTimeout(() => {
+        cleanup()
+        resolve(false)
+      }, timeoutMs)
+      socket.once('connect', onConnect)
+      socket.once('connect_error', onFailure)
+    })
   }
 
   async handleHttpRequest(request: RelayHttpRequest): Promise<RelayHttpResponse> {
@@ -1489,16 +2248,18 @@ export function startOutboundRelayClient(options: StartOutboundRelayClientOption
   const activeClient = activeClients.get(connectionId)
   if (activeClient) return activeClient
 
-  const clientOptions: OutboundRelayClientOptions = {
+    const clientOptions: OutboundRelayClientOptions = {
     relayUrl,
     relayToken: options.relayToken ?? '',
     userToken: options.userToken ?? '',
     instanceId: options.instanceId ?? '',
+    deviceCode: options.deviceCode ?? '',
     localBaseUrl: options.localBaseUrl ?? `http://127.0.0.1:${config.port}`,
+    machineInfo: options.machineInfo,
     fetchImpl: options.fetchImpl ?? fetch,
   }
-  const client = options.relayProtocol === 'websocket'
-    ? new PlainWebSocketRelayClient(clientOptions)
+  const client = options.relayProtocol === 'mcu-socket.io'
+    ? new McuSocketIoRelayClient(clientOptions)
     : new OutboundRelayClient(clientOptions)
   client.start()
   activeClients.set(connectionId, client)

@@ -45,6 +45,15 @@ describe('App Store', () => {
     expect(window.localStorage.getItem('hermes_sidebar_collapsed')).toBe('0')
   })
 
+  it('tracks route-owned sidebar state for desktop chrome layout', () => {
+    const store = useAppStore()
+
+    expect(store.pageSidebarExpanded).toBe(true)
+
+    store.setPageSidebarExpanded(false)
+    expect(store.pageSidebarExpanded).toBe(false)
+  })
+
   it('loads model visibility and falls back when the configured default is hidden', async () => {
     mockSystemApi.fetchAvailableModels.mockResolvedValue({
       default: 'deepseek-chat',
@@ -191,6 +200,21 @@ describe('App Store', () => {
 
     expect(store.serverVersion).toBe('test')
     expect(store.clientOutdated).toBe(false)
+  })
+
+  it('records Docker runtime state from the health response', async () => {
+    mockSystemApi.checkHealth.mockResolvedValue({
+      status: 'ok',
+      webui_version: 'test',
+      webui_update_available: false,
+      is_docker: true,
+    })
+    const store = useAppStore()
+
+    await store.checkConnection()
+
+    expect(store.isDocker).toBe(true)
+    expect(store.updateAvailable).toBe(false)
   })
 
   it('clears the updating state and reports failure when self-update request fails', async () => {

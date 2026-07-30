@@ -14,6 +14,7 @@ import {
   openAiChatToResponses,
   responsesToAnthropicMessages,
   responsesToOpenAiChat,
+  truncateResponsesToolOutputs,
 } from '../adapters/responses'
 import {
   anthropicMessagesSseToResponsesEvents,
@@ -120,7 +121,7 @@ async function callOpenAiResponses(target: CodexProxyTarget, body: any): Promise
     ;(err as any).status = 501
     throw err
   }
-  const responsesBody = { ...body, model: target.model }
+  const responsesBody = truncateResponsesToolOutputs({ ...body, model: target.model })
   return agentRunGateway.completeJson({
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,
@@ -137,11 +138,27 @@ function responsesEventStream(events: AsyncIterable<CanonicalResponsesEvent>): R
   return Readable.from(generate())
 }
 
+function responseEventForCodexClient(target: CodexProxyTarget, event: CanonicalResponsesEvent): CanonicalResponsesEvent {
+  if (target.apiMode === 'codex_responses' || event.type !== 'response.completed') return event
+  const response = (event.data as any).response
+  if (!response?.usage) return event
+  const { usage: _usage, ...responseWithoutUsage } = response
+  return {
+    ...event,
+    data: {
+      ...event.data,
+      response: responseWithoutUsage,
+    },
+  }
+}
+
 function observableResponsesEvents(target: CodexProxyTarget, events: AsyncIterable<CanonicalResponsesEvent>): AsyncIterable<CanonicalResponsesEvent> {
   async function* observe() {
     for await (const event of events) {
-      codingAgentRunManager.handleResponseEvent(target.agentSessionId, event)
-      yield event
+      codingAgentRunManager.handleProxyUsageEvent(target.agentSessionId, event)
+      const clientEvent = responseEventForCodexClient(target, event)
+      codingAgentRunManager.handleResponseEvent(target.agentSessionId, clientEvent)
+      yield clientEvent
     }
   }
   return observe()
@@ -196,7 +213,7 @@ async function openAiResponsesSseStream(target: CodexProxyTarget, body: any): Pr
     throw err
   }
 
-  const responsesBody = { ...body, model: target.model, stream: true }
+  const responsesBody = truncateResponsesToolOutputs({ ...body, model: target.model, stream: true })
   const stream = await agentRunGateway.streamBytes({
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,

@@ -33,7 +33,7 @@ vi.mock('naive-ui', () => ({
 }))
 
 import MessageItem from '@/components/hermes/chat/MessageItem.vue'
-import type { Message } from '@/stores/hermes/chat'
+import { useChatStore, type Message } from '@/stores/hermes/chat'
 
 describe('MessageItem tool details', () => {
   beforeEach(() => {
@@ -60,6 +60,50 @@ describe('MessageItem tool details', () => {
         resume: vi.fn(),
       },
     })
+  })
+
+  it('selects a completed user or assistant message as the next-turn reference', async () => {
+    const chatStore = useChatStore()
+    chatStore.activeSessionId = 'session-1'
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: {
+          id: 'assistant-reference',
+          role: 'assistant',
+          content: 'Use this answer as context',
+          timestamp: Date.now(),
+        } satisfies Message,
+      },
+      global: { stubs: { MarkdownRenderer: true } },
+    })
+
+    await wrapper.get('.reference-bubble-btn').trigger('click')
+
+    expect(chatStore.activeMessageReference).toMatchObject({
+      id: 'assistant-reference',
+      role: 'assistant',
+      content: 'Use this answer as context',
+    })
+  })
+
+  it('keeps legacy assistant thinking text out of the message reference', async () => {
+    const chatStore = useChatStore()
+    chatStore.activeSessionId = 'session-1'
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: {
+          id: 'assistant-with-thinking',
+          role: 'assistant',
+          content: '<think>private reasoning</think>Visible answer',
+          timestamp: Date.now(),
+        } satisfies Message,
+      },
+      global: { stubs: { MarkdownRenderer: true } },
+    })
+
+    await wrapper.get('.reference-bubble-btn').trigger('click')
+
+    expect(chatStore.activeMessageReference?.content).toBe('Visible answer')
   })
 
   it('renders highlighted code blocks for tool arguments and tool results', async () => {
@@ -391,6 +435,58 @@ describe('MessageItem tool details', () => {
     expect(toolDetails.find('.code-lang').text()).toBe('diff')
     expect(toolDetails.find('.diff-line-added .diff-line-content').text()).toContain('b'.repeat(1600))
     expect(toolDetails.text()).not.toContain('chat.truncated')
+  })
+
+  it('renders a turn-scoped workspace change inside its assistant response', async () => {
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: {
+          id: 'assistant-42',
+          role: 'assistant',
+          content: 'Implemented the requested change.',
+          timestamp: Date.now(),
+          workspaceChanges: [{
+            change_id: 'change-turn-1',
+            assistant_message_id: '42',
+            session_id: 'session-1',
+            run_id: 'run-1',
+            source: 'run',
+            workspace: '/tmp/repo',
+            workspace_kind: 'git',
+            started_at: 1,
+            finished_at: 2,
+            files_changed: 1,
+            additions: 2,
+            deletions: 1,
+            truncated: false,
+            total_patch_bytes: 32,
+            created_at: 2,
+            files: [{
+              id: 1,
+              change_id: 'change-turn-1',
+              session_id: 'session-1',
+              path: 'src/example.ts',
+              old_path: null,
+              change_type: 'modified',
+              additions: 2,
+              deletions: 1,
+              size_before: 10,
+              size_after: 12,
+              patch_bytes: 32,
+              truncated: false,
+              binary: false,
+              created_at: 2,
+            }],
+          }],
+        } as Message,
+      },
+      global: { stubs: { MarkdownRenderer: true } },
+    })
+
+    expect(wrapper.find('.msg-content.assistant .assistant-workspace-change').exists()).toBe(true)
+    expect(wrapper.find('.tool-change-card-title').text()).toBe('chat.changesThisTurn')
+    expect(wrapper.find('.tool-change-file-row').exists()).toBe(false)
+    expect(wrapper.find('.assistant-workspace-change .tool-change-card-header').attributes('aria-expanded')).toBe('false')
   })
 
   it('shows only an embedded difference field when a JSON tool result contains a unified diff', async () => {

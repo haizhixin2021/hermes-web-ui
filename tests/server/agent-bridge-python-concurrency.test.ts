@@ -82,6 +82,7 @@ approval._session_key = contextvars.ContextVar("approval_session_key", default="
 approval._notify = {}
 approval._resolved_gateway = []
 approval._session_approved = {}
+approval._session_yolo = set()
 approval._permanent_approved = set()
 approval._saved_permanent = set()
 approval._check_execute_code_calls = []
@@ -114,6 +115,16 @@ def is_approved(session_key, pattern_key):
 def approve_session(session_key, pattern_key):
     approval._session_approved.setdefault(session_key, set()).add(pattern_key)
 
+def enable_session_yolo(session_key):
+    if session_key:
+        approval._session_yolo.add(session_key)
+
+def disable_session_yolo(session_key):
+    approval._session_yolo.discard(session_key)
+
+def is_session_yolo_enabled(session_key):
+    return bool(session_key) and session_key in approval._session_yolo
+
 def approve_permanent(pattern_key):
     approval._permanent_approved.add(pattern_key)
 
@@ -135,6 +146,9 @@ approval.unregister_gateway_notify = unregister_gateway_notify
 approval.resolve_gateway_approval = resolve_gateway_approval
 approval.is_approved = is_approved
 approval.approve_session = approve_session
+approval.enable_session_yolo = enable_session_yolo
+approval.disable_session_yolo = disable_session_yolo
+approval.is_session_yolo_enabled = is_session_yolo_enabled
 approval.approve_permanent = approve_permanent
 approval.save_permanent_allowlist = save_permanent_allowlist
 approval.load_permanent_allowlist = load_permanent_allowlist
@@ -212,6 +226,462 @@ def wait_for(condition, timeout=20):
 `
 
 describe('agent bridge Python session concurrency', () => {
+  it('toggles YOLO for a session before its first Agent session exists', () => {
+    runPython(String.raw`
+${harness}
+
+pool, _fake_db = make_pool()
+assert "session-yolo" not in pool._sessions
+
+enabled = pool.dispatch_command("session-yolo", "/yolo", "default")
+assert enabled == {
+    "session_id": "session-yolo",
+    "command": "yolo",
+    "handled": True,
+    "type": "yolo",
+    "action": "yolo",
+    "enabled": True,
+    "message": "⚡ YOLO mode ON for this session — all commands auto-approved. Use with caution.",
+}, enabled
+assert approval.is_session_yolo_enabled("session-yolo") is True
+assert approval.is_session_yolo_enabled("another-session") is False
+assert "session-yolo" not in pool._sessions
+
+class YoloAwareAgent:
+    def __init__(self):
+        self.seen = []
+
+    def run_conversation(self, message, session_id=None, stream_callback=None, **kwargs):
+        active_session = approval.get_current_session_key()
+        self.seen.append((
+            active_session,
+            approval.is_session_yolo_enabled(active_session),
+        ))
+        return {"output": "done"}
+
+agent = YoloAwareAgent()
+_session, record, thread = start_manual_run(
+    pool,
+    "session-yolo",
+    agent,
+    "first real message",
+)
+thread.join(timeout=2)
+assert not thread.is_alive(), record.result
+assert agent.seen == [("session-yolo", True)], agent.seen
+
+disabled = pool.dispatch_command("session-yolo", "yolo", "default")
+assert disabled["enabled"] is False, disabled
+assert approval.is_session_yolo_enabled("session-yolo") is False
+`)
+  })
+
+  it('binds Agent-session background delivery capability across runtime context versions', () => {
+    runPython(String.raw`
+${harness}
+
+gateway_pkg = types.ModuleType("gateway")
+gateway_pkg.__path__ = []
+sys.modules["gateway"] = gateway_pkg
+
+session_context = types.ModuleType("gateway.session_context")
+captured = []
+
+def modern_set_session_vars(
+    platform="",
+    source="",
+    session_key="",
+    session_id="",
+    profile="",
+    cwd="",
+    async_delivery=True,
+):
+    captured.append({
+        "platform": platform,
+        "source": source,
+        "session_key": session_key,
+        "session_id": session_id,
+        "profile": profile,
+        "cwd": cwd,
+        "async_delivery": async_delivery,
+    })
+    return ["modern-token"]
+
+session_context.set_session_vars = modern_set_session_vars
+sys.modules["gateway.session_context"] = session_context
+
+tokens = bridge._set_bridge_session_vars(
+    "session-modern",
+    "profile-modern",
+    "/tmp/workspace-modern",
+    False,
+)
+assert tokens == ["modern-token"]
+assert captured[-1] == {
+    "platform": "agent_bridge",
+    "source": "tui",
+    "session_key": "session-modern",
+    "session_id": "session-modern",
+    "profile": "profile-modern",
+    "cwd": "/tmp/workspace-modern",
+    "async_delivery": False,
+}
+
+def legacy_set_session_vars(
+    platform="",
+    chat_id="",
+    chat_name="",
+    thread_id="",
+    user_id="",
+    user_name="",
+    session_key="",
+    message_id="",
+):
+    captured.append({"platform": platform, "session_key": session_key})
+    return ["legacy-token"]
+
+session_context.set_session_vars = legacy_set_session_vars
+tokens = bridge._set_bridge_session_vars(
+    "session-legacy",
+    "profile-legacy",
+    "C:/workspace-legacy",
+    True,
+)
+assert tokens == ["legacy-token"]
+assert captured[-1] == {
+    "platform": "agent_bridge",
+    "session_key": "session-legacy",
+}
+`)
+  })
+
+  it('forwards Agent creation policy from chat and context-estimate requests', () => {
+    runPython(String.raw`
+${harness}
+
+captured = []
+
+class FakePool:
+    def start_chat(self, *args):
+        captured.append(args)
+        return bridge.RunRecord(run_id=f"run-{len(captured)}", session_id=args[0])
+
+    def estimate_context(self, *args, **kwargs):
+        captured.append(kwargs)
+        return {"session_id": args[0]}
+
+server = object.__new__(bridge.BridgeServer)
+server.pool = FakePool()
+
+disabled = server.handle({
+    "action": "chat",
+    "session_id": "session-disabled",
+    "message": "hello",
+    "background_delegation_enabled": False,
+})
+enabled = server.handle({
+    "action": "chat",
+    "session_id": "session-default",
+    "message": "hello",
+})
+estimated = server.handle({
+    "action": "context_estimate",
+    "session_id": "session-estimate-disabled",
+    "background_delegation_enabled": False,
+})
+
+assert disabled["status"] == "running"
+assert enabled["status"] == "running"
+assert captured[0][-1] is False
+assert captured[1][-1] is None
+assert estimated["session_id"] == "session-estimate-disabled"
+assert captured[2]["background_delegation_enabled"] is False
+`)
+  })
+
+  it('buffers subagent events after the parent run has ended', () => {
+    runPython(String.raw`
+${harness}
+
+pool, _fake_db = make_pool()
+session = bridge.AgentSession(session_id="background-session", agent=object())
+record = bridge.RunRecord(run_id="parent-run", session_id=session.session_id)
+session.current_run_id = record.run_id
+with pool._lock:
+    pool._sessions[session.session_id] = session
+    pool._runs[record.run_id] = record
+
+pool._append_event(session.session_id, {
+    "event": "subagent.start",
+    "subagent_id": "child-1",
+    "goal": "inspect the repository",
+})
+assert len(record.events) == 1
+assert session.background_events == []
+assert session.background_tasks["child-1"]["status"] == "running"
+
+session.current_run_id = None
+pool._append_event(session.session_id, {
+    "event": "subagent.text",
+    "subagent_id": "child-1",
+    "text": "found the relevant file",
+})
+pool._append_event(session.session_id, {
+    "event": "subagent.complete",
+    "subagent_id": "child-1",
+    "status": "completed",
+    "summary": "done",
+})
+
+polled = pool.poll_background()
+assert [event["event"] for event in polled["sessions"][0]["events"]] == [
+    "subagent.text", "subagent.complete"
+]
+assert polled["sessions"][0]["tasks"][0]["status"] == "completed"
+assert pool.poll_background()["sessions"] == []
+`)
+  })
+
+  it('requeues a released durable background completion claim', () => {
+    runPython(String.raw`
+${harness}
+
+import queue
+
+process_registry_module = types.ModuleType("tools.process_registry")
+process_registry_module.process_registry = types.SimpleNamespace(completion_queue=queue.Queue())
+process_registry_module.format_process_notification = lambda event: "background result ready"
+sys.modules["tools.process_registry"] = process_registry_module
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.claim_event_delivery = lambda event, consumer: "claim-1"
+async_module.release_completion_delivery = lambda delegation_id, claim_id: True
+async_module.complete_completion_delivery = lambda delegation_id, claim_id: True
+sys.modules["tools.async_delegation"] = async_module
+
+pool, _fake_db = make_pool()
+event = {
+    "type": "async_delegation",
+    "delegation_id": "deleg-1",
+    "session_key": "session-1",
+    "parent_session_id": "session-1",
+    "status": "completed",
+}
+process_registry_module.process_registry.completion_queue.put(event)
+
+polled = pool.poll_background(["session-1"])
+assert polled["notifications"][0]["claim_id"] == "claim-1"
+assert process_registry_module.process_registry.completion_queue.empty()
+
+released = pool.release_background_notification("deleg-1", "claim-1")
+assert released["released"] is True
+assert process_registry_module.process_registry.completion_queue.get_nowait() == event
+`)
+  })
+
+  it('acknowledges a user-cancelled delegation completion without starting a new parent turn', () => {
+    runPython(String.raw`
+${harness}
+
+import queue
+
+completed = []
+process_registry_module = types.ModuleType("tools.process_registry")
+process_registry_module.process_registry = types.SimpleNamespace(completion_queue=queue.Queue())
+process_registry_module.format_process_notification = lambda event: "should not be delivered"
+sys.modules["tools.process_registry"] = process_registry_module
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.claim_event_delivery = lambda event, consumer: "claim-interrupted"
+async_module.complete_completion_delivery = lambda delegation_id, claim_id: completed.append(
+    (delegation_id, claim_id)
+) or True
+sys.modules["tools.async_delegation"] = async_module
+
+pool, _fake_db = make_pool()
+pool._suppressed_background_delegations.add("deleg-interrupted")
+process_registry_module.process_registry.completion_queue.put({
+    "type": "async_delegation",
+    "delegation_id": "deleg-interrupted",
+    "session_key": "session-1",
+    "parent_session_id": "session-1",
+    "status": "completed",
+})
+
+polled = pool.poll_background(["session-1"])
+
+assert polled["notifications"] == []
+assert process_registry_module.process_registry.completion_queue.empty()
+assert completed == [("deleg-interrupted", "claim-interrupted")]
+assert pool._suppressed_background_delegations == set()
+`)
+  })
+
+  it('interrupts background work and releases claims during worker shutdown', () => {
+    runPython(String.raw`
+${harness}
+
+calls = []
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.interrupt_all = lambda reason: calls.append(("interrupt_all", reason)) or 1
+async_module.active_count = lambda: 0
+async_module.release_completion_delivery = lambda delegation_id, claim_id: calls.append(
+    ("release", delegation_id, claim_id)
+) or True
+sys.modules["tools.async_delegation"] = async_module
+
+process_registry_module = types.ModuleType("tools.process_registry")
+process_registry_module.process_registry = types.SimpleNamespace(
+    kill_all=lambda: calls.append(("kill_all",)) or 2,
+)
+sys.modules["tools.process_registry"] = process_registry_module
+
+class InterruptibleAgent:
+    def interrupt(self, message):
+        calls.append(("session_interrupt", message))
+
+pool, _fake_db = make_pool()
+session = bridge.AgentSession(session_id="session-1", agent=InterruptibleAgent())
+session.running = True
+pool._sessions[session.session_id] = session
+pool._background_notification_claims[("deleg-1", "claim-1")] = {"type": "async_delegation"}
+
+result = pool.shutdown()
+
+assert result == {
+    "interrupted_sessions": 1,
+    "interrupted_delegations": 1,
+    "killed_processes": 2,
+    "released_claims": 1,
+}
+assert calls == [
+    ("session_interrupt", "Agent bridge shutting down"),
+    ("interrupt_all", "agent_bridge_shutdown"),
+    ("kill_all",),
+    ("release", "deleg-1", "claim-1"),
+]
+assert pool._background_notification_claims == {}
+`)
+  })
+
+  it('interrupts only the current session background delegations on user stop', () => {
+    runPython(String.raw`
+${harness}
+
+calls = []
+async_module = types.ModuleType("tools.async_delegation")
+async_module.interrupt_for_session = lambda **kwargs: calls.append(kwargs) or 2
+async_module.list_async_delegations = lambda: [
+    {
+        "delegation_id": "deleg-current",
+        "status": "running",
+        "session_key": "session-1",
+    },
+    {
+        "delegation_id": "deleg-other",
+        "status": "running",
+        "session_key": "session-2",
+    },
+]
+sys.modules["tools.async_delegation"] = async_module
+
+class InterruptibleAgent:
+    def interrupt(self, message):
+        calls.append({"parent_message": message})
+
+pool, _fake_db = make_pool()
+session = bridge.AgentSession(session_id="session-1", agent=InterruptibleAgent())
+pool._sessions[session.session_id] = session
+pool._append_event(session.session_id, {
+    "event": "subagent.start",
+    "subagent_id": "child-current",
+    "task_index": 0,
+    "task_count": 1,
+    "goal": "background work",
+})
+
+result = pool.interrupt("session-1", "Aborted by user")
+
+assert result == {
+    "status": "interrupted",
+    "session_id": "session-1",
+    "synced": True,
+    "background_interrupted": 2,
+    "background_delegation_ids": ["deleg-current"],
+}
+assert calls == [{
+    "session_key": "session-1",
+    "origin_ui_session_id": "session-1",
+    "parent_session_id": "session-1",
+    "reason": "user_interrupt",
+}, {"parent_message": "Aborted by user"}]
+assert pool._suppressed_background_delegations == {"deleg-current"}
+polled = pool.poll_background()
+assert polled["sessions"][0]["tasks"][0]["status"] == "interrupted"
+assert [event["event"] for event in polled["sessions"][0]["events"]] == [
+    "subagent.start", "subagent.complete"
+]
+assert polled["sessions"][0]["events"][-1]["status"] == "interrupted"
+`)
+  })
+
+  it('keeps idle sessions alive while durable background delegations are active', () => {
+    runPython(String.raw`
+${harness}
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.list_async_delegations = lambda: [
+    {
+        "delegation_id": "deleg-running",
+        "status": "running",
+        "parent_session_id": "session-running",
+    },
+    {
+        "delegation_id": "deleg-finalizing",
+        "status": "finalizing",
+        "origin_ui_session_id": "session-finalizing",
+    },
+]
+async_module.interrupt_for_session = lambda **kwargs: 0
+sys.modules["tools.async_delegation"] = async_module
+
+server = bridge.BridgeServer("tcp://127.0.0.1:1")
+server.GC_INTERVAL_SECONDS = 0
+old = time.time() - server.IDLE_TIMEOUT_SECONDS - 1
+for session_id in ("session-running", "session-finalizing", "session-idle"):
+    session = bridge.AgentSession(session_id=session_id, agent=object())
+    session.last_used_at = old
+    server.pool._sessions[session_id] = session
+
+server._gc_idle_sessions()
+
+assert set(server.pool._sessions) == {"session-running", "session-finalizing"}
+`)
+  })
+
+  it('falls back to worker task state when checking idle background work', () => {
+    runPython(String.raw`
+${harness}
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.list_async_delegations = lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable"))
+async_module.interrupt_for_session = lambda **kwargs: 0
+sys.modules["tools.async_delegation"] = async_module
+
+server = bridge.BridgeServer("tcp://127.0.0.1:1")
+server.GC_INTERVAL_SECONDS = 0
+session = bridge.AgentSession(session_id="session-1", agent=object())
+session.last_used_at = time.time() - server.IDLE_TIMEOUT_SECONDS - 1
+session.background_tasks["child-1"] = {"status": "running"}
+server.pool._sessions[session.session_id] = session
+
+server._gc_idle_sessions()
+
+assert "session-1" in server.pool._sessions
+`)
+  })
+
   it('hot-switches a loaded idle session model without recreating the session', () => {
     runPython(String.raw`
 ${harness}
@@ -266,6 +736,101 @@ assert agent.switch_calls == [{
 assert session.config["model"] == "new-model"
 assert session.config["provider"] == "anthropic"
 assert "pending_model_switch_note" in session.config
+`)
+  })
+
+  it('does not rebuild an idle agent when only the requested custom-provider alias differs', () => {
+    runPython(String.raw`
+${harness}
+
+def fake_resolve_runtime(model, provider=None):
+    assert provider == "custom:liuzheng"
+    return {
+        "provider": "custom",
+        "base_url": "https://custom.example/v1",
+        "api_key": "same-key",
+        "api_mode": "chat_completions",
+    }
+
+bridge._resolve_runtime = fake_resolve_runtime
+pool, _fake_db = make_pool()
+
+class SwitchableAgent:
+    def __init__(self):
+        self.model = "same-model"
+        self.provider = "custom"
+        self.base_url = "https://custom.example/v1"
+        self.api_key = "same-key"
+        self.api_mode = "chat_completions"
+        self.switch_calls = []
+
+    def switch_model(self, **kwargs):
+        self.switch_calls.append(kwargs)
+
+agent = SwitchableAgent()
+session = bridge.AgentSession(
+    session_id="session-custom-alias",
+    agent=agent,
+    config={"profile": "default", "model": "same-model", "provider": "custom"},
+)
+pool._sessions["session-custom-alias"] = session
+
+result = pool.switch_session_model(
+    "session-custom-alias", "same-model", "custom:liuzheng", "default",
+)
+
+assert result["switched"] is True
+assert agent.switch_calls == []
+assert session.config["model"] == "same-model"
+assert session.config["provider"] == "custom:liuzheng"
+assert session.config["base_url"] == "https://custom.example/v1"
+`)
+  })
+
+  it('rebuilds an idle agent when credentials change under the same runtime', () => {
+    runPython(String.raw`
+${harness}
+
+def fake_resolve_runtime(model, provider=None):
+    return {
+        "provider": "custom",
+        "base_url": "https://custom.example/v1",
+        "api_key": "rotated-key",
+        "api_mode": "chat_completions",
+    }
+
+bridge._resolve_runtime = fake_resolve_runtime
+pool, _fake_db = make_pool()
+
+class SwitchableAgent:
+    def __init__(self):
+        self.model = "same-model"
+        self.provider = "custom"
+        self.base_url = "https://custom.example/v1"
+        self.api_key = "old-key"
+        self.api_mode = "chat_completions"
+        self.switch_calls = []
+
+    def switch_model(self, **kwargs):
+        self.switch_calls.append(kwargs)
+        self.api_key = kwargs["api_key"]
+
+agent = SwitchableAgent()
+session = bridge.AgentSession(
+    session_id="session-rotated-key",
+    agent=agent,
+    config={"profile": "default", "model": "same-model", "provider": "custom:liuzheng"},
+)
+pool._sessions["session-rotated-key"] = session
+
+result = pool.switch_session_model(
+    "session-rotated-key", "same-model", "custom:liuzheng", "default",
+)
+
+assert result["switched"] is True
+assert result["provider"] == "custom:liuzheng"
+assert len(agent.switch_calls) == 1
+assert agent.switch_calls[0]["api_key"] == "rotated-key"
 `)
   })
 
@@ -772,6 +1337,55 @@ assert broker._session_worker_key == {}
 `)
   })
 
+  it('routes a first-message YOLO command to the requested profile worker', () => {
+    runPython(String.raw`
+${harness}
+
+class CommandWorker:
+    running = True
+    pid = 12345
+    endpoint = "ipc:///tmp/yolo-worker.sock"
+    last_used_at = 12.5
+
+    def __init__(self):
+        self.profile = "work"
+        self.key = "work"
+        self.requests = []
+
+    def request(self, req, timeout=None):
+        self.requests.append(req)
+        return {
+            "ok": True,
+            "session_id": req["session_id"],
+            "command": "yolo",
+            "handled": True,
+            "action": "yolo",
+            "enabled": True,
+        }
+
+broker = bridge.BridgeBroker("ipc:///tmp/unused.sock")
+worker = CommandWorker()
+broker._workers["work"] = worker
+
+response = broker.handle({
+    "action": "command",
+    "session_id": "new-session",
+    "profile": "work",
+    "command": "yolo",
+})
+
+assert response["enabled"] is True, response
+assert worker.requests == [{
+    "action": "command",
+    "session_id": "new-session",
+    "profile": "work",
+    "command": "yolo",
+}], worker.requests
+assert broker._session_profile["new-session"] == "work"
+assert broker._session_worker_key["new-session"] == "work"
+`)
+  })
+
   it('routes worker-keyed broker requests without stopping the worker on session destroy', () => {
     runPython(String.raw`
 ${harness}
@@ -1238,7 +1852,7 @@ assert events == [
 `)
   })
 
-  it('shuts down MCP servers before worker shutdown exits', () => {
+  it('cleans worker background state and MCP servers before shutdown exits', () => {
     runPython(String.raw`
 ${harness}
 
@@ -1252,7 +1866,16 @@ class FakeBridgeServer(bridge.BridgeServer):
 server = FakeBridgeServer("tcp://127.0.0.1:1")
 response = server.handle({"action": "shutdown"})
 
-assert response == {"status": "shutting_down"}, response
+assert response == {
+    "status": "shutting_down",
+    "cleanup": {
+        "interrupted_sessions": 0,
+        "interrupted_delegations": 0,
+        "killed_processes": 0,
+        "released_claims": 0,
+        "mcp_servers": 2,
+    },
+}, response
 assert events == ["mcp-shutdown"], events
 assert server._stop.is_set(), "shutdown should stop worker after MCP shutdown"
 `)

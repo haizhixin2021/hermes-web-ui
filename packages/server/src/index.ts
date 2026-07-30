@@ -1,11 +1,10 @@
 import Koa from 'koa'
 import type { Context } from 'koa'
 import cors from '@koa/cors'
-import bodyParser from '@koa/bodyparser'
 import serve from 'koa-static'
 import send from 'koa-send'
 import os from 'os'
-import { resolve } from 'path'
+import { relative, resolve } from 'path'
 import { mkdir } from 'fs/promises'
 import { readFileSync } from 'fs'
 import { config, shouldCreateWebUiDataDir } from './config'
@@ -31,9 +30,11 @@ import { WorkflowSocketServer } from './services/workflow-socket'
 import { PetStateSocketServer } from './services/hermes/pet-state-socket'
 import { logger } from './services/logger'
 import { createStaticCompressionMiddleware } from './middleware/static-compression'
+import { getStaticCacheControl, SPA_ENTRY_CACHE_CONTROL } from './middleware/static-cache'
 import { requireUserJwt, resolveUserProfile } from './middleware/user-auth'
 import { createCorsOriginResolver, securityHeaders } from './security'
 import type { ShutdownHandler } from './services/shutdown'
+import { createRequestBodyParser } from './middleware/request-body-parser'
 
 // Injected by esbuild at build time; fallback to reading package.json in dev mode
 declare const __APP_VERSION__: string
@@ -292,13 +293,7 @@ export async function bootstrap() {
   app.use(cors({ origin: createCorsOriginResolver(config.corsOrigins) }))
   // Raise body limits above the default 1mb: profile avatars and MiMo voice-clone
   // reference audio are posted as base64 data URLs before reaching handlers.
-  app.use(bodyParser({
-    encoding: 'utf-8',
-    jsonLimit: '20mb',
-    formLimit: '20mb',
-    textLimit: '20mb',
-    parsedMethods: ['POST', 'PUT', 'PATCH', 'DELETE'],
-  }))
+  app.use(createRequestBodyParser())
   console.log('[bootstrap] cors + bodyParser registered')
 
   registerDesktopShutdownRoute(app)
@@ -310,12 +305,18 @@ export async function bootstrap() {
   // SPA fallback
   const distDir = resolve(__dirname, '..', 'client')
   app.use(createStaticCompressionMiddleware())
-  app.use(serve(distDir))
+  app.use(serve(distDir, {
+    setHeaders(res, filePath) {
+      const cacheControl = getStaticCacheControl(relative(distDir, filePath))
+      if (cacheControl) res.setHeader('Cache-Control', cacheControl)
+    },
+  }))
   app.use(async (ctx) => {
     if (!ctx.path.startsWith('/api') &&
       ctx.path !== '/health' &&
       ctx.path !== '/upload' &&
       ctx.path !== '/webhook') {
+      ctx.set('Cache-Control', SPA_ENTRY_CACHE_CONTROL)
       await send(ctx, 'index.html', { root: distDir })
     }
   })
@@ -340,6 +341,15 @@ export async function bootstrap() {
   chatRunServer = new ChatRunSocket(groupChatServer.getIO())
   setChatRunServer(chatRunServer)
   chatRunServer.init()
+
+  // A process restart loses in-memory scheduler, approval, and runner ownership.
+  // Persist a fail-closed terminal state before exposing workflow sockets, then abort
+  // any surviving session runners through the now-registered ChatRun service.
+  const { getWorkflowManager } = await import('./services/workflow-manager')
+  const recoveredWorkflows = await getWorkflowManager().recoverActiveRuns()
+  if (recoveredWorkflows.runs > 0) {
+    logger.warn('Recovered %d orphaned workflow runs and aborted %d sessions', recoveredWorkflows.runs, recoveredWorkflows.sessions)
+  }
 
   workflowSocketServer = new WorkflowSocketServer(groupChatServer.getIO())
   workflowSocketServer.init()

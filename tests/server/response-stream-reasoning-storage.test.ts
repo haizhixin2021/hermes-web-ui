@@ -103,6 +103,27 @@ describe('response stream reasoning storage', () => {
     }))
   })
 
+  it('rebinds run messages to persisted ids and returns the final assistant id', () => {
+    const state: SessionState = { messages: [], isWorking: false, events: [], queue: [] }
+    addMessageMock.mockReturnValueOnce(40).mockReturnValueOnce(41).mockReturnValueOnce(42)
+
+    applyResponseStreamEvent(state, 'session-1', 'run-1', 'response.created', {
+      response: { id: 'resp-1', status: 'in_progress' },
+    })
+    applyResponseStreamEvent(state, 'session-1', 'run-1', 'response.output_text.delta', {
+      delta: 'Before tool.',
+    })
+    applyResponseStreamEvent(state, 'session-1', 'run-1', 'response.output_item.done', {
+      item: { type: 'function_call', call_id: 'tool-1', name: 'Bash', arguments: '{}' },
+    })
+    applyResponseStreamEvent(state, 'session-1', 'run-1', 'response.output_text.delta', {
+      delta: 'Final answer.',
+    })
+
+    expect(flushResponseRunToDb(state, 'session-1')).toBe('42')
+    expect(state.messages.map(message => message.id)).toEqual([40, 41, 42])
+  })
+
   it('deduplicates final reasoning snapshots after streamed reasoning deltas', () => {
     const state: SessionState = { messages: [], isWorking: false, events: [], queue: [] }
 

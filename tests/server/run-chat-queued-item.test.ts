@@ -57,6 +57,7 @@ vi.mock('../../packages/server/src/lib/llm-prompt', () => ({
 vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
   clearSessionMessages: sessionStoreMocks.clearSessionMessages,
   getSession: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli' })),
+  getSessionMetadata: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli' })),
   getSessionDetail: vi.fn(() => null),
 }))
 
@@ -468,4 +469,21 @@ describe('ChatRunSocket queued bridge runs', () => {
       queueLength: 0,
     }))
   })
+  it('aborts the underlying runner when runAndWait reaches its timeout', async () => {
+    vi.useFakeTimers()
+    handleBridgeRunMock.mockImplementationOnce(async () => new Promise(() => {}))
+    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { io } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const abortSpy = vi.spyOn(server, 'abortSession').mockResolvedValue(undefined)
+    try {
+      const resultPromise = server.runAndWait({
+        session_id: 'session-1', input: 'slow workflow node', source: 'workflow', session_source: 'workflow',
+      }, { profile: 'default', timeoutMs: 25 })
+      await vi.advanceTimersByTimeAsync(25)
+      await expect(resultPromise).resolves.toMatchObject({ ok: false, error: 'chat-run timed out after 25ms' })
+      expect(abortSpy).toHaveBeenCalledWith('session-1', 'chat-run timed out after 25ms')
+    } finally { vi.useRealTimers() }
+  })
+
 })

@@ -1,5 +1,6 @@
 import { request, getApiKey, getBaseUrlValue } from '../client'
 import type { ProviderApiMode } from './system'
+import { fetchAuthenticatedBlob, saveBlob } from './binary-content'
 
 export interface SessionSummary {
   id: string
@@ -35,7 +36,15 @@ export interface SessionSummary {
   actual_cost_usd: number | null
   cost_status: string
   workspace?: string | null
+  category_id?: number | null
   webui_imported?: boolean
+}
+
+export interface SessionCategory {
+  id: number
+  name: string
+  created_at: number
+  updated_at: number
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -73,6 +82,24 @@ export interface SessionSearchResult extends SessionSummary {
   matched_message_id: number | null
   snippet: string
   rank: number
+}
+
+export interface HermesSessionGroupPage {
+  source: string
+  sessions: SessionSummary[]
+  hasMore: boolean
+}
+
+export interface HermesSessionGroupsResult {
+  groups: HermesSessionGroupPage[]
+  included: SessionSummary[]
+}
+
+export interface HermesSessionPage {
+  sessions: SessionSummary[]
+  hasMore: boolean
+  offset: number
+  limit: number
 }
 
 export interface HermesMessage {
@@ -114,6 +141,9 @@ export interface WorkspaceRunChangeFileDetail extends WorkspaceRunChangeFileSumm
 
 export interface WorkspaceRunChangeSummary {
   change_id: string
+  room_id?: string
+  message_id?: string
+  assistant_message_id?: string
   session_id: string
   run_id: string
   source: 'run'
@@ -138,6 +168,36 @@ export async function fetchSessions(source?: string, limit?: number, profile?: s
   const query = params.toString()
   const res = await request<{ sessions: SessionSummary[] }>(`/api/hermes/sessions${query ? `?${query}` : ''}`)
   return res.sessions
+}
+
+export async function fetchSessionCategories(): Promise<SessionCategory[]> {
+  const res = await request<{ categories: SessionCategory[] }>('/api/hermes/session-categories')
+  return res.categories
+}
+
+export async function createSessionCategory(name: string): Promise<SessionCategory> {
+  const res = await request<{ category: SessionCategory }>('/api/hermes/session-categories', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  })
+  return res.category
+}
+
+export async function renameSessionCategory(id: number, name: string): Promise<SessionCategory> {
+  const res = await request<{ category: SessionCategory }>(
+    `/api/hermes/session-categories/${encodeURIComponent(String(id))}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    },
+  )
+  return res.category
+}
+
+export async function deleteSessionCategory(id: number): Promise<void> {
+  await request(`/api/hermes/session-categories/${encodeURIComponent(String(id))}`, {
+    method: 'DELETE',
+  })
 }
 
 export async function fetchWorkspaceRunChangesForSession(id: string): Promise<WorkspaceRunChangeSummary[]> {
@@ -176,6 +236,63 @@ export async function readSessionWorkspaceFile(
   )
 }
 
+export async function fetchSessionWorkspaceFileBlob(
+  sessionId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const params = new URLSearchParams({ path })
+  return fetchAuthenticatedBlob(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/content?${params}`,
+    { signal },
+  )
+}
+
+export async function fetchSessionWorkspaceAttachmentBlob(
+  sessionId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const params = new URLSearchParams({ path, download: '1' })
+  return fetchAuthenticatedBlob(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/content?${params}`,
+    { signal },
+  )
+}
+
+export async function fetchSessionWorkspaceFileText(
+  sessionId: string,
+  path: string,
+): Promise<{ content: string; size: number }> {
+  const params = new URLSearchParams({ path, text: '1' })
+  const blob = await fetchAuthenticatedBlob(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/content?${params}`,
+  )
+  return { content: await blob.text(), size: blob.size }
+}
+
+export async function downloadSessionWorkspaceFile(
+  sessionId: string,
+  path: string,
+  fileName: string,
+): Promise<void> {
+  const params = new URLSearchParams({ path, download: '1' })
+  const blob = await fetchAuthenticatedBlob(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/content?${params}`,
+  )
+  saveBlob(blob, fileName)
+}
+
+export async function listSessionWorkspaceFiles(
+  sessionId: string,
+  path: string = '',
+): Promise<{ entries: Array<{ name: string; path: string; absolutePath?: string; isDir: boolean; size: number; modTime: string }>; path: string; absolutePath?: string }> {
+  const params = new URLSearchParams()
+  if (path) params.set('path', path)
+  const query = params.toString()
+  return request(`/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-files/list${query ? `?${query}` : ''}`)
+}
+
 export async function writeSessionWorkspaceFile(
   sessionId: string,
   path: string,
@@ -190,8 +307,36 @@ export async function writeSessionWorkspaceFile(
   )
 }
 
+export async function mkdirSessionWorkspaceFile(sessionId: string, path: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/mkdir`,
+    { method: 'POST', body: JSON.stringify({ path }) },
+  )
+}
+
+export async function deleteSessionWorkspaceFile(sessionId: string, path: string, recursive = false): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/delete`,
+    { method: 'DELETE', body: JSON.stringify({ path, recursive }) },
+  )
+}
+
+export async function renameSessionWorkspaceFile(sessionId: string, oldPath: string, newPath: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/rename`,
+    { method: 'POST', body: JSON.stringify({ oldPath, newPath }) },
+  )
+}
+
+export async function copySessionWorkspaceFile(sessionId: string, srcPath: string, destPath: string): Promise<void> {
+  await request<{ ok: boolean }>(
+    `/api/hermes/sessions/${encodeURIComponent(sessionId)}/workspace-file/copy`,
+    { method: 'POST', body: JSON.stringify({ srcPath, destPath }) },
+  )
+}
+
 /**
- * Fetch Hermes sessions only (exclude api_server source)
+ * Fetch Hermes History sessions, including API Server source.
  */
 export async function fetchHermesSessions(source?: string, limit?: number, profile?: string | null): Promise<SessionSummary[]> {
   const params = new URLSearchParams()
@@ -201,6 +346,32 @@ export async function fetchHermesSessions(source?: string, limit?: number, profi
   const query = params.toString()
   const res = await request<{ sessions: SessionSummary[] }>(`/api/hermes/sessions/hermes${query ? `?${query}` : ''}`)
   return res.sessions
+}
+
+export async function fetchHermesSessionGroups(
+  limit: number,
+  profile?: string | null,
+  includedSessionIds: string[] = [],
+): Promise<HermesSessionGroupsResult> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (profile) params.set('profile', profile)
+  for (const sessionId of includedSessionIds) params.append('include', sessionId)
+  return request<HermesSessionGroupsResult>(`/api/hermes/sessions/hermes/groups?${params}`)
+}
+
+export async function fetchHermesSessionPage(
+  source: string,
+  offset: number,
+  limit: number,
+  profile?: string | null,
+): Promise<HermesSessionPage> {
+  const params = new URLSearchParams({
+    source,
+    offset: String(offset),
+    limit: String(limit),
+  })
+  if (profile) params.set('profile', profile)
+  return request<HermesSessionPage>(`/api/hermes/sessions/hermes?${params}`)
 }
 
 export async function searchSessions(q: string, source?: string, limit?: number, profile?: string): Promise<SessionSearchResult[]> {
@@ -258,7 +429,7 @@ export async function fetchSessionMessagesPage(
 }
 
 /**
- * Fetch Hermes session detail only (exclude api_server source)
+ * Fetch Hermes History session detail, including API Server source.
  */
 export async function fetchHermesSession(id: string, profile?: string | null): Promise<SessionDetail | null> {
   try {
@@ -364,6 +535,13 @@ export async function setSessionWorkspace(id: string, workspace: string | null):
   }
 }
 
+export async function setSessionCategory(id: string, categoryId: number | null): Promise<void> {
+  await request(`/api/hermes/sessions/${encodeURIComponent(id)}/category`, {
+    method: 'POST',
+    body: JSON.stringify({ categoryId }),
+  })
+}
+
 export async function setSessionModel(id: string, model: string, provider: string, apiMode?: ProviderApiMode): Promise<boolean> {
   try {
     await request(`/api/hermes/sessions/${id}/model`, {
@@ -386,7 +564,14 @@ export async function exportSession(id: string, mode: 'full' | 'compressed' = 'f
   const contentDisposition = res.headers.get('Content-Disposition') || ''
   let filename = `session_${id}.${ext}`
   const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?([^;\n]+)/i)
-  if (match) filename = decodeURIComponent(match[1].replace(/"/g, ''))
+  if (match) {
+    const dispositionFilename = match[1].replace(/"/g, '')
+    try {
+      filename = decodeURIComponent(dispositionFilename)
+    } catch {
+      filename = dispositionFilename
+    }
+  }
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = filename
@@ -406,6 +591,15 @@ export interface UsageStatsResponse {
   period_days?: number
   model_usage: Array<{
     model: string
+    input_tokens: number
+    output_tokens: number
+    cache_read_tokens: number
+    cache_write_tokens: number
+    reasoning_tokens: number
+    sessions: number
+  }>
+  agent_usage?: Array<{
+    agent: string
     input_tokens: number
     output_tokens: number
     cache_read_tokens: number

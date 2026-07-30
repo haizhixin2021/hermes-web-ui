@@ -25,6 +25,7 @@ vi.mock('@/api/hermes/chat', () => ({
   onPeerUserMessage: vi.fn(() => vi.fn()),
   onSessionCommand: vi.fn(() => vi.fn()),
   onSessionTitleUpdated: vi.fn(() => vi.fn()),
+  onSessionWorkspaceUpdated: vi.fn(() => vi.fn()),
 }))
 
 vi.mock('@/api/client', () => ({
@@ -36,6 +37,8 @@ vi.mock('@/api/hermes/sessions', () => ({
   deleteSession: sessionsApi.deleteSession,
   fetchSessionMessagesPage: sessionsApi.fetchSessionMessagesPage,
   fetchSessions: sessionsApi.fetchSessions,
+  fetchWorkspaceRunChangesForSession: vi.fn(async () => []),
+  fetchWorkspaceRunChangeFile: vi.fn(async () => null),
   setSessionModel: sessionsApi.setSessionModel,
 }))
 
@@ -132,6 +135,39 @@ describe('chat store reasoning/tool boundaries', () => {
       content: 'After tool.',
       isStreaming: true,
     }))
+  })
+
+  it('uses interim assistant text as authoritative and seals each segment', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    await store.sendMessage('verify the result')
+
+    const onEvent = chatApi.startRunViaSocket.mock.calls[0][1] as (event: RunEvent) => void
+    onEvent({ event: 'run.started', session_id: 'session-1' })
+    onEvent({ event: 'message.delta', session_id: 'session-1', delta: 'partial' })
+    onEvent({
+      event: 'message.interim',
+      session_id: 'session-1',
+      text: 'partial answer',
+      already_streamed: true,
+    })
+    onEvent({
+      event: 'message.interim',
+      session_id: 'session-1',
+      text: 'callback-only commentary',
+      already_streamed: false,
+    })
+    onEvent({ event: 'message.delta', session_id: 'session-1', delta: 'final answer' })
+
+    expect(store.messages.filter(message => message.role === 'assistant')).toEqual([
+      expect.objectContaining({ content: 'partial answer', isStreaming: false }),
+      expect.objectContaining({ content: 'callback-only commentary', isStreaming: false }),
+      expect.objectContaining({ content: 'final answer', isStreaming: true }),
+    ])
   })
 
   it('renders MoA reference and aggregating events as tools before the final assistant message', async () => {
@@ -514,6 +550,33 @@ describe('chat store reasoning/tool boundaries', () => {
     expect(body.reasoning_effort).toBeUndefined()
   })
 
+  it('sends the hidden API mode when starting a scoped Ekko Agent run', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.source = 'coding_agent'
+    session.agent = 'ekko-agent'
+    session.codingAgentId = 'ekko-agent'
+    session.codingAgentMode = 'scoped'
+    session.provider = 'custom:fun-codex'
+    session.model = 'gpt-5.5'
+    session.baseUrl = 'https://api.apikey.fun/v1'
+    session.apiMode = 'codex_responses'
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    await store.sendMessage('check the weather')
+
+    expect(chatApi.startRunViaSocket.mock.calls[0][0]).toEqual(expect.objectContaining({
+      source: 'coding_agent',
+      coding_agent_id: 'ekko-agent',
+      mode: 'scoped',
+      provider: 'custom:fun-codex',
+      model: 'gpt-5.5',
+      apiMode: 'codex_responses',
+    }))
+  })
+
   it('clears stale coding-agent runtime credentials when switching providers', async () => {
     const store = useChatStore()
     const session = makeSession()
@@ -546,6 +609,35 @@ describe('chat store reasoning/tool boundaries', () => {
     expect(session.apiMode).toBe('chat_completions')
   })
 
+  it('keeps a local-only session workspace when switching models before the first message', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.isLocalOnly = true
+    session.workspace = 'D:\\projects\\hermes'
+    session.provider = 'deepseek'
+    session.model = 'deepseek-chat'
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    const ok = await store.switchSessionModel('deepseek-reasoner', 'deepseek', 'session-1')
+
+    expect(ok).toBe(true)
+    expect(sessionsApi.setSessionModel).not.toHaveBeenCalled()
+    expect(session.model).toBe('deepseek-reasoner')
+    expect(session.provider).toBe('deepseek')
+    expect(session.workspace).toBe('D:\\projects\\hermes')
+    expect(session.isLocalOnly).toBe(true)
+
+    await store.sendMessage('inspect this workspace')
+
+    expect(chatApi.startRunViaSocket.mock.calls[0][0]).toEqual(expect.objectContaining({
+      session_id: 'session-1',
+      model: 'deepseek-reasoner',
+      provider: 'deepseek',
+      workspace: 'D:\\projects\\hermes',
+    }))
+  })
 
   it('preserves a scoped coding-agent API mode when reselecting the same provider', async () => {
     const store = useChatStore()

@@ -1,5 +1,5 @@
 import * as hermesCli from '../../services/hermes/hermes-cli'
-import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb, getSessionDetailFromDbWithProfile, getSessionDetailPaginatedFromDbWithProfile, getExactSessionDetailFromDbWithProfile } from '../../db/hermes/sessions-db'
+import { listSessionSummaries, listSessionSummaryGroups, getUsageStatsFromDb, getSessionDetailFromDb, getSessionDetailFromDbWithProfile, getSessionDetailPaginatedFromDbWithProfile, getExactSessionDetailFromDbWithProfile } from '../../db/hermes/sessions-db'
 import {
   listSessions as localListSessions,
   searchSessions as localSearchSessions,
@@ -13,13 +13,30 @@ import {
   updateSession as localUpdateSession,
   updateSessionStats as localUpdateSessionStats,
 } from '../../db/hermes/session-store'
-import { ExportCompressor } from '../../lib/context-compressor/export-compressor'
-import { deleteUsage, getUsage, getUsageBatch } from '../../db/hermes/usage-store'
-import type { UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
+import { buildDbExportHistory, ExportCompressor } from '../../lib/context-compressor/export-compressor'
+import { getLocalUsageStats, getRecordedUsageSessionIds, getUsage, getUsageBatch } from '../../db/hermes/usage-store'
+import {
+  SESSION_CATEGORY_NAME_MAX_LENGTH,
+  createSessionCategory,
+  deleteSessionCategory,
+  findSessionCategoryByName,
+  getSessionCategory,
+  listSessionCategories,
+  normalizeSessionCategoryName,
+  renameSessionCategory,
+  setSessionCategory,
+} from '../../db/hermes/session-category-store'
+import type { UsageStatsAgentRow, UsageStatsModelRow, UsageStatsDailyRow } from '../../db/hermes/usage-store'
 import { deleteWorkspaceRunChangesForSession, getWorkspaceRunChangeFile as getWorkspaceRunChangeFileFromDb, listWorkspaceRunChangesForSession } from '../../db/hermes/workspace-run-changes-store'
 import { getModelContextLength } from '../../services/hermes/model-context'
-import { getActiveProfileName, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
-import { isNearestExistingRealPathWithin, isPathWithin, isRealPathWithin } from '../../services/hermes/hermes-path'
+import { getActiveProfileDir, getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../../services/hermes/hermes-profile'
+import { isNearestExistingRealPathWithin, isPathWithin, relativePathFromBase } from '../../services/hermes/hermes-path'
+import {
+  isWorkspaceListPathAllowed,
+  normalizeWindowsWorkspacePath,
+  useWindowsDriveWorkspaceMode,
+  workspaceBaseOverride,
+} from '../../services/hermes/workspace-path'
 import { getGroupChatServer } from '../../routes/hermes/group-chat'
 import { logger } from '../../services/logger'
 import type { ConversationSummary } from '../../services/hermes/conversations'
@@ -27,10 +44,11 @@ import { listUserProfiles } from '../../db/hermes/users-store'
 import { readConfigYamlForProfile } from '../../services/config-helpers'
 import { codingAgentRunManager } from '../../services/agent-runner/coding-agent-run-manager'
 import { AgentBridgeClient, getAgentBridgeManager } from '../../services/hermes/agent-bridge'
-import { ensureHermesRunWorkspace } from '../../services/hermes/run-chat/workspace'
-import { isSensitivePath, MAX_EDIT_SIZE } from '../../services/hermes/file-provider'
-import { readFile, stat as fsStat, writeFile } from 'fs/promises'
-import { normalize as pathNormalize, resolve as pathResolve, win32 as pathWin32 } from 'path'
+import { defaultHermesWorkspace, ensureHermesRunWorkspace } from '../../services/hermes/run-chat/workspace'
+import { isSensitivePath, MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, validatePath } from '../../services/hermes/file-provider'
+import { buildFileContentHeaders, getFilePreviewDescriptor } from '../../services/hermes/file-preview'
+import { copyFile, mkdir, readFile, readdir, rename as fsRename, rm as fsRm, stat as fsStat, writeFile } from 'fs/promises'
+import { relative, normalize as pathNormalize, resolve as pathResolve } from 'path'
 
 function getPendingDeletedSessionIds(): Set<string> {
   return getGroupChatServer()?.getStorage().getPendingDeletedSessionIds() || new Set<string>()
@@ -125,8 +143,61 @@ function isRequestedSessionSource(source: string | undefined, sessionSource?: st
   return isVisibleWebUiSessionSource(sessionSource)
 }
 
+function requestedSessionSources(source?: string): string[] {
+  if (source === 'global_agent') return ['global_agent']
+  if (source === 'workflow') return ['workflow']
+  return ['api_server', 'cli', 'coding_agent', 'global_agent']
+}
+
 function isHermesHistorySessionSource(source?: string | null): boolean {
-  return source !== 'api_server' && source !== 'global_agent' && source !== 'workflow'
+  return source !== 'global_agent' && source !== 'workflow'
+}
+
+function sessionLastActive(session: any): number {
+  return Number(session?.last_active || session?.ended_at || session?.started_at || 0)
+}
+
+function compareSessionsNewestFirst(a: any, b: any): number {
+  const activityDelta = sessionLastActive(b) - sessionLastActive(a)
+  if (activityDelta !== 0) return activityDelta
+  return String(b?.id || '').localeCompare(String(a?.id || ''))
+}
+
+function mergeHermesHistorySessions(
+  ctx: any,
+  profile: string | undefined,
+  hermesSessions: any[],
+  localSessions: any[],
+  source?: string,
+): any[] {
+  const importedIds = new Set(localSessions.map(session => session.id))
+  const historySessionsById = new Map<string, any>()
+  // Keep Hermes Agent state.db as the canonical summary when both stores have
+  // the same id. Hermes Studio contributes import/archive state and local-only
+  // coding-agent sessions without replacing the Agent-owned session fields.
+  for (const session of hermesSessions) {
+    historySessionsById.set(session.id, {
+      ...(profile ? { ...session, profile } : session),
+      webui_imported: importedIds.has(session.id),
+    })
+  }
+
+  const localSessionsById = new Map(localSessions.map(session => [session.id, session]))
+  for (const [id, session] of historySessionsById) {
+    const localSession = localSessionsById.get(id)
+    if (localSession?.is_archived != null) session.is_archived = localSession.is_archived
+  }
+
+  for (const session of localSessions) {
+    if (historySessionsById.has(session.id)) continue
+    if (!isArchivedSession(session) && !isHermesHistorySessionSource(session.source)) continue
+    historySessionsById.set(session.id, { ...session, webui_imported: true })
+  }
+
+  return filterPendingDeletedSessions(filterByAllowedProfiles(ctx, [...historySessionsById.values()]).filter(session =>
+    (!source || session.source === source) &&
+    (isHermesHistorySessionSource(session.source) || (isArchivedSession(session) && session.source !== 'global_agent')),
+  ))
 }
 
 function isCodingAgentSession(session?: { source?: string | null; agent?: string | null; agent_session_id?: string | null } | null): boolean {
@@ -395,6 +466,75 @@ export async function list(ctx: any) {
   }
 }
 
+export async function listCategories(ctx: any) {
+  ctx.body = { categories: listSessionCategories() }
+}
+
+export async function createCategory(ctx: any) {
+  const body = ctx.request.body as { name?: string }
+  const name = normalizeSessionCategoryName(body?.name)
+  if (!name) {
+    ctx.status = 400
+    ctx.body = { error: 'Category name is required' }
+    return
+  }
+  if (name.length > SESSION_CATEGORY_NAME_MAX_LENGTH) {
+    ctx.status = 400
+    ctx.body = { error: `Category name must be ${SESSION_CATEGORY_NAME_MAX_LENGTH} characters or fewer` }
+    return
+  }
+  ctx.body = { category: createSessionCategory(name) }
+}
+
+export async function renameCategory(ctx: any) {
+  const categoryId = Number(ctx.params.id)
+  if (!Number.isSafeInteger(categoryId) || categoryId <= 0 || !getSessionCategory(categoryId)) {
+    ctx.status = 404
+    ctx.body = { error: 'Category not found' }
+    return
+  }
+  const body = ctx.request.body as { name?: string }
+  const name = normalizeSessionCategoryName(body?.name)
+  if (!name) {
+    ctx.status = 400
+    ctx.body = { error: 'Category name is required' }
+    return
+  }
+  if (name.length > SESSION_CATEGORY_NAME_MAX_LENGTH) {
+    ctx.status = 400
+    ctx.body = { error: `Category name must be ${SESSION_CATEGORY_NAME_MAX_LENGTH} characters or fewer` }
+    return
+  }
+  const duplicate = findSessionCategoryByName(name)
+  if (duplicate && duplicate.id !== categoryId) {
+    ctx.status = 409
+    ctx.body = { error: 'A category with this name already exists' }
+    return
+  }
+  const category = renameSessionCategory(categoryId, name)
+  if (!category) {
+    ctx.status = 404
+    ctx.body = { error: 'Category not found' }
+    return
+  }
+  ctx.body = { category }
+}
+
+export async function removeCategory(ctx: any) {
+  const categoryId = Number(ctx.params.id)
+  if (!Number.isSafeInteger(categoryId) || categoryId <= 0 || !getSessionCategory(categoryId)) {
+    ctx.status = 404
+    ctx.body = { error: 'Category not found' }
+    return
+  }
+  if (!deleteSessionCategory(categoryId)) {
+    ctx.status = 404
+    ctx.body = { error: 'Category not found' }
+    return
+  }
+  ctx.body = { ok: true }
+}
+
 export async function count(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const profile = explicitProfileFilter(ctx)
@@ -408,51 +548,86 @@ export async function count(ctx: any) {
 }
 
 /**
- * List Hermes sessions only (exclude api_server source)
+ * List Hermes History sessions, including Web UI/API Server sessions.
  * GET /api/hermes/sessions/hermes?source=&limit=
  */
 export async function listHermesSessions(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
+  const offset = ctx.query.offset ? parseInt(ctx.query.offset as string, 10) : 0
   const profile = requestedProfile(ctx)
   const effectiveLimit = limit && limit > 0 ? limit : 2000
+  const normalizedOffset = Number.isFinite(offset) && offset > 0 ? offset : 0
+  const paginated = Boolean(source) || normalizedOffset > 0
+  const candidateLimit = paginated ? normalizedOffset + effectiveLimit + 1 : effectiveLimit
+  const localSessions = localListSessions(profile, source, candidateLimit)
+  const allSessions = await listSessionSummaries(source, candidateLimit, profile)
+  const merged = mergeHermesHistorySessions(ctx, profile, allSessions, localSessions, source)
 
-  const localSessions = localListSessions(profile, undefined, effectiveLimit)
-  const importedIds = new Set(localSessions.map(session => session.id))
-  const allSessions = (await listSessionSummaries(source, effectiveLimit, profile))
-    .map(session => ({
-      ...(profile ? { ...session, profile } : session),
-      webui_imported: importedIds.has(session.id),
-    }))
-  const historySessionsById = new Map<string, any>()
-  for (const session of allSessions) historySessionsById.set(session.id, session)
-
-  // Hermes state.db does not carry Web UI local archive state. When a CLI or
-  // api_server session exists in both databases, the state.db row is inserted
-  // first and would otherwise hide the local `is_archived` flag from History,
-  // preventing archived sessions from rendering the unarchive action.
-  const localSessionsById = new Map(localSessions.map(session => [session.id, session]))
-  for (const [id, session] of historySessionsById) {
-    const localSession = localSessionsById.get(id)
-    if (localSession?.is_archived != null) {
-      session.is_archived = localSession.is_archived
+  if (paginated) {
+    const sorted = [...merged].sort(compareSessionsNewestFirst)
+    const sessions = sorted.slice(normalizedOffset, normalizedOffset + effectiveLimit)
+    ctx.body = {
+      sessions,
+      hasMore: sorted.length > normalizedOffset + sessions.length,
+      offset: normalizedOffset,
+      limit: effectiveLimit,
     }
+    return
   }
 
-  for (const session of localSessions) {
-    if (historySessionsById.has(session.id)) continue
-    // Surface local-only sessions that are absent from the Hermes state.db
-    // (e.g. coding_agent runs started via the Web UI such as Claude Code /
-    // Codex). Without this, the History view cannot list or open them, and the
-    // chat panel's "view in history" link dead-ends to an empty list.
-    if (!isArchivedSession(session) && !isHermesHistorySessionSource(session.source)) continue
-    historySessionsById.set(session.id, { ...session, webui_imported: true })
-  }
   ctx.body = {
-    sessions: filterPendingDeletedSessions(filterByAllowedProfiles(ctx, [...historySessionsById.values()]).filter(s =>
-      isHermesHistorySessionSource(s.source) || (isArchivedSession(s) && s.source !== 'global_agent'),
-    )),
+    sessions: merged,
   }
+}
+
+/**
+ * List the first page of each Hermes History source group.
+ * GET /api/hermes/sessions/hermes/groups?limit=&include=&profile=
+ */
+export async function listHermesSessionGroups(ctx: any) {
+  const requestedLimit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : 20
+  const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 20
+  const profile = requestedProfile(ctx)
+  const rawIncluded = ctx.query.include
+  const includedIds = (Array.isArray(rawIncluded) ? rawIncluded : rawIncluded ? [rawIncluded] : [])
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+    .slice(0, 100)
+
+  const [hermesResult, localSessions] = await Promise.all([
+    listSessionSummaryGroups(limit, profile, includedIds),
+    Promise.resolve(localListSessions(profile, undefined, 2000)),
+  ])
+  const hermesGroups = new Map(hermesResult.groups.map(group => [group.source, group]))
+  const sources = new Set([
+    ...hermesGroups.keys(),
+    ...localSessions.map(session => session.source).filter(Boolean),
+  ])
+  const groups: Array<{ source: string; sessions: any[]; hasMore: boolean }> = []
+
+  for (const source of sources) {
+    const hermesGroup = hermesGroups.get(source)
+    const localSourceSessions = localSessions.filter(session => session.source === source)
+    const merged = mergeHermesHistorySessions(
+      ctx,
+      profile,
+      hermesGroup?.sessions || [],
+      localSourceSessions,
+      source,
+    ).sort(compareSessionsNewestFirst)
+    const sessions = merged.slice(0, limit)
+    if (sessions.length === 0) continue
+    groups.push({
+      source,
+      sessions,
+      hasMore: Boolean(hermesGroup?.hasMore) || merged.length > sessions.length,
+    })
+  }
+
+  const localIncluded = localSessions.filter(session => includedIds.includes(session.id))
+  const included = mergeHermesHistorySessions(ctx, profile, hermesResult.included, localIncluded)
+  ctx.body = { groups, included }
 }
 
 export async function search(ctx: any) {
@@ -460,8 +635,22 @@ export async function search(ctx: any) {
   const source = (ctx.query.source as string) || undefined
   const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : undefined
   const profile = explicitProfileFilter(ctx)
-  const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20)
-  const knownProfiles = profile ? null : new Set(listProfileNamesFromDisk())
+  const allowedProfiles = allowedProfileSet(ctx)
+  if (profile && allowedProfiles && !allowedProfiles.has(profile)) {
+    ctx.body = { results: [] }
+    return
+  }
+  const searchableProfiles = profile
+    ? undefined
+    : listProfileNamesFromDisk().filter(name => !allowedProfiles || allowedProfiles.has(name))
+  const pendingDeletedIds = [...getPendingDeletedSessionIds()]
+  const results = localSearchSessions(profile, q, limit && limit > 0 ? limit : 20, {
+    sources: requestedSessionSources(source),
+    profiles: searchableProfiles,
+    includeArchived: false,
+    excludeSessionIds: pendingDeletedIds,
+  })
+  const knownProfiles = profile ? null : new Set(searchableProfiles)
   ctx.body = {
     results: filterPendingDeletedSessions(filterArchivedSessions(filterByAllowedProfiles(ctx, results).filter(s =>
       isRequestedSessionSource(source, s.source) &&
@@ -515,8 +704,9 @@ export async function getWorkspaceRunChangeFile(ctx: any) {
   ctx.body = { file }
 }
 
-function normalizeWorkspaceRelativePath(value: unknown): string {
+function normalizeWorkspaceRelativePath(value: unknown, options: { allowEmpty?: boolean } = {}): string {
   const raw = typeof value === 'string' ? value.trim() : ''
+  if (!raw && options.allowEmpty) return ''
   if (!raw) throw Object.assign(new Error('Missing path parameter'), { code: 'missing_path', status: 400 })
   if (raw.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(raw)) {
     throw Object.assign(new Error('Invalid file path'), { code: 'invalid_path', status: 400 })
@@ -528,18 +718,80 @@ function normalizeWorkspaceRelativePath(value: unknown): string {
   return normalized
 }
 
-function resolveSessionWorkspaceFile(ctx: any, relativePathValue: unknown): { session: ReturnType<typeof localGetSession>; relativePath: string; fullPath: string; workspace: string } {
+function workspaceRelativePath(workspace: string, fullPath: string): string {
+  return relative(workspace, fullPath).replace(/\\/g, '/')
+}
+
+function sessionWorkspacePrefix(workspace: string, profile?: string | null): string {
+  const profileDir = profile ? getProfileDir(profile) : getActiveProfileDir()
+  return relativePathFromBase(workspace, profileDir) || ''
+}
+
+function normalizeSessionWorkspaceRelativePath(
+  workspace: string,
+  profile: string | null | undefined,
+  value: unknown,
+  options: { allowEmpty?: boolean } = {},
+): string {
+  const normalized = normalizeWorkspaceRelativePath(value, options)
+  const prefix = sessionWorkspacePrefix(workspace, profile)
+  if (!prefix) return normalized
+  if (normalized === prefix) return ''
+  return normalized.startsWith(`${prefix}/`) ? normalized.slice(prefix.length + 1) : normalized
+}
+
+async function resolveSessionWorkspacePath(
+  ctx: any,
+  relativePathValue: unknown,
+  options: { allowEmpty?: boolean } = {},
+): Promise<{ session: NonNullable<ReturnType<typeof localGetSession>>; relativePath: string; fullPath: string; workspace: string }> {
   const session = localGetSession(ctx.params.id)
   if (!session) throw Object.assign(new Error('Session not found'), { code: 'not_found', status: 404 })
   if (denySessionAccess(ctx, session)) throw Object.assign(new Error('Forbidden'), { code: 'forbidden', status: 403, handled: true })
   const workspace = String(session.workspace || '').trim()
   if (!workspace) throw Object.assign(new Error('Session workspace not found'), { code: 'workspace_not_found', status: 404 })
-  const relativePath = normalizeWorkspaceRelativePath(relativePathValue)
+  const relativePath = normalizeSessionWorkspaceRelativePath(workspace, session.profile, relativePathValue, options)
   const fullPath = pathResolve(workspace, relativePath)
-  if (!isPathWithin(fullPath, workspace)) {
+  if (!isPathWithin(fullPath, workspace) || !await isNearestExistingRealPathWithin(fullPath, workspace)) {
     throw Object.assign(new Error('Invalid file path'), { code: 'invalid_path', status: 400 })
   }
   return { session, relativePath, fullPath, workspace }
+}
+
+async function resolveSessionWorkspaceFile(ctx: any, relativePathValue: unknown) {
+  return resolveSessionWorkspacePath(ctx, relativePathValue)
+}
+
+async function resolveSessionPreviewFile(ctx: any, pathValue: unknown) {
+  const rawPath = typeof pathValue === 'string' ? pathValue.trim() : ''
+  const isAbsolutePath = rawPath.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rawPath)
+  if (!isAbsolutePath) return resolveSessionWorkspaceFile(ctx, pathValue)
+
+  const session = localGetSession(ctx.params.id)
+  if (!session) throw Object.assign(new Error('Session not found'), { code: 'not_found', status: 404 })
+  if (denySessionAccess(ctx, session)) throw Object.assign(new Error('Forbidden'), { code: 'forbidden', status: 403, handled: true })
+
+  const fullPath = validatePath(rawPath)
+  const roots = [
+    String(session.workspace || '').trim(),
+    defaultHermesWorkspace(String(session.profile || 'default')),
+  ].filter(Boolean)
+
+  for (const root of roots) {
+    if (isPathWithin(fullPath, root) && await isNearestExistingRealPathWithin(fullPath, root)) {
+      return {
+        session,
+        relativePath: workspaceRelativePath(root, fullPath),
+        fullPath,
+        workspace: root,
+      }
+    }
+  }
+
+  throw Object.assign(new Error('File is outside the session and Hermes workspaces'), {
+    code: 'invalid_path',
+    status: 400,
+  })
 }
 
 function handleWorkspaceFileError(ctx: any, err: any): void {
@@ -549,9 +801,41 @@ function handleWorkspaceFileError(ctx: any, err: any): void {
   ctx.body = { error: err?.message || 'Failed to access workspace file', code: err?.code || 'workspace_file_error' }
 }
 
+export async function listWorkspaceFiles(ctx: any) {
+  try {
+    const { relativePath, fullPath, workspace } = await resolveSessionWorkspacePath(ctx, ctx.query.path, { allowEmpty: true })
+    const info = await fsStat(fullPath)
+    if (!info.isDirectory()) {
+      ctx.status = 400
+      ctx.body = { error: 'Not a directory', code: 'not_a_directory' }
+      return
+    }
+    const entries = await readdir(fullPath, { withFileTypes: true })
+    const mapped = await Promise.all(entries.map(async entry => {
+      const entryFullPath = pathResolve(fullPath, entry.name)
+      const stat = await fsStat(entryFullPath)
+      return {
+        name: entry.name,
+        path: workspaceRelativePath(workspace, entryFullPath),
+        absolutePath: entryFullPath,
+        isDir: stat.isDirectory(),
+        size: stat.size,
+        modTime: stat.mtime.toISOString(),
+      }
+    }))
+    mapped.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+    ctx.body = { entries: mapped, path: relativePath, absolutePath: fullPath }
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
 export async function readWorkspaceFile(ctx: any) {
   try {
-    const { relativePath, fullPath } = resolveSessionWorkspaceFile(ctx, ctx.query.path)
+    const { relativePath, fullPath } = await resolveSessionWorkspaceFile(ctx, ctx.query.path)
     const info = await fsStat(fullPath)
     if (!info.isFile()) {
       ctx.status = 400
@@ -570,10 +854,60 @@ export async function readWorkspaceFile(ctx: any) {
   }
 }
 
+export async function readWorkspaceFileContent(ctx: any) {
+  try {
+    const { relativePath, fullPath } = await resolveSessionPreviewFile(ctx, ctx.query.path)
+    const info = await fsStat(fullPath)
+    if (!info.isFile()) {
+      ctx.status = 400
+      ctx.body = { error: 'Not a file', code: 'not_a_file' }
+      return
+    }
+
+    const download = String(ctx.query?.download || '') === '1'
+    const textPreview = String(ctx.query?.text || '') === '1'
+    const descriptor = getFilePreviewDescriptor(relativePath)
+    if (!download && !textPreview && !descriptor) {
+      ctx.status = 415
+      ctx.body = { error: 'File type is not supported for preview', code: 'unsupported_preview' }
+      return
+    }
+    const maxBytes = download ? MAX_DOWNLOAD_SIZE : textPreview ? MAX_EDIT_SIZE : descriptor!.maxBytes
+    if (info.size > maxBytes) {
+      ctx.status = 413
+      ctx.body = {
+        error: download ? 'File too large to download' : 'File too large to preview',
+        code: 'file_too_large',
+      }
+      return
+    }
+
+    const data = await readFile(fullPath)
+    if (data.length > maxBytes) {
+      ctx.status = 413
+      ctx.body = {
+        error: download ? 'File too large to download' : 'File too large to preview',
+        code: 'file_too_large',
+      }
+      return
+    }
+    const headers = buildFileContentHeaders({
+      fileName: relativePath,
+      mime: textPreview ? 'text/plain; charset=utf-8' : descriptor?.mime || 'application/octet-stream',
+      size: data.length,
+      download,
+    })
+    for (const [name, value] of Object.entries(headers)) ctx.set(name, value)
+    ctx.body = data
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
 export async function writeWorkspaceFile(ctx: any) {
   const body = ctx.request.body as { path?: unknown; content?: unknown }
   try {
-    const { relativePath, fullPath } = resolveSessionWorkspaceFile(ctx, body?.path)
+    const { relativePath, fullPath } = await resolveSessionWorkspaceFile(ctx, body?.path)
     if (isSensitivePath(relativePath)) {
       ctx.status = 403
       ctx.body = { error: 'Cannot modify sensitive file', code: 'permission_denied' }
@@ -588,6 +922,78 @@ export async function writeWorkspaceFile(ctx: any) {
     }
     await writeFile(fullPath, data)
     ctx.body = { ok: true, path: relativePath }
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
+export async function mkdirWorkspaceFile(ctx: any) {
+  const body = ctx.request.body as { path?: unknown }
+  try {
+    const { fullPath } = await resolveSessionWorkspaceFile(ctx, body?.path)
+    await mkdir(fullPath, { recursive: true })
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
+export async function deleteWorkspaceFile(ctx: any) {
+  const body = ctx.request.body as { path?: unknown; recursive?: unknown }
+  try {
+    const { relativePath, fullPath } = await resolveSessionWorkspaceFile(ctx, body?.path)
+    if (isSensitivePath(relativePath)) {
+      ctx.status = 403
+      ctx.body = { error: 'Cannot delete sensitive file', code: 'permission_denied' }
+      return
+    }
+    const info = await fsStat(fullPath)
+    if (info.isDirectory()) {
+      await fsRm(fullPath, { recursive: Boolean(body?.recursive), force: false })
+    } else {
+      await fsRm(fullPath)
+    }
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
+export async function renameWorkspaceFile(ctx: any) {
+  const body = ctx.request.body as { oldPath?: unknown; newPath?: unknown }
+  try {
+    const oldTarget = await resolveSessionWorkspaceFile(ctx, body?.oldPath)
+    const newTarget = await resolveSessionWorkspaceFile(ctx, body?.newPath)
+    if (isSensitivePath(oldTarget.relativePath) || isSensitivePath(newTarget.relativePath)) {
+      ctx.status = 403
+      ctx.body = { error: 'Cannot rename sensitive file', code: 'permission_denied' }
+      return
+    }
+    await fsRename(oldTarget.fullPath, newTarget.fullPath)
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    handleWorkspaceFileError(ctx, err)
+  }
+}
+
+export async function copyWorkspaceFile(ctx: any) {
+  const body = ctx.request.body as { srcPath?: unknown; destPath?: unknown }
+  try {
+    const srcTarget = await resolveSessionWorkspaceFile(ctx, body?.srcPath)
+    const destTarget = await resolveSessionWorkspaceFile(ctx, body?.destPath)
+    if (isSensitivePath(destTarget.relativePath)) {
+      ctx.status = 403
+      ctx.body = { error: 'Cannot overwrite sensitive file', code: 'permission_denied' }
+      return
+    }
+    const info = await fsStat(srcTarget.fullPath)
+    if (!info.isFile()) {
+      ctx.status = 400
+      ctx.body = { error: 'Not a file', code: 'not_a_file' }
+      return
+    }
+    await copyFile(srcTarget.fullPath, destTarget.fullPath)
+    ctx.body = { ok: true }
   } catch (err: any) {
     handleWorkspaceFileError(ctx, err)
   }
@@ -643,7 +1049,7 @@ export async function getContext(ctx: any) {
 }
 
 /**
- * Get Hermes session detail only (exclude api_server source)
+ * Get Hermes History session detail, including Web UI/API Server sessions.
  * GET /api/hermes/sessions/hermes/:id
  */
 export async function getHermesSession(ctx: any) {
@@ -796,7 +1202,6 @@ export async function remove(ctx: any) {
     ctx.body = { error: 'Failed to delete session' }
     return
   }
-  deleteUsage(sessionId)
   deleteWorkspaceRunChangesForSession(sessionId)
   ctx.body = { ok: true, deleted: Boolean(existing), hermes }
 }
@@ -872,7 +1277,6 @@ export async function batchRemove(ctx: any) {
     if (shouldDeleteLocal) {
       const ok = localDeleteSession(id)
       if (ok) {
-        deleteUsage(id)
         deleteWorkspaceRunChangesForSession(id)
         results.deleted++
       } else {
@@ -986,6 +1390,40 @@ export async function setWorkspace(ctx: any) {
   ctx.body = { ok: true }
 }
 
+export async function setCategory(ctx: any) {
+  const existing = localGetSession(ctx.params.id)
+  if (!existing) {
+    ctx.status = 404
+    ctx.body = { error: 'Session not found' }
+    return
+  }
+  if (denySessionAccess(ctx, existing)) return
+
+  const body = (ctx.request.body || {}) as { categoryId?: number | null; category_id?: number | null }
+  const rawCategoryId = body.categoryId ?? body.category_id
+  let categoryId: number | null = null
+  if (rawCategoryId !== null && rawCategoryId !== undefined) {
+    categoryId = Number(rawCategoryId)
+    if (!Number.isSafeInteger(categoryId) || categoryId <= 0) {
+      ctx.status = 400
+      ctx.body = { error: 'categoryId must be a positive integer or null' }
+      return
+    }
+    if (!getSessionCategory(categoryId)) {
+      ctx.status = 404
+      ctx.body = { error: 'Category not found' }
+      return
+    }
+  }
+
+  if (!setSessionCategory(ctx.params.id, categoryId)) {
+    ctx.status = 500
+    ctx.body = { error: 'Failed to update session category' }
+    return
+  }
+  ctx.body = { ok: true, category_id: categoryId }
+}
+
 type SessionProviderApiMode = 'chat_completions' | 'codex_responses' | 'anthropic_messages'
 
 function normalizeSessionApiMode(value: unknown): SessionProviderApiMode | undefined {
@@ -1050,7 +1488,10 @@ export async function contextLength(ctx: any) {
 export async function usageStats(ctx: any) {
   const rawDays = parseInt(String(ctx.query?.days ?? '30'), 10)
   const days = Number.isFinite(rawDays) && rawDays > 0 ? Math.min(rawDays, 365) : 30
-  const profile = requestedProfile(ctx)
+  const profile = requestedProfile(ctx) || getActiveProfileName()
+
+  const local = getLocalUsageStats(profile, days)
+  const localSessionIds = getRecordedUsageSessionIds(profile)
 
   let hermes = {
     input_tokens: 0,
@@ -1060,15 +1501,58 @@ export async function usageStats(ctx: any) {
     reasoning_tokens: 0,
     sessions: 0,
     by_model: [] as UsageStatsModelRow[],
+    by_agent: [] as UsageStatsAgentRow[],
     by_day: [] as UsageStatsDailyRow[],
     cost: 0,
     total_api_calls: 0,
   }
 
   try {
-    hermes = profile ? await getUsageStatsFromDb(days, undefined, profile) : await getUsageStatsFromDb(days)
+    hermes = await getUsageStatsFromDb(days, undefined, profile, localSessionIds)
   } catch (err) {
     logger.warn(err, 'usageStats: failed to load Hermes usage analytics from state.db')
+  }
+
+  const modelMap = new Map<string, UsageStatsModelRow>()
+  for (const row of [...local.by_model, ...hermes.by_model]) {
+    const model = row.model.trim()
+    const current = modelMap.get(model) || {
+      model,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      reasoning_tokens: 0,
+      sessions: 0,
+    }
+    current.input_tokens += row.input_tokens
+    current.output_tokens += row.output_tokens
+    current.cache_read_tokens += row.cache_read_tokens
+    current.cache_write_tokens += row.cache_write_tokens
+    current.reasoning_tokens += row.reasoning_tokens
+    current.sessions += row.sessions
+    modelMap.set(model, current)
+  }
+
+  const agentMap = new Map<string, UsageStatsAgentRow>()
+  for (const row of [...(local.by_agent || []), ...(hermes.by_agent || [])]) {
+    const agent = row.agent.trim() || 'hermes'
+    const current = agentMap.get(agent) || {
+      agent,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      reasoning_tokens: 0,
+      sessions: 0,
+    }
+    current.input_tokens += row.input_tokens
+    current.output_tokens += row.output_tokens
+    current.cache_read_tokens += row.cache_read_tokens
+    current.cache_write_tokens += row.cache_write_tokens
+    current.reasoning_tokens += row.reasoning_tokens
+    current.sessions += row.sessions
+    agentMap.set(agent, current)
   }
 
   const dayMap = new Map<string, UsageStatsDailyRow>()
@@ -1079,7 +1563,7 @@ export async function usageStats(ctx: any) {
     const key = d.toISOString().slice(0, 10)
     dayMap.set(key, { date: key, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, sessions: 0, errors: 0, cost: 0 })
   }
-  for (const d of hermes.by_day) {
+  for (const d of [...local.by_day, ...hermes.by_day]) {
     const existing = dayMap.get(d.date)
     if (existing) {
       existing.input_tokens += d.input_tokens; existing.output_tokens += d.output_tokens
@@ -1089,42 +1573,19 @@ export async function usageStats(ctx: any) {
   }
 
   ctx.body = {
-    total_input_tokens: hermes.input_tokens,
-    total_output_tokens: hermes.output_tokens,
-    total_cache_read_tokens: hermes.cache_read_tokens,
-    total_cache_write_tokens: hermes.cache_write_tokens,
-    total_reasoning_tokens: hermes.reasoning_tokens,
-    total_sessions: hermes.sessions,
-    total_cost: hermes.cost,
-    total_api_calls: hermes.total_api_calls,
+    total_input_tokens: local.input_tokens + hermes.input_tokens,
+    total_output_tokens: local.output_tokens + hermes.output_tokens,
+    total_cache_read_tokens: local.cache_read_tokens + hermes.cache_read_tokens,
+    total_cache_write_tokens: local.cache_write_tokens + hermes.cache_write_tokens,
+    total_reasoning_tokens: local.reasoning_tokens + hermes.reasoning_tokens,
+    total_sessions: local.sessions + hermes.sessions,
+    total_cost: local.cost + hermes.cost,
+    total_api_calls: local.total_api_calls + hermes.total_api_calls,
     period_days: days,
-    model_usage: hermes.by_model.sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens)),
+    model_usage: [...modelMap.values()].sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens)),
+    agent_usage: [...agentMap.values()].sort((a, b) => (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens)),
     daily_usage: [...dayMap.values()],
   }
-}
-
-function workspaceBaseOverride(): string {
-  return process.env.WORKSPACE_BASE?.trim() || ''
-}
-
-function useWindowsDriveWorkspaceMode(): boolean {
-  return process.platform === 'win32' && !workspaceBaseOverride()
-}
-
-function windowsDriveRoot(pathValue: string): string | null {
-  const match = /^([a-zA-Z]:)[\\/]?$/.exec(pathValue.trim())
-  return match ? `${match[1].toUpperCase()}\\` : null
-}
-
-function normalizeWindowsWorkspacePath(inputPath: string): { base: string; fullPath: string } | null {
-  const raw = String(inputPath || '').trim()
-  if (!/^[a-zA-Z]:[\\/]/.test(raw)) return null
-  const fullPath = pathWin32.resolve(raw)
-  const root = windowsDriveRoot(pathWin32.parse(fullPath).root)
-  if (!root) return null
-  const rel = pathWin32.relative(root, fullPath)
-  if (rel.startsWith('..') || pathWin32.isAbsolute(rel)) return null
-  return { base: root, fullPath }
 }
 
 async function listWindowsWorkspaceDrives() {
@@ -1143,23 +1604,12 @@ async function listWindowsWorkspaceDrives() {
   return drives
 }
 
-async function isWorkspaceListPathAllowed(fullPath: string, basePath: string, statFn: any): Promise<boolean> {
-  try {
-    const info = await statFn(fullPath)
-    if (!info.isDirectory()) return false
-    if (process.platform === 'win32') return true
-    return await isRealPathWithin(fullPath, basePath)
-  } catch {
-    return false
-  }
-}
-
-async function isSafeWorkspaceFolderEntry(entry: any, fullPath: string, basePath: string, statFn: any): Promise<boolean> {
+async function isSafeWorkspaceFolderEntry(entry: any, fullPath: string, basePath: string, statFn: any, options?: { trustWindowsJunctions?: boolean }): Promise<boolean> {
   if (!entry.isDirectory() && !(typeof entry.isSymbolicLink === 'function' && entry.isSymbolicLink())) {
     return false
   }
 
-  return isWorkspaceListPathAllowed(fullPath, basePath, statFn)
+  return isWorkspaceListPathAllowed(fullPath, basePath, statFn, options)
 }
 
 /**
@@ -1375,7 +1825,7 @@ export async function renameWorkspaceFolder(ctx: any) {
       ctx.body = { error: 'Path is not a directory' }
       return
     }
-    await rename(resolvedCurrent.fullPath, targetPath)
+    await fsRename(resolvedCurrent.fullPath, targetPath)
     ctx.body = { ok: true }
   } catch (err: any) {
     ctx.status = err?.code === 'EEXIST' ? 409 : err?.code === 'ENOENT' ? 404 : 500
@@ -1413,7 +1863,7 @@ export async function deleteWorkspaceFolder(ctx: any) {
       ctx.body = { error: 'Path is not a directory' }
       return
     }
-    await rm(resolvedCurrent.fullPath, { recursive: true })
+    await fsRm(resolvedCurrent.fullPath, { recursive: true })
     ctx.body = { ok: true }
   } catch (err: any) {
     ctx.status = err?.code === 'ENOENT' ? 404 : 500
@@ -1424,7 +1874,10 @@ export async function deleteWorkspaceFolder(ctx: any) {
 const exportCompressor = new ExportCompressor()
 
 export async function exportSession(ctx: any) {
-  const session = localGetSessionDetail(ctx.params.id)
+  const mode = (ctx.query.mode as string) || 'full'
+  const session = mode === 'compressed'
+    ? localGetSession(ctx.params.id)
+    : localGetSessionDetail(ctx.params.id)
 
   if (!session) {
     ctx.status = 404
@@ -1433,7 +1886,6 @@ export async function exportSession(ctx: any) {
   }
   if (denySessionAccess(ctx, session)) return
 
-  const mode = (ctx.query.mode as string) || 'full'
   const ext = (ctx.query.ext as string) || (mode === 'compressed' ? 'txt' : 'json')
   const title = session.title || 'session'
   const safeName = title.replace(/[^a-zA-Z0-9一-鿿_-]/g, '_').slice(0, 50)
@@ -1454,7 +1906,7 @@ export async function exportSession(ctx: any) {
     if (ext === 'txt') {
       ctx.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
       ctx.set('Content-Type', 'text/plain; charset=utf-8')
-      ctx.body = serializeAsText(session.title, session.messages || [])
+      ctx.body = serializeAsText(session.title, (session as any).messages || [])
     } else {
       ctx.set('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
       ctx.set('Content-Type', 'application/json')
@@ -1467,14 +1919,7 @@ async function compressSession(session: any) {
   const profile = session.profile || getActiveProfileName()
   const upstream = ''
   const apiKey = undefined
-  const messages = (session.messages || []).map((m: any) => ({
-    role: m.role,
-    content: m.content || '',
-    tool_calls: m.tool_calls,
-    tool_call_id: m.tool_call_id,
-    name: m.tool_name,
-    reasoning_content: m.reasoning,
-  }))
+  const messages = buildDbExportHistory(session.id)
 
   return exportCompressor.compress(messages, upstream, apiKey, session.id, {
     profile,
