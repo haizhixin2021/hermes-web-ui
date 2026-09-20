@@ -81,15 +81,18 @@ RUN npm ci --ignore-scripts && npm rebuild node-pty
 COPY . .
 
 RUN npm run build && npm prune --omit=dev
+RUN npm run verify:sharp-runtime
 
 ENV NODE_ENV=production
 ENV HOME=/home/agent
 ENV HERMES_HOME=/home/agent/.hermes
 ENV HERMES_WEB_UI_MANAGED_GATEWAY=1
-ENV PATH=/opt/hermes/.venv/bin:$PATH
+# Keep runtime-installed coding agent CLIs in the existing Studio data volume.
+ENV NPM_CONFIG_PREFIX=/home/agent/.hermes-web-ui/coding-agent/npm
+ENV PATH=/home/agent/.hermes-web-ui/coding-agent/npm/bin:/opt/hermes/.venv/bin:$PATH
 
 EXPOSE 6060
 
 # 强制覆盖基础镜像的默认启动脚本，让镜像本身具备独立运行的能力
-ENTRYPOINT ["node", "dist/server/index.js"]
+ENTRYPOINT ["/app/bin/start-studio-all.sh"]
 CMD []

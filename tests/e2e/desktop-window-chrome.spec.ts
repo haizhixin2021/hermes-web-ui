@@ -43,6 +43,11 @@ async function installDesktopBridge(page: Page, platform: DesktopPlatform, withB
       clearAnnotationCalls: 0,
       captureAnnotationCalls: 0,
       annotationNotes: {} as Record<number, string>,
+      removedAnnotations: [] as number[],
+      markers: [] as number[],
+      capturedMarkers: [] as number[],
+      failRemoval: false,
+      failCapture: false,
       requestAnnotation: undefined as undefined | ((request: { tabId: string; mode: 'element' | 'region' }) => void),
     }
     ;(window as typeof window & { __PW_DESKTOP_BROWSER__?: typeof browserHarness }).__PW_DESKTOP_BROWSER__ = browserHarness
@@ -75,6 +80,7 @@ async function installDesktopBridge(page: Page, platform: DesktopPlatform, withB
       annotate: async (_tabId: string, mode: 'element' | 'region') => {
         browserHarness.annotationCount += 1
         const marker = browserHarness.annotationCount
+        browserHarness.markers.push(marker)
         return {
           tabId: 'tab-1', marker, mode, url: 'about:blank', title: 'New Tab',
           viewport: { width: 800, height: 600, scaleFactor: 1 },
@@ -83,12 +89,21 @@ async function installDesktopBridge(page: Page, platform: DesktopPlatform, withB
         }
       },
       cancelAnnotation: async () => true,
+      removeAnnotation: async (_tabId: string, marker: number) => {
+        if (browserHarness.failRemoval) throw new Error('Could not remove annotation')
+        browserHarness.removedAnnotations.push(marker)
+        browserHarness.markers = browserHarness.markers.filter(value => value !== marker)
+        delete browserHarness.annotationNotes[marker]
+        return true
+      },
       updateAnnotationNote: async (_tabId: string, marker: number, note: string) => {
         browserHarness.annotationNotes[marker] = note
         return true
       },
       captureAnnotations: async () => {
+        if (browserHarness.failCapture) throw new Error('Could not capture annotations')
         browserHarness.captureAnnotationCalls += 1
+        browserHarness.capturedMarkers = [...browserHarness.markers]
         return { mediaType: 'image/png', data: '', width: 800, height: 600 }
       },
       clearAnnotations: async () => { browserHarness.clearAnnotationCalls += 1; return true },
@@ -150,11 +165,11 @@ test('places Windows controls in a dedicated bar above main content', async ({ p
 
   const controls = page.locator('.desktop-titlebar')
   const header = page.locator('.page-header')
-  const sidebar = page.locator('aside.sidebar')
+  const sidebar = page.locator('aside.hermes-config-sidebar')
   await expect(controls).toBeVisible()
   await expect(controls.locator('.desktop-window-btn')).toHaveCount(3)
   await expect(controls.locator('img')).toHaveCount(0)
-  await expect(controls).not.toContainText('Hermes Studio')
+  await expect(controls).not.toContainText('Ekko Studio')
 
   const [controlsBox, headerBox] = await Promise.all([
     controls.boundingBox(),
@@ -174,6 +189,27 @@ test('places Windows controls in a dedicated bar above main content', async ({ p
   await expect.poll(() => page.evaluate(() => (
     window as typeof window & { __PW_DESKTOP_WINDOW__?: { actions: string[] } }
   ).__PW_DESKTOP_WINDOW__?.actions)).toEqual(['toggle-maximize'])
+})
+
+test('keeps Windows controls physically stable when the app language is RTL', async ({ page }) => {
+  await openDesktopJobs(page, 'win32')
+
+  const titleBar = page.locator('.desktop-titlebar')
+  const controls = titleBar.locator('.desktop-titlebar__controls')
+  const buttonPositions = async () => controls.locator('.desktop-window-btn').evaluateAll(buttons =>
+    buttons.map(button => Math.round(button.getBoundingClientRect().left)),
+  )
+  await expect(titleBar).toBeVisible()
+  await expect(controls.locator('.desktop-window-btn')).toHaveCount(3)
+  const ltrPositions = await buttonPositions()
+
+  await page.evaluate(() => document.documentElement.setAttribute('dir', 'rtl'))
+
+  await expect(titleBar).toHaveCSS('direction', 'ltr')
+  await expect.poll(buttonPositions).toEqual(ltrPositions)
+  await expect(controls).toHaveCSS('border-left-width', '1px')
+  await expect(controls).toHaveCSS('border-right-width', '0px')
+  await expect(controls).toHaveCSS('border-top-right-radius', '12px')
 })
 
 test('matches Windows controls to the header glass over custom backgrounds', async ({ page }) => {
@@ -215,8 +251,8 @@ test('reserves the macOS traffic-light area inside the primary sidebar', async (
 
   await expect(page.locator('.desktop-titlebar')).toHaveCount(0)
   expect((await page.locator('.app-layout').boundingBox())?.y).toBe(0)
-  expect((await page.locator('aside.sidebar').boundingBox())?.y).toBe(10)
-  await expect(page.locator('aside.sidebar')).toHaveCSS('padding-top', '40px')
+  expect((await page.locator('aside.hermes-config-sidebar').boundingBox())?.y).toBe(10)
+  await expect(page.locator('aside.hermes-config-sidebar')).toHaveCSS('padding-top', '40px')
   await expect.poll(() => topGutterDragRegion(page)).toEqual({ appRegion: 'drag', height: '10px' })
 })
 
@@ -349,9 +385,93 @@ test('keeps Linux on native chrome and preserves its original sidebar spacing', 
 
   await expect(page.locator('.desktop-titlebar')).toHaveCount(0)
   expect((await page.locator('.app-layout').boundingBox())?.y).toBe(0)
-  expect((await page.locator('aside.sidebar').boundingBox())?.y).toBe(10)
-  await expect(page.locator('aside.sidebar')).toHaveCSS('padding-top', '8px')
+  expect((await page.locator('aside.hermes-config-sidebar').boundingBox())?.y).toBe(10)
+  await expect(page.locator('aside.hermes-config-sidebar')).toHaveCSS('padding-top', '8px')
   await expect.poll(() => topGutterDragRegion(page)).toEqual({ appRegion: 'none', height: 'auto' })
+})
+
+test('keeps the chat tool drawer unchanged in LTR and mirrors its resize seam in RTL', async ({ page }) => {
+  await installDesktopBridge(page, 'darwin', true)
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockChatSocket(page)
+  await mockHermesApi(page)
+  await page.goto('/#/hermes/chat')
+
+  await page.locator('.header-tool-toggle').click()
+  const wrapper = page.locator('.chat-content-wrapper')
+  const panel = page.locator('.chat-tool-panel')
+  const handle = page.locator('.chat-tool-resize-handle')
+  await expect(panel).toBeVisible()
+  await expect(panel).not.toHaveClass(/tool-panel-enter-active/)
+
+  const geometry = async () => {
+    const [wrapperBox, panelBox, handleBox] = await Promise.all([
+      wrapper.boundingBox(),
+      panel.boundingBox(),
+      handle.boundingBox(),
+    ])
+    if (!wrapperBox || !panelBox || !handleBox) throw new Error('drawer geometry unavailable')
+    return {
+      wrapperLeft: wrapperBox.x,
+      wrapperRight: wrapperBox.x + wrapperBox.width,
+      panelLeft: panelBox.x,
+      panelRight: panelBox.x + panelBox.width,
+      panelWidth: panelBox.width,
+      handleCenter: handleBox.x + handleBox.width / 2,
+      handleY: handleBox.y + handleBox.height / 2,
+    }
+  }
+
+  const ltr = await geometry()
+  expect(Math.abs(ltr.panelRight - ltr.wrapperRight)).toBeLessThanOrEqual(1)
+  expect(Math.abs(ltr.handleCenter - ltr.panelLeft)).toBeLessThanOrEqual(1)
+  await page.mouse.move(ltr.handleCenter, ltr.handleY)
+  await page.mouse.down()
+  await page.mouse.move(ltr.handleCenter + 32, ltr.handleY)
+  await page.mouse.up()
+  await expect.poll(async () => (await geometry()).panelWidth).toBeLessThan(ltr.panelWidth)
+
+  await page.evaluate(() => document.documentElement.setAttribute('dir', 'rtl'))
+  await expect.poll(async () => {
+    const current = await geometry()
+    return Math.abs(current.panelLeft - current.wrapperLeft) <= 1
+  }).toBe(true)
+  const rtlGeometry = await geometry()
+  expect(Math.abs(rtlGeometry.panelLeft - rtlGeometry.wrapperLeft)).toBeLessThanOrEqual(1)
+  expect(Math.abs(rtlGeometry.handleCenter - rtlGeometry.panelRight)).toBeLessThanOrEqual(1)
+  await page.mouse.move(rtlGeometry.handleCenter, rtlGeometry.handleY)
+  await page.mouse.down()
+  await page.mouse.move(rtlGeometry.handleCenter - 32, rtlGeometry.handleY)
+  await page.mouse.up()
+  await expect.poll(async () => (await geometry()).panelWidth).toBeLessThan(rtlGeometry.panelWidth)
+})
+
+test('shows the mobile file tree from the inline start edge in LTR and RTL', async ({ page }) => {
+  await page.setViewportSize({ width: 600, height: 800 })
+  await installDesktopBridge(page, 'darwin', true)
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await page.addInitScript(() => window.localStorage.setItem('hermes_locale', 'en'))
+  await mockChatSocket(page)
+  await mockHermesApi(page)
+  await page.goto('/#/hermes/chat')
+
+  await expect(page.locator('html')).toHaveAttribute('dir', 'ltr')
+  await page.locator('.header-tool-toggle').click()
+  const panel = page.locator('.chat-tool-panel')
+  const tree = panel.locator('.files-tree-panel')
+  await expect(tree).toBeVisible()
+  await expect(panel.locator('.sidebar-toggle')).toBeHidden()
+
+  await expect.poll(async () => {
+    const box = await tree.boundingBox()
+    return box ? Math.round(box.x) : null
+  }).toBe(0)
+
+  await page.evaluate(() => document.documentElement.setAttribute('dir', 'rtl'))
+  await expect.poll(async () => {
+    const box = await tree.boundingBox()
+    return box ? Math.round(box.x + box.width) : null
+  }).toBe(600)
 })
 
 test('embeds the desktop browser beside workspace and terminal', async ({ page }) => {
@@ -363,7 +483,10 @@ test('embeds the desktop browser beside workspace and terminal', async ({ page }
 
   await page.locator('.header-tool-toggle').click()
   const toolPanel = page.locator('.chat-tool-panel')
-  await expect(toolPanel.locator('.chat-tool-tab')).toHaveText(['Workspace', 'Terminal', 'Browser'])
+  await expect(toolPanel.getByRole('tab')).toHaveCount(3)
+  await expect(toolPanel.getByRole('tab', { name: 'Workspace' })).toBeVisible()
+  await expect(toolPanel.getByRole('tab', { name: 'Terminal' })).toBeVisible()
+  await expect(toolPanel.getByRole('tab', { name: 'Browser' })).toBeVisible()
 
   await toolPanel.getByRole('tab', { name: 'Browser' }).click()
   await expect(toolPanel.locator('.browser-panel')).toBeVisible()
@@ -465,9 +588,11 @@ test('embeds the desktop browser beside workspace and terminal', async ({ page }
   await toolPanel.locator('.annotation-editor textarea').fill('Keep this card aligned with annotation one')
   await toolPanel.locator('.annotation-session-bar').getByRole('button', { name: 'Send' }).click()
   await expect(toolPanel.locator('.annotation-session-bar')).toHaveCount(0)
-  await expect(page.locator('.chat-input-area .attachment-preview.image')).toHaveCount(1)
+  await expect(page.locator('.chat-input-area .attachment-preview')).toHaveCount(0)
   await expect(page.locator('.chat-input-area textarea')).toHaveValue('')
-  const selectionData = page.locator('.chat-input-area .attachment-context')
+  const sentSelection = page.locator('.message.user .msg-attachment.image').last()
+  await expect(sentSelection).toBeVisible()
+  const selectionData = sentSelection.locator('.msg-attachment-context')
   await expect(selectionData).not.toHaveAttribute('open', '')
   await selectionData.locator('summary').click()
   await expect(selectionData).toHaveAttribute('open', '')
@@ -495,6 +620,90 @@ test('embeds the desktop browser beside workspace and terminal', async ({ page }
   await page.goto('/#/hermes/browser')
   await expect(page.locator('.browser-settings-page')).toBeVisible()
   await expect(page.locator('.browser-settings-page .native-viewport')).toHaveCount(0)
+})
+
+async function openAnnotationPanel(page: Page) {
+  await installDesktopBridge(page, 'darwin', true)
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockChatSocket(page)
+  await mockHermesApi(page)
+  await page.goto('/#/hermes/chat')
+  await page.locator('.header-tool-toggle').click()
+  const panel = page.locator('.chat-tool-panel')
+  await panel.getByRole('tab', { name: 'Browser' }).click()
+  await expect(panel.locator('.native-viewport')).toBeVisible()
+  return panel
+}
+
+async function requestTestAnnotation(page: Page) {
+  await page.evaluate(() => (window as any).__PW_DESKTOP_BROWSER__.requestAnnotation({ tabId: 'tab-1', mode: 'element' }))
+  await expect(page.locator('.annotation-editor')).toBeVisible()
+}
+
+test('deletes individual annotations and sends only surviving notes and visual markers', async ({ page }) => {
+  const panel = await openAnnotationPanel(page)
+  for (const note of ['Keep first', 'Wrong middle', 'Keep last']) {
+    await requestTestAnnotation(page)
+    await panel.locator('.annotation-editor textarea').fill(note)
+    await panel.getByRole('button', { name: 'Done', exact: true }).click()
+    await expect(panel.locator('.annotation-editor')).toHaveCount(0)
+  }
+  await panel.locator('.annotation-list').getByRole('button', { name: 'Delete annotation 2', exact: true }).click()
+  await expect(panel.locator('.annotation-item')).toHaveCount(2)
+  await expect(panel.locator('.annotation-list')).toContainText('Annotation 1 · Keep first')
+  await expect(panel.locator('.annotation-list')).toContainText('Annotation 3 · Keep last')
+  await expect(panel.locator('.annotation-list')).not.toContainText('Wrong middle')
+  await panel.locator('.annotation-session-bar').getByRole('button', { name: 'Send', exact: true }).click()
+  const context = page.locator('.message.user .msg-attachment.image').last().locator('.msg-attachment-context')
+  await expect(context).toBeVisible()
+  await context.locator('summary').click()
+  await expect(context.locator('pre')).toContainText('Keep first')
+  await expect(context.locator('pre')).toContainText('Keep last')
+  await expect(context.locator('pre')).not.toContainText('Wrong middle')
+  await expect(context.locator('pre')).not.toContainText('"marker": 2')
+  expect(await page.evaluate(() => (window as any).__PW_DESKTOP_BROWSER__.capturedMarkers)).toEqual([1, 3])
+})
+
+test('undoes pending and completed annotations without clearing earlier selections', async ({ page }) => {
+  const panel = await openAnnotationPanel(page)
+  await requestTestAnnotation(page)
+  await panel.locator('.annotation-editor textarea').fill('Keep this note')
+  await panel.getByRole('button', { name: 'Done', exact: true }).click()
+  await requestTestAnnotation(page)
+  await panel.locator('.annotation-editor textarea').fill('Discard this pending note')
+  await panel.getByRole('button', { name: 'Undo last', exact: true }).click()
+  await expect(panel.locator('.annotation-editor')).toHaveCount(0)
+  await expect(panel.locator('.annotation-item')).toHaveCount(1)
+  await expect(panel.locator('.annotation-list')).toContainText('Keep this note')
+  await panel.getByRole('button', { name: 'Undo last', exact: true }).click()
+  await expect(panel.locator('.annotation-session-bar')).toHaveCount(0)
+  await expect(panel.locator('.native-viewport')).toBeVisible()
+  expect(await page.evaluate(() => (window as any).__PW_DESKTOP_BROWSER__.removedAnnotations)).toEqual([2, 1])
+  expect(await page.evaluate(() => (window as any).__PW_DESKTOP_BROWSER__.clearAnnotationCalls)).toBe(0)
+  await requestTestAnnotation(page)
+  await expect(panel.locator('.annotation-item')).toHaveCount(1)
+  await panel.locator('.annotation-actions').getByRole('button', { name: 'Delete annotation 3', exact: true }).click()
+  await expect(panel.locator('.annotation-session-bar')).toHaveCount(0)
+})
+
+test('keeps annotations retryable on deletion failure and refuses a stale screenshot on capture failure', async ({ page }) => {
+  const panel = await openAnnotationPanel(page)
+  await requestTestAnnotation(page)
+  await panel.locator('.annotation-editor textarea').fill('Keep pending text')
+  await page.evaluate(() => { (window as any).__PW_DESKTOP_BROWSER__.failRemoval = true })
+  await panel.getByRole('button', { name: 'Undo last', exact: true }).click()
+  await expect(page.getByText('Could not remove annotation', { exact: true })).toBeVisible()
+  await expect(panel.locator('.annotation-list')).toContainText('Keep pending text')
+  await expect(panel.locator('.annotation-item')).toHaveCount(1)
+  await page.evaluate(() => { (window as any).__PW_DESKTOP_BROWSER__.failCapture = true })
+  await panel.locator('.annotation-session-bar').getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(page.getByText('Could not capture annotations', { exact: true })).toBeVisible()
+  await expect(panel.locator('.annotation-item')).toHaveCount(1)
+  await expect(panel.locator('.annotation-list')).toContainText('Keep pending text')
+  await expect(page.locator('.message.user .msg-attachment.image')).toHaveCount(0)
+  await page.evaluate(() => { (window as any).__PW_DESKTOP_BROWSER__.failRemoval = false })
+  await panel.getByRole('button', { name: 'Undo last', exact: true }).click()
+  await expect(panel.locator('.annotation-session-bar')).toHaveCount(0)
 })
 
 test('manages desktop browser profiles with switchable cards and editor modals', async ({ page }) => {

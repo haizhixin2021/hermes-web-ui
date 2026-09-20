@@ -5,13 +5,16 @@ import {
   HERMES_DISCOVERY_PORT,
   discoveryPortForHttpPort,
   getDiscoveryHttpPorts,
+  getLanBackendUrl,
+  getLanBackendUrlForRequest,
   getLanEndpointKind,
   isPrivateOrLoopbackIPv4,
   resetLanDiscoveryState,
   scanLanDevices,
+  selectLanIPv4Address,
   startLanDiscoveryResponder,
-} from '../../packages/server/src/services/lan-discovery'
-import type { PublicSystemInfo } from '../../packages/server/src/services/system-info'
+} from '../../packages/server/src/modules/studio/services/network/lan-discovery'
+import type { PublicSystemInfo } from '../../packages/server/src/modules/studio/public/system-info'
 
 const fakeKeyPair = generateKeyPairSync('ed25519', {
   publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -62,6 +65,79 @@ describe('LAN discovery', () => {
     expect(getLanEndpointKind(8648)).toBe('web')
     expect(getLanEndpointKind(8748)).toBe('desktop')
     expect(getLanEndpointKind(19001)).toBe('custom')
+  })
+
+  it('builds an App backend URL on a private local interface', () => {
+    const url = new URL(getLanBackendUrl('::ffff:127.0.0.1', 19004))
+
+    expect(url.protocol).toBe('http:')
+    expect(url.port).toBe('19004')
+    expect(isPrivateOrLoopbackIPv4(url.hostname)).toBe(true)
+  })
+
+  it('uses the externally requested host instead of a Docker container interface', () => {
+    expect(getLanBackendUrlForRequest(
+      '172.19.0.1',
+      'http://192.168.10.102:6060',
+      6060,
+      '',
+    )).toBe('http://192.168.10.102:6060')
+  })
+
+  it('supports an explicit Docker LAN advertise URL and ignores localhost request origins', () => {
+    expect(getLanBackendUrlForRequest(
+      '172.19.0.1',
+      'http://localhost:6060',
+      6060,
+      'http://192.168.10.102:16060',
+    )).toBe('http://192.168.10.102:16060')
+    expect(getLanBackendUrlForRequest(
+      '192.168.10.20',
+      'http://localhost:6060',
+      6060,
+      '',
+    )).not.toBe('http://localhost:6060')
+  })
+
+  it('prefers a physical LAN interface over VPN and virtual adapters for local QR codes', () => {
+    const interfaces = [
+      { name: 'utun4', address: '10.8.0.2', netmask: '255.255.255.255' },
+      { name: 'docker0', address: '172.17.0.1', netmask: '255.255.0.0' },
+      { name: 'en0', address: '192.168.10.102', netmask: '255.255.255.0' },
+    ]
+
+    expect(selectLanIPv4Address('127.0.0.1', interfaces)).toBe('192.168.10.102')
+    expect(getLanBackendUrlForRequest(
+      '127.0.0.1',
+      'http://localhost:8648',
+      8648,
+      '',
+      interfaces,
+    )).toBe('http://192.168.10.102:8648')
+  })
+
+  it('ignores a VPN request origin when a physical LAN interface is available', () => {
+    const interfaces = [
+      { name: 'Tailscale Tunnel', address: '100.64.0.2', netmask: '255.255.255.255' },
+      { name: 'Wi-Fi', address: '192.168.1.20', netmask: '255.255.255.0' },
+    ]
+
+    expect(getLanBackendUrlForRequest(
+      '127.0.0.1',
+      'http://100.64.0.2:8648',
+      8648,
+      '',
+      interfaces,
+    )).toBe('http://192.168.1.20:8648')
+  })
+
+  it('keeps an exact remote subnet match even when it uses a VPN interface', () => {
+    const interfaces = [
+      { name: 'WireGuard Tunnel', address: '10.8.0.2', netmask: '255.255.255.0' },
+      { name: 'Ethernet', address: '192.168.1.20', netmask: '255.255.255.0' },
+    ]
+
+    expect(selectLanIPv4Address('10.8.0.50', interfaces)).toBe('10.8.0.2')
   })
 
   it('limits discovery responses to local/private IPv4 senders', () => {
@@ -155,10 +231,11 @@ describe('LAN discovery', () => {
     expect(result.devices).toEqual([])
   })
 
-  it('registers device request routes before auth and management routes behind super admin auth', () => {
-    const source = readFileSync('packages/server/src/routes/index.ts', 'utf8')
-    const deviceRoutesSource = readFileSync('packages/server/src/routes/devices.ts', 'utf8')
-    const bootstrapSource = readFileSync('packages/server/src/index.ts', 'utf8')
+  it('registers device request routes before auth and device management routes behind super admin auth', () => {
+    const source = readFileSync('packages/server/src/bootstrap/routes.ts', 'utf8')
+    const deviceRoutesSource = readFileSync('packages/server/src/modules/studio/routes/devices.ts', 'utf8')
+    const mcuDeviceRoutesSource = readFileSync('packages/server/src/modules/studio/routes/mcu-devices.ts', 'utf8')
+    const bootstrapSource = readFileSync('packages/server/src/bootstrap/http.ts', 'utf8')
 
     const authIndex = source.indexOf('authMiddleware.forEach')
     const publicDeviceIndex = source.indexOf('app.use(devicePublicRoutes.routes())')
@@ -177,13 +254,14 @@ describe('LAN discovery', () => {
     expect(deviceRoutesSource).toContain("deviceRoutes.get('/api/devices/peer-connections'")
     expect(deviceRoutesSource).toContain("deviceRoutes.post('/api/devices/:id/connect'")
     expect(deviceRoutesSource).toContain("deviceRoutes.get('/api/devices/peer-connections/:connectionId/terminals'")
+    expect(mcuDeviceRoutesSource).not.toContain('requireSuperAdmin')
     expect(bootstrapSource).toContain('getLanPeerSocketPath()')
     expect(publicDeviceIndex).toBeLessThan(authIndex)
     expect(deviceIndex).toBeGreaterThan(authIndex)
   })
 
   it('keeps LAN peer terminals bounded and idle-reclaimable', () => {
-    const peerSocketSource = readFileSync('packages/server/src/services/lan-peer-socket.ts', 'utf8')
+    const peerSocketSource = readFileSync('packages/server/src/modules/studio/services/network/lan-peer-socket.ts', 'utf8')
 
     expect(peerSocketSource).toContain("boundedEnvInt('HERMES_LAN_PEER_MAX_TERMINALS', 4")
     expect(peerSocketSource).toContain("boundedEnvInt('HERMES_LAN_PEER_TERMINAL_IDLE_MS', 10 * 60 * 1000")
@@ -194,16 +272,16 @@ describe('LAN discovery', () => {
   })
 
   it('exposes an MCP terminal list tool so agents can recover forgotten terminal ids', () => {
-    const mcpSource = readFileSync('bin/hermes-studio-mcp.mjs', 'utf8')
+    const mcpSource = readFileSync('bin/ekko-studio-mcp.mjs', 'utf8')
 
-    expect(mcpSource).toContain("name: 'hermes_studio_lan_devices_list'")
+    expect(mcpSource).toContain("name: 'ekko_studio_lan_devices_list'")
     expect(mcpSource).toContain('online status')
     expect(mcpSource).toContain('temporary profile token')
     expect(mcpSource).toContain("'X-Hermes-Profile': profile")
     expect(mcpSource).toContain('token: args.token')
     expect(mcpSource).toContain('profile: args.profile')
     expect(mcpSource).toContain("join(appHome(), 'profiles', segment, '.model-run-token')")
-    expect(mcpSource).toContain("name: 'hermes_studio_lan_terminal_list'")
+    expect(mcpSource).toContain("name: 'ekko_studio_lan_terminal_list'")
     expect(mcpSource).toContain('/terminals`, withAuthArgs(args))')
   })
 })

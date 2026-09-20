@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 let hermesHome = ''
+const mockResolveAuthorizedCredentials = vi.fn()
 
 function writeHermesFile(path: string, content: string) {
   mkdirSync(hermesHome, { recursive: true })
@@ -40,23 +41,28 @@ function makeCtx(profile?: string): any {
 
 async function loadModelsController() {
   vi.resetModules()
-  vi.doMock('../../packages/server/src/services/app-config', () => ({
+  vi.doMock('../../packages/server/src/modules/studio/public/app-config', () => ({
     readAppConfig: vi.fn().mockResolvedValue({}),
     providerDisplayLabel: (_appConfig: any, _profile: string, _providerId: string, fallback: string) => fallback,
   }))
-  vi.doMock('../../packages/server/src/services/hermes/copilot-models', () => ({
+  vi.doMock('../../packages/server/src/modules/hermes/services/providers/copilot-models', () => ({
     getCopilotModelsDetailed: vi.fn().mockResolvedValue([]),
     resolveCopilotOAuthToken: vi.fn().mockResolvedValue(''),
   }))
-  return import('../../packages/server/src/controllers/hermes/models')
+  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+  return import('../../packages/server/src/modules/hermes/controllers/models')
 }
 
 async function loadCodexAuthController() {
   vi.resetModules()
-  vi.doMock('../../packages/server/src/services/logger', () => ({
+  vi.doMock('../../packages/server/src/modules/studio/public/logging', () => ({
     logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
   }))
-  return import('../../packages/server/src/controllers/hermes/codex-auth')
+  vi.doMock('../../packages/server/src/modules/hermes/services/providers/authorized-provider-credentials', () => ({
+    resolveAuthorizedProviderRuntimeCredentials: mockResolveAuthorizedCredentials,
+  }))
+  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+  return import('../../packages/server/src/modules/hermes/controllers/codex-auth')
 }
 
 describe('OpenAI Codex credential pool auth compatibility', () => {
@@ -67,12 +73,14 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
     process.env.CODEX_HOME = join(hermesHome, 'codex-home')
     writeConfigYaml('model:\n  default: gpt-5.5\n  provider: openai-codex\n')
     writeEnv('')
+    mockResolveAuthorizedCredentials.mockReset()
   })
 
   afterEach(() => {
-    vi.doUnmock('../../packages/server/src/services/app-config')
-    vi.doUnmock('../../packages/server/src/services/hermes/copilot-models')
-    vi.doUnmock('../../packages/server/src/services/logger')
+    vi.doUnmock('../../packages/server/src/modules/studio/public/app-config')
+    vi.doUnmock('../../packages/server/src/modules/hermes/services/providers/copilot-models')
+    vi.doUnmock('../../packages/server/src/modules/studio/public/logging')
+    vi.doUnmock('../../packages/server/src/modules/hermes/services/providers/authorized-provider-credentials')
     delete process.env.HERMES_HOME
     delete process.env.HERMES_WEB_UI_HOME
     delete process.env.CODEX_HOME
@@ -121,6 +129,11 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
         ],
       },
     })
+    mockResolveAuthorizedCredentials.mockResolvedValue({
+      provider: 'openai-codex',
+      apiKey: 'non-jwt-access-token',
+      lastRefresh: '2026-05-10T00:00:00.000Z',
+    })
 
     const { status } = await loadCodexAuthController()
     const ctx = makeCtx()
@@ -128,6 +141,10 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
     await status(ctx)
 
     expect(ctx.body).toEqual({ authenticated: true, last_refresh: '2026-05-10T00:00:00.000Z' })
+    expect(mockResolveAuthorizedCredentials).toHaveBeenCalledWith({
+      profile: 'default',
+      provider: 'openai-codex',
+    })
   })
 
   it('reports Codex status from the request-scoped profile', async () => {
@@ -142,6 +159,11 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
         ],
       },
     }, 'profiles/research/auth.json')
+    mockResolveAuthorizedCredentials.mockResolvedValue({
+      provider: 'openai-codex',
+      apiKey: 'research-token',
+      lastRefresh: '2026-06-02T00:00:00.000Z',
+    })
 
     const { status } = await loadCodexAuthController()
     const ctx = makeCtx('research')
@@ -149,6 +171,10 @@ describe('OpenAI Codex credential pool auth compatibility', () => {
     await status(ctx)
 
     expect(ctx.body).toEqual({ authenticated: true, last_refresh: '2026-06-02T00:00:00.000Z' })
+    expect(mockResolveAuthorizedCredentials).toHaveBeenCalledWith({
+      profile: 'research',
+      provider: 'openai-codex',
+    })
   })
 
   it('persists Codex OAuth credentials in the request-scoped profile only', async () => {

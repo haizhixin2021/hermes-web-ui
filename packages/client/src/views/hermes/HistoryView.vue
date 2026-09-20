@@ -4,21 +4,20 @@ import { useRoute, useRouter } from 'vue-router'
 import { type Session } from '@/stores/hermes/chat'
 import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
-import { useSessionBrowserPrefsStore } from '@/stores/hermes/session-browser-prefs'
 import { NButton, NDropdown, NPopconfirm, NTooltip, useMessage, type DropdownOption } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { getSourceLabel } from '@/shared/session-display'
 import { copyToClipboard } from '@/utils/clipboard'
+import { mergeTaskPlanMessages } from '@/utils/task-plan'
 import HistoryMessageList from '@/components/hermes/chat/HistoryMessageList.vue'
 import SessionListItem from '@/components/hermes/chat/SessionListItem.vue'
 import OutlinePanel from '@/components/hermes/chat/OutlinePanel.vue'
 import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
 import PageSidebarFooter from '@/components/layout/PageSidebarFooter.vue'
-import { batchDeleteSessions, deleteSession, fetchHermesSessionGroups, fetchHermesSessionPage, fetchHermesSession, fetchSessionMessagesPage, importHermesSession, unarchiveSession, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
+import { setSessionPinned, batchDeleteSessions, deleteSession, fetchHermesSessionGroups, fetchHermesSessionPage, fetchHermesSession, fetchSessionMessagesPage, importHermesSession, unarchiveSession, type HermesMessage, type SessionSummary } from '@/api/studio/sessions'
 
 const appStore = useAppStore()
 const profilesStore = useProfilesStore()
-const sessionBrowserPrefsStore = useSessionBrowserPrefsStore()
 const message = useMessage()
 const { t } = useI18n()
 const route = useRoute()
@@ -54,9 +53,9 @@ const showContextMenu = ref(false)
 const contextMenuX = ref(0)
 const contextMenuY = ref(0)
 let hermesSessionsRequestId = 0
-
 const HISTORY_PAGE_SIZE = 150
 const HISTORY_GROUP_PAGE_SIZE = 50
+const collapsedGroups = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem('hermes_collapsed_groups') || '[]')))
 const sourceHasMore = ref<Record<string, boolean>>({})
 const sourceLoading = ref<Record<string, boolean>>({})
 const sourceOffsets = ref<Record<string, number>>({})
@@ -74,7 +73,7 @@ async function loadHermesSessions() {
   const requestId = ++hermesSessionsRequestId
   hermesSessionsLoading.value = true
   try {
-    const includedIds = [...sessionBrowserPrefsStore.pinnedIds]
+    const includedIds: string[] = []
     if (routeSessionId.value && !includedIds.includes(routeSessionId.value)) includedIds.push(routeSessionId.value)
     const result = await fetchHermesSessionGroups(HISTORY_GROUP_PAGE_SIZE, effectiveHistoryProfile.value, includedIds)
     if (requestId !== hermesSessionsRequestId) return
@@ -120,7 +119,7 @@ const contextSessionSummary = computed(() =>
 )
 
 const contextSessionPinned = computed(() =>
-  contextSessionId.value ? sessionBrowserPrefsStore.isPinned(contextSessionId.value) : false,
+  contextSessionId.value ? Boolean(contextSessionSummary.value?.is_pinned) : false,
 )
 
 const contextMenuOptions = computed<DropdownOption[]>(() => {
@@ -130,7 +129,7 @@ const contextMenuOptions = computed<DropdownOption[]>(() => {
       key: 'import-webui',
       disabled: Boolean(contextSessionSummary.value?.webui_imported),
     },
-    { label: t(contextSessionPinned.value ? 'chat.unpin' : 'chat.pin'), key: 'pin' },
+    { label: t(contextSessionPinned.value ? 'chat.unpin' : 'chat.pin'), key: 'pin', disabled: contextSessionSummary.value?.webui_imported === false },
     ...(contextSessionSummary.value?.is_archived ? [{ label: t('chat.unarchiveSession'), key: 'unarchive' }] : []),
     { label: t('chat.copySessionLink'), key: 'copy-link' },
     { label: t('chat.copySessionId'), key: 'copy-id' },
@@ -177,6 +176,7 @@ function mapHistoryMessages(messages: HermesMessage[]): Session['messages'] {
       timestamp: m.timestamp * 1000,
       reasoning: m.reasoning || undefined,
       systemType: displayRole === 'command' ? 'command' : undefined,
+      runMarker: m.run_marker,
     }
 
     if (m.role === 'tool' || isHistoryMoaToolDisplay(m)) {
@@ -197,12 +197,12 @@ function mapHistoryMessages(messages: HermesMessage[]): Session['messages'] {
 }
 
 function codingAgentFields(summary: SessionSummary): Pick<Session, 'agent' | 'agentSessionId' | 'agentNativeSessionId' | 'codingAgentId' | 'codingAgentMode'> {
-  const isCodingAgentSession = summary.source === 'coding_agent' || summary.agent === 'claude' || summary.agent === 'codex'
+  const isCodingAgentSession = summary.source === 'coding_agent' || summary.agent === 'claude' || summary.agent === 'codex' || summary.agent === 'pi' || summary.agent === 'grok' || (summary.agent === 'opencode' || summary.agent === 'dsh')
   return {
     agent: summary.agent || undefined,
     agentSessionId: summary.agent_session_id || undefined,
     agentNativeSessionId: summary.agent_native_session_id || undefined,
-    codingAgentId: summary.agent === 'codex' ? 'codex' : summary.agent === 'claude' ? 'claude-code' : undefined,
+    codingAgentId: summary.agent === 'codex' ? 'codex' : summary.agent === 'pi' ? 'pi' : summary.agent === 'grok' ? 'grok' : summary.agent === 'dsh' ? 'dsh' : summary.agent === 'opencode' ? 'opencode' : summary.agent === 'claude' ? 'claude-code' : undefined,
     codingAgentMode: isCodingAgentSession
       ? (summary.agent_mode === 'global' || summary.agent_mode === 'scoped'
           ? summary.agent_mode
@@ -230,7 +230,9 @@ function sessionFromSummary(summary: SessionSummary, messages: Session['messages
     outputTokens: summary.output_tokens,
     endedAt: summary.ended_at ? summary.ended_at * 1000 : undefined,
     lastActiveAt: summary.last_active ? summary.last_active * 1000 : undefined,
+    isPinned: Boolean(summary.is_pinned),
     isArchived: Boolean(summary.is_archived),
+    pushEnabled: Boolean(summary.push_enabled),
     workspace: summary.workspace || undefined,
     messages,
   }
@@ -244,7 +246,7 @@ async function loadHistorySession(sessionId: string, profile?: string | null) {
 
   if (page) {
     const base = summary || page.session
-    sessionData = sessionFromSummary(base, mapHistoryMessages(page.messages))
+    sessionData = sessionFromSummary(base, mergeTaskPlanMessages(mapHistoryMessages(page.messages), page.taskPlans || [], sessionId))
     sessionData.profile = summary?.profile || sessionProfile || undefined
     sessionData.messageCount = page.total
     sessionData.messageTotal = page.total
@@ -302,7 +304,7 @@ async function loadOlderHistoryMessages(sessionId: string): Promise<boolean> {
 
     const existingIds = new Set(target.messages.map(message => message.id))
     const olderMessages = mapHistoryMessages(page.messages).filter(message => !existingIds.has(message.id))
-    target.messages = [...olderMessages, ...target.messages]
+    target.messages = mergeTaskPlanMessages([...olderMessages, ...target.messages], page.taskPlans || [], sessionId)
     target.loadedMessageCount = offset + page.messages.length
     target.messageTotal = page.total
     target.messageCount = page.total
@@ -401,18 +403,21 @@ onUnmounted(() => {
   window.removeEventListener('hermes:open-page-sidebar', openPageSidebar)
 })
 
-watch([routeSessionId, routeProfile], async ([sessionId]) => {
-  if (!sessionId) {
-    historySessionId.value = null
-    historySession.value = null
-    return
-  }
-  if (!hermesSessionsLoaded.value) return
-  if (routeProfile.value && !hermesSessions.value.some(s => s.profile === routeProfile.value)) {
-    await loadHermesSessions()
-  }
-  await syncRouteSession()
-})
+watch(
+  [routeSessionId, routeProfile],
+  async ([sessionId]) => {
+    if (!sessionId) {
+      historySessionId.value = null
+      historySession.value = null
+      return
+    }
+    if (!hermesSessionsLoaded.value) return
+    if (routeProfile.value && !hermesSessions.value.some(s => s.profile === routeProfile.value)) {
+      await loadHermesSessions()
+    }
+    await syncRouteSession()
+  },
+)
 
 watch(() => profilesStore.activeProfileName, async () => {
   if (!hermesSessionsLoaded.value) return
@@ -422,8 +427,6 @@ watch(() => profilesStore.activeProfileName, async () => {
   await loadHermesSessions()
   await openDefaultHistorySession(true)
 })
-
-const collapsedGroups = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem('hermes_collapsed_groups') || '[]')))
 
 // Convert SessionSummary to Session format
 function sessionSummaryToSession(summary: SessionSummary): Session {
@@ -442,7 +445,9 @@ function sessionSummaryToSession(summary: SessionSummary): Session {
     outputTokens: summary.output_tokens,
     endedAt: summary.ended_at ? summary.ended_at * 1000 : undefined,
     lastActiveAt: summary.last_active ? summary.last_active * 1000 : undefined,
+    isPinned: Boolean(summary.is_pinned),
     isArchived: Boolean(summary.is_archived),
+    pushEnabled: Boolean(summary.push_enabled),
     workspace: summary.workspace || undefined,
     messages: [],
   }
@@ -528,13 +533,13 @@ interface SessionGroup {
 }
 
 const pinnedSessions = computed(() =>
-  sortSessionsWithActiveFirst(historySessions.value.filter(session => sessionBrowserPrefsStore.isPinned(session.id))),
+  sortSessionsWithActiveFirst(historySessions.value.filter(session => session.isPinned)),
 )
 
 const groupedSessions = computed<SessionGroup[]>(() => {
   const map = new Map<string, Session[]>()
   for (const s of historySessions.value) {
-    if (sessionBrowserPrefsStore.isPinned(s.id)) continue
+    if (s.isPinned) continue
     const key = s.source || ''
     if (!map.has(key)) map.set(key, [])
     map.get(key)!.push(s)
@@ -713,7 +718,14 @@ async function handleContextMenuSelect(key: string) {
   showContextMenu.value = false
   if (!contextSessionId.value) return
   if (key === 'pin') {
-    sessionBrowserPrefsStore.togglePinned(contextSessionId.value)
+    const summary = contextSessionSummary.value
+    if (!summary) return
+    try {
+      const result = await setSessionPinned(summary.id, !summary.is_pinned)
+      summary.is_pinned = result.is_pinned
+    } catch (error: any) {
+      message.error(error?.message || t('common.saveFailed'))
+    }
   } else if (key === 'copy-link') {
     await copySessionLink(contextSessionId.value)
   } else if (key === 'copy-id') {
@@ -748,7 +760,6 @@ async function handleDeleteSession(id: string, profile?: string | null) {
     return
   }
 
-  sessionBrowserPrefsStore.removePinned(id)
   hermesSessions.value = hermesSessions.value.filter(s => s.id !== id)
   if (summary?.source && sourceOffsets.value[summary.source]) {
     sourceOffsets.value = {
@@ -786,10 +797,6 @@ async function handleBatchDelete() {
   try {
     const result = await batchDeleteSessions(targets)
     if (result.deleted > 0) {
-      for (const target of targets) {
-        sessionBrowserPrefsStore.removePinned(target.id)
-      }
-
       await loadHermesSessions()
 
       if (activeWasSelected || (historySessionId.value && !findHistorySession(historySessionId.value))) {
@@ -830,7 +837,6 @@ function handleBatchDeleteConfirm() {
         <PageSidebarNav
           active="history"
           :primary-label="t('chat.newChat')"
-          hide-mode-switch
           @primary="openNewChatPage"
         />
         <div class="session-list-toolbar">
@@ -1037,6 +1043,7 @@ function handleBatchDeleteConfirm() {
             ref="historyMessageListRef"
             :session="historySession"
             :load-older="loadOlderHistoryMessages"
+            scroll-scope="history"
           />
         </div>
         <OutlinePanel
@@ -1092,8 +1099,8 @@ function handleBatchDeleteConfirm() {
 
   &.collapsed {
     width: 0;
-    margin-left: 0;
-    margin-right: 0;
+    margin-inline-start: 0;
+    margin-inline-end: 0;
     border: none;
     box-shadow: none;
     opacity: 0;
@@ -1195,6 +1202,11 @@ function handleBatchDeleteConfirm() {
   padding: 6px 10px 4px;
   cursor: pointer;
   user-select: none;
+
+  &[role='button']:focus-visible {
+    outline: 2px solid rgba($accent-primary, 0.55);
+    outline-offset: -2px;
+  }
 }
 
 .session-group-header--static {
@@ -1226,13 +1238,14 @@ function handleBatchDeleteConfirm() {
 }
 
 .session-group-load-more {
-  margin-left: auto;
+  margin-inline-start: auto;
   color: $text-muted;
 
   &:hover {
     color: $accent-primary;
   }
 }
+
 
 .session-items {
   flex: 1;
@@ -1261,7 +1274,7 @@ function handleBatchDeleteConfirm() {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
 
   &--sidebar-collapsed {
-    margin-left: 10px;
+    margin-inline-start: 10px;
   }
 }
 

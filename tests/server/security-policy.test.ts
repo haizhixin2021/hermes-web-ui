@@ -1,12 +1,14 @@
 import http from 'http'
 import Koa from 'koa'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createCorsOriginResolver,
   isOriginAllowed,
+  parseUpgradeRequestUrl,
   securityHeaders,
   shouldRejectUpgradeOrigin,
-} from '../../packages/server/src/security'
+  writeBadUpgradeRequest,
+} from '../../packages/server/src/modules/studio/middleware/security'
 
 function fakeCtx(origin: string, host: string) {
   return {
@@ -30,6 +32,7 @@ describe('server security policy', () => {
     const resolveOrigin = createCorsOriginResolver('')
 
     await expect(resolveOrigin(fakeCtx('http://127.0.0.1:8648', '127.0.0.1:8648'))).resolves.toBe('http://127.0.0.1:8648')
+    await expect(resolveOrigin(fakeCtx('http://localhost', '192.168.10.102:8647'))).resolves.toBe('')
     await expect(resolveOrigin(fakeCtx('https://evil.example', '127.0.0.1:8648'))).resolves.toBe('')
   })
 
@@ -45,7 +48,24 @@ describe('server security policy', () => {
     expect(shouldRejectUpgradeOrigin({ headers: { origin: 'https://evil.example', host: '127.0.0.1:8648' } } as any, '')).toBe(true)
     expect(shouldRejectUpgradeOrigin({ headers: { origin: 'null', host: '127.0.0.1:8648' } } as any, '')).toBe(true)
     expect(shouldRejectUpgradeOrigin({ headers: { origin: 'http://127.0.0.1:8648', host: '127.0.0.1:8648' } } as any, '')).toBe(false)
+    expect(shouldRejectUpgradeOrigin({ headers: { origin: 'http://localhost', host: '192.168.10.102:8647' } } as any, '')).toBe(false)
+    expect(shouldRejectUpgradeOrigin({ headers: { origin: 'http://localhost:5173', host: '192.168.10.102:8647' } } as any, '')).toBe(false)
     expect(shouldRejectUpgradeOrigin({ headers: { host: '127.0.0.1:8648' } } as any, '')).toBe(false)
+  })
+
+  it('rejects malformed websocket upgrade URLs without throwing', () => {
+    expect(parseUpgradeRequestUrl({ url: '/socket', headers: { host: '127.0.0.1:8648' } } as any)?.pathname)
+      .toBe('/socket')
+    expect(parseUpgradeRequestUrl({ url: '/socket', headers: { host: '[' } } as any)).toBeNull()
+
+    const socket = {
+      destroyed: false,
+      write: vi.fn(),
+      destroy: vi.fn(),
+    }
+    writeBadUpgradeRequest(socket)
+    expect(socket.write).toHaveBeenCalledWith('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+    expect(socket.destroy).toHaveBeenCalledOnce()
   })
 
   it('adds baseline browser security headers', async () => {
@@ -70,5 +90,32 @@ describe('server security policy', () => {
     expect(response.headers.get('cross-origin-opener-policy')).toBe('same-origin-allow-popups')
     expect(response.headers.get('content-security-policy')).toContain("default-src 'self'")
     expect(response.headers.get('strict-transport-security')).toContain('max-age=31536000')
+  })
+
+  it('preserves the opener only for the dedicated group chat Agent authorization document', async () => {
+    const app = new Koa()
+    app.use(securityHeaders())
+    app.use((ctx) => {
+      ctx.body = '<!doctype html>'
+    })
+    const server = app.listen(0)
+    servers.push(server)
+    await new Promise<void>((resolve) => server.once('listening', () => resolve()))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('expected tcp server')
+
+    const authorizationDocument = await fetch(
+      `http://127.0.0.1:${address.port}/?groupChatAgentLink=1`,
+    )
+    const unrelatedPath = await fetch(
+      `http://127.0.0.1:${address.port}/health?groupChatAgentLink=1`,
+    )
+    const unrelatedQuery = await fetch(
+      `http://127.0.0.1:${address.port}/?groupChatAgentLink=unexpected`,
+    )
+
+    expect(authorizationDocument.headers.get('cross-origin-opener-policy')).toBe('unsafe-none')
+    expect(unrelatedPath.headers.get('cross-origin-opener-policy')).toBe('same-origin-allow-popups')
+    expect(unrelatedQuery.headers.get('cross-origin-opener-policy')).toBe('same-origin-allow-popups')
   })
 })

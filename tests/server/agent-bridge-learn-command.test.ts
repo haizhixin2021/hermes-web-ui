@@ -42,6 +42,7 @@ bridge_runtime._install_execute_code_approval_memory_patch = lambda *_args, **_k
 bridge_runtime._jsonable = lambda value: value
 bridge_runtime._load_cfg = lambda *_args, **_kwargs: {}
 bridge_runtime._load_enabled_toolsets = lambda *_args, **_kwargs: []
+bridge_runtime._load_fallback_model = lambda *_args, **_kwargs: None
 bridge_runtime._load_reasoning_config = lambda *_args, **_kwargs: {}
 bridge_runtime._load_service_tier = lambda *_args, **_kwargs: None
 bridge_runtime._mcp_tool_names_from_names = lambda *_args, **_kwargs: []
@@ -64,7 +65,7 @@ sys.modules["bridge_runtime"] = bridge_runtime
 
 spec = importlib.util.spec_from_file_location(
     "bridge_pool",
-    "packages/server/src/services/hermes/agent-bridge/python/bridge_pool.py",
+    "packages/server/src/modules/hermes/services/bridge/python/bridge_pool.py",
 )
 bridge_pool = importlib.util.module_from_spec(spec)
 assert spec.loader is not None

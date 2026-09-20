@@ -2,8 +2,8 @@
 import { NButton, NSpin, NEmpty, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useFilesStore, isPreviewableFile, isTextFile } from '@/stores/hermes/files'
-import { downloadFile } from '@/api/hermes/download'
-import type { FileEntry } from '@/api/hermes/files'
+import { downloadFile } from '@/api/studio/download'
+import type { FileEntry } from '@/api/studio/files'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -167,7 +167,7 @@ async function handleDownload(entry: FileEntry) {
 }
 
 .sort-indicator {
-  margin-left: 2px;
+  margin-inline-start: 2px;
   font-size: 11px;
 }
 
@@ -209,7 +209,7 @@ async function handleDownload(entry: FileEntry) {
 }
 
 .file-size {
-  text-align: right;
+  text-align: end;
   color: $text-secondary;
 }
 

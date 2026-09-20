@@ -47,6 +47,7 @@ vi.mock('@/components/hermes/chat/VirtualMessageList.vue', () => ({
     },
     template: `
       <div class="virtual-message-list-stub">
+        <slot v-if="messages.length === 0" name="empty" />
         <slot name="before" />
         <slot name="item" v-for="message in messages" :key="message.id" :message="message" />
       </div>
@@ -57,13 +58,19 @@ vi.mock('@/components/hermes/chat/VirtualMessageList.vue', () => ({
 vi.mock('@/components/hermes/chat/MessageItem.vue', () => ({
   default: defineComponent({
     name: 'MessageItem',
-    props: { message: { type: Object, required: true } },
+    props: {
+      message: { type: Object, required: true },
+      assistantAgent: { type: Object, default: null },
+      userProfileName: { type: String, default: 'default' },
+      userProfileAvatar: { type: Object, default: null },
+    },
     template: '<div class="stub-message" :data-id="message.id">{{ message.content }}</div>',
   }),
 }))
 
 import MessageList from '@/components/hermes/chat/MessageList.vue'
 import { useChatStore, type Message, type Session } from '@/stores/hermes/chat'
+import { useProfilesStore } from '@/stores/hermes/profiles'
 
 function makeMessage(id: string): Message {
   return { id, role: 'user', content: id, timestamp: Date.now() }
@@ -106,6 +113,8 @@ describe('MessageList session scroll position', () => {
     vi.clearAllMocks()
 
     const sessionASnapshot = {
+      anchorMessageId: 'scroll-session-a-message',
+      anchorOffset: -24,
       scrollTop: 320,
       scrollHeight: 1200,
       clientHeight: 500,
@@ -120,6 +129,8 @@ describe('MessageList session scroll position', () => {
 
     vi.clearAllMocks()
     mockCaptureViewportPosition.mockReturnValue({
+      anchorMessageId: 'scroll-session-b-message',
+      anchorOffset: 12,
       scrollTop: 40,
       scrollHeight: 1000,
       clientHeight: 500,
@@ -147,6 +158,114 @@ describe('MessageList session scroll position', () => {
     await flushSessionScroll()
 
     expect(wrapper.getComponent({ name: 'VirtualMessageList' }).props('virtualized')).toBe(false)
+  })
+
+  it('shows Ekko while the session is pending, then displays the loaded Agent', async () => {
+    const chatStore = useChatStore()
+    chatStore.activeSessionId = 'pending-session'
+    chatStore.activeSession = null
+    const wrapper = mount(MessageList, { global: { stubs: { Transition: false } } })
+    await flushSessionScroll()
+
+    expect(wrapper.get('.empty-logo').attributes('src')).toBe('/coding-agents/ekko-agent.png')
+    expect(wrapper.get('.empty-logo').attributes('alt')).toBe('Ekko')
+    expect(wrapper.get('.empty-state p').text()).toBe('chat.emptyStateAgent')
+
+    chatStore.activeSession = {
+      ...makeSession('pending-session'),
+      source: 'coding_agent',
+      agent: 'codex',
+      codingAgentId: 'codex',
+      messages: [],
+    }
+    await flushSessionScroll()
+    expect(wrapper.get('.empty-logo').attributes('src')).toBe('/coding-agents/codex-openai.png')
+    expect(wrapper.get('.empty-logo').attributes('alt')).toBe('Codex')
+    wrapper.unmount()
+  })
+
+  it.each([
+    {
+      runtime: 'Hermes',
+      session: { source: 'global_agent', agent: 'hermes' },
+      logo: '/coding-agents/hermes.png',
+      alt: 'Hermes',
+    },
+    {
+      runtime: 'Ekko',
+      session: { source: 'global_agent', agent: 'ekko-agent', codingAgentId: 'ekko-agent' },
+      logo: '/coding-agents/ekko-agent.png',
+      alt: 'Ekko',
+    },
+  ])('renders the $runtime logo for an empty Global Agent session', async ({ session, logo, alt }) => {
+    const chatStore = useChatStore()
+    const activeSession = { ...makeSession(`empty-${alt}`), ...session, messages: [] } as Session
+    chatStore.activeSessionId = activeSession.id
+    chatStore.activeSession = activeSession
+
+    const wrapper = mount(MessageList, {
+      global: {
+        stubs: { Transition: false },
+      },
+    })
+    await flushSessionScroll()
+
+    const emptyLogo = wrapper.get('.empty-logo')
+    expect(emptyLogo.attributes('src')).toBe(logo)
+    expect(emptyLogo.attributes('alt')).toBe(alt)
+  })
+
+  it.each([
+    ['Hermes', { agent: 'hermes' }, '/coding-agents/hermes.png'],
+    ['Ekko', { agent: 'ekko-agent', codingAgentId: 'ekko-agent' }, '/coding-agents/ekko-agent.png'],
+    ['Claude', { source: 'coding_agent', agent: 'claude', codingAgentId: 'claude-code' }, '/coding-agents/claude-code.svg'],
+    ['Codex', { source: 'coding_agent', agent: 'codex', codingAgentId: 'codex' }, '/coding-agents/codex-openai.png'],
+    ['Pi', { source: 'coding_agent', agent: 'pi', codingAgentId: 'pi' }, '/coding-agents/pi.svg'],
+    ['Grok', { source: 'coding_agent', agent: 'grok', codingAgentId: 'grok' }, '/coding-agents/grok.svg'],
+    ['OpenCode', { source: 'coding_agent', agent: 'opencode', codingAgentId: 'opencode' }, '/coding-agents/opencode.png'],
+  ])('passes the $runtime avatar to Assistant message bubbles', async (label, identity, src) => {
+    const chatStore = useChatStore()
+    const activeSession = { ...makeSession(`avatar-${label}`), ...identity } as Session
+    activeSession.messages = [{
+      id: `assistant-${label}`,
+      role: 'assistant',
+      content: label,
+      timestamp: Date.now(),
+    }]
+    chatStore.activeSessionId = activeSession.id
+    chatStore.activeSession = activeSession
+
+    const wrapper = mount(MessageList, {
+      global: { stubs: { Transition: false } },
+    })
+    await flushSessionScroll()
+
+    expect(wrapper.getComponent({ name: 'MessageItem' }).props('assistantAgent')).toEqual({ label, src })
+  })
+
+  it('passes the active session profile identity to user message bubbles', async () => {
+    const chatStore = useChatStore()
+    const profilesStore = useProfilesStore()
+    const avatar = { type: 'generated' as const, seed: 'research-avatar' }
+    profilesStore.activeProfileName = 'default'
+    profilesStore.profiles = [
+      { name: 'default', active: true, model: '', alias: '' },
+      { name: 'research', active: false, model: '', alias: 'Researcher', avatar },
+    ]
+
+    const session = makeSession('profile-identity-session')
+    session.profile = 'research'
+    chatStore.activeSessionId = session.id
+    chatStore.activeSession = session
+
+    const wrapper = mount(MessageList, {
+      global: { stubs: { Transition: false } },
+    })
+    await flushSessionScroll()
+
+    const messageItem = wrapper.getComponent({ name: 'MessageItem' })
+    expect(messageItem.props('userProfileName')).toBe('Researcher')
+    expect(messageItem.props('userProfileAvatar')).toEqual(avatar)
   })
 
   it('shows a history link instead of loading more after the live chat message cap', async () => {
@@ -287,6 +406,54 @@ describe('MessageList session scroll position', () => {
 
     expect(document.body.querySelector('.approval-float-panel--global')).toBeNull()
     expect(wrapper.find('.message-float-stack .approval-float-panel').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('has no close control and keeps explicit approval and reply actions usable', async () => {
+    const chatStore = useChatStore()
+    const session = makeSession('stale-prompt-session')
+    chatStore.activeSessionId = session.id
+    chatStore.activeSession = session
+    chatStore.pendingApprovals.set(session.id, {
+      sessionId: session.id,
+      approvalId: 'stale-approval',
+      command: 'npm run test',
+      description: 'Run tests',
+      choices: ['once', 'deny'],
+      allowPermanent: false,
+      isMemoryWrite: false,
+      requestedAt: Date.now() - 10,
+    })
+    chatStore.pendingClarifies.set(session.id, {
+      sessionId: session.id,
+      clarifyId: 'stale-clarify',
+      question: 'Which environment?',
+      choices: ['staging'],
+      initialResponse: '',
+      responseMode: 'input',
+      timeoutMs: 1,
+      requestedAt: Date.now() - 10,
+    })
+
+    const wrapper = mount(MessageList, {
+      global: { stubs: { Transition: false } },
+    })
+    await nextTick()
+
+    expect(wrapper.find('.float-panel-close').exists()).toBe(false)
+    const approvalPanel = wrapper.findAll('.approval-float-panel')
+      .find(panel => panel.text().includes('chat.approvalTitle'))
+    expect(approvalPanel).toBeTruthy()
+    await approvalPanel!.get('.approval-float-actions button').trigger('click')
+    expect(chatStore.pendingApprovals.has(session.id)).toBe(false)
+    expect(chatStore.pendingClarifies.has(session.id)).toBe(true)
+
+    await nextTick()
+    const clarifyPanel = wrapper.findAll('.approval-float-panel')
+      .find(panel => panel.text().includes('chat.clarifyTitle'))
+    expect(clarifyPanel).toBeTruthy()
+    await clarifyPanel!.get('.approval-float-actions button').trigger('click')
+    expect(chatStore.pendingClarifies.has(session.id)).toBe(false)
     wrapper.unmount()
   })
 })

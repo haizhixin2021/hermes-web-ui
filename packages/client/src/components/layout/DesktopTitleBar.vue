@@ -92,6 +92,7 @@ onMounted(() => {
   height: 36px;
   display: flex;
   align-items: center;
+  direction: ltr;
   border: 0;
   border-radius: 12px;
   background: $bg-main-surface;
@@ -119,7 +120,7 @@ onMounted(() => {
     width: 138px;
 
     .desktop-titlebar__controls {
-      border-left: 0;
+      border-inline-start: 0;
       border-radius: inherit;
       clip-path: inset(0 round 12px);
     }
@@ -150,7 +151,7 @@ onMounted(() => {
   align-items: stretch;
   overflow: hidden;
   contain: paint;
-  border-left: 1px solid $border-color;
+  border-inline-start: 1px solid $border-color;
   border-radius: 0 12px 12px 0;
   clip-path: inset(0 round 0 12px 12px 0);
   -webkit-app-region: no-drag;

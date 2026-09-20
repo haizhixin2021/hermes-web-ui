@@ -2,7 +2,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { NSelect, NButton, NSpin, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
-import { fetchLogFiles, fetchLogs, type LogEntry } from '@/api/hermes/logs'
+import { fetchLogFiles, fetchLogs, type LogEntry } from '@/api/studio/logs'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -14,8 +14,12 @@ const lineCount = ref(100)
 const levelFilter = ref<string>('')
 const searchQuery = ref('')
 
+function displayLogName(name: string): string {
+  return name.replace(/^ekko-agent(?=\/|$)/, 'Ekko')
+}
+
 const logOptions = computed(() =>
-  logFiles.value.map(f => ({ label: `${f.name} (${f.size})`, value: f.name })),
+  logFiles.value.map(f => ({ label: `${displayLogName(f.name)} (${f.size})`, value: f.name })),
 )
 
 const levelOptions = computed(() => [
@@ -81,6 +85,16 @@ async function loadLogs() {
 
 onMounted(async () => {
   logFiles.value = await fetchLogFiles()
+  if (!logFiles.value.some(file => file.name === selectedLog.value)) {
+    selectedLog.value = logFiles.value.find(file => file.name === 'webui')?.name
+      || logFiles.value.find(file => file.name === 'ekko-agent')?.name
+      || logFiles.value[0]?.name
+      || ''
+  }
+  if (!selectedLog.value) {
+    entries.value = []
+    return
+  }
   await loadLogs()
 })
 </script>
@@ -135,7 +149,7 @@ onMounted(async () => {
           >
             <span class="log-time">{{ formatTime(entry.timestamp) }}</span>
             <span class="log-level" :class="levelClass(entry.level)">{{ entry.level }}</span>
-            <span class="log-logger">{{ entry.logger }}</span>
+            <span class="log-logger">{{ displayLogName(entry.logger) }}</span>
             <template v-if="parseAccessLog(entry.message)">
               <span class="access-method">{{ parseAccessLog(entry.message)!.method }}</span>
               <span class="access-path">{{ parseAccessLog(entry.message)!.path }}</span>
@@ -225,19 +239,19 @@ onMounted(async () => {
   font-family: $font-code;
   font-size: 12px;
   line-height: 1.6;
-  border-left: 2px solid transparent;
+  border-inline-start: 2px solid transparent;
 
   &:hover {
     background-color: rgba(var(--accent-primary-rgb), 0.03);
   }
 
   &.level-error {
-    border-left-color: $error;
+    border-inline-start-color: $error;
     .log-message { color: $error; }
   }
 
   &.level-warning {
-    border-left-color: $warning;
+    border-inline-start-color: $warning;
     .log-message { color: $warning; }
   }
 }

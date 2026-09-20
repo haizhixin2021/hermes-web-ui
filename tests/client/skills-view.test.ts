@@ -61,6 +61,21 @@ vi.mock('naive-ui', () => ({
 import SkillsView from '@/views/hermes/SkillsView.vue'
 
 describe('SkillsView', () => {
+  it.each(['codex', 'pi', 'grok', 'opencode', 'dsh', 'claude'] as const)('shows shared skills without edit controls for %s', async target => {
+    mockFetchSkills.mockResolvedValue({ categories: [{ name: 'misc', description: '', skills: [
+      { name: 'shared', description: 'Shared', source: 'local', readonly: true },
+    ] }], archived: [] })
+    const wrapper = mount(SkillsView, {
+      props: { target },
+      global: { stubs: {
+        SkillList: true, SkillDetail: defineComponent({ props: ['readonly'], template: '<article class="detail" :data-readonly="readonly" />' }),
+        SkillImportModal: true, SkillExternalDirsModal: true, PendingWriteApprovals: true,
+      } },
+    })
+    await flushPromises()
+    expect(wrapper.get('.detail').attributes('data-readonly')).toBe('true')
+    wrapper.unmount()
+  })
   beforeEach(() => {
     vi.clearAllMocks()
     mockProfilesStore.activeProfileName = 'default'
@@ -120,6 +135,8 @@ describe('SkillsView', () => {
     expect(detail.attributes('data-skill')).toBe('first-skill')
     expect(detail.text()).toBe('first-skill')
     expect(wrapper.get('.skill-list-stub').attributes('data-selected')).toBe('alpha/first-skill')
+    expect(wrapper.find('.n-select-stub').exists()).toBe(false)
+    expect(mockFetchSkills).toHaveBeenCalledWith(undefined, 'hermes')
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })
 })

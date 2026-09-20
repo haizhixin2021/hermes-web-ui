@@ -8,15 +8,15 @@ import {
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 import { useMessage } from "naive-ui";
-import { downloadFile, getDownloadUrl } from "@/api/hermes/download";
+import { downloadFile, getDownloadUrl } from "@/api/studio/download";
 import { copyToClipboard } from "@/utils/clipboard";
 import { parseThinking, countThinkingChars } from "@/utils/thinking-parser";
 import { useChatStore } from "@/stores/hermes/chat";
 import { useFilesStore } from "@/stores/hermes/files";
 import { useToolPanelStore } from "@/stores/hermes/tool-panel";
-import { useProfilesStore } from "@/stores/hermes/profiles";
 import { useSettingsStore } from "@/stores/hermes/settings";
-import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
+import { chatSessionAgentAvatar, type ChatAgentAvatar } from "@/utils/chat-agent-avatar";
+import TaskPlanCard from './TaskPlanCard.vue';
 import ToolChangeCard from "./ToolChangeCard.vue";
 import {
   copyTextToClipboard,
@@ -30,8 +30,11 @@ import { useVoiceSettings } from "@/composables/useVoiceSettings";
 import { speedToEdgeRate, hzToEdgePitch } from "@/utils/ttsHelpers";
 import { formatChatTimestamp } from "@/utils/chat-timestamp";
 import { openSubagentStream, subagentIdFromToolCall } from "@/utils/hermes/subagent-stream";
-import type { WorkspaceRunChangeSummary } from "@/api/hermes/sessions";
-import { isServerTtsProvider } from "@/api/hermes/tts";
+import type { WorkspaceRunChangeSummary } from "@/api/studio/sessions";
+import { isServerTtsProvider } from "@/api/studio/tts";
+import type { ProfileAvatar as ProfileAvatarData } from "@/api/hermes/profiles";
+import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
+import ImagePreviewOverlay from "./ImagePreviewOverlay.vue";
 
 const MarkdownRenderer = defineAsyncComponent(async () => (await import("./MarkdownRenderer.vue")).default);
 
@@ -43,7 +46,18 @@ const JSON_MAX_KEYS_PER_OBJECT = 50;
 const JSON_MAX_ITEMS_PER_ARRAY = 50;
 const JSON_TRUNCATED_KEY = "__truncated__";
 
-const props = defineProps<{ message: Message; highlight?: boolean; headingIdPrefix?: string; showForkAction?: boolean }>();
+const props = withDefaults(defineProps<{
+  message: Message
+  highlight?: boolean
+  headingIdPrefix?: string
+  showForkAction?: boolean
+  assistantAgent?: ChatAgentAvatar
+  userProfileName?: string
+  userProfileAvatar?: ProfileAvatarData | null
+}>(), {
+  userProfileName: "default",
+  userProfileAvatar: null,
+});
 const { t } = useI18n();
 const toast = useMessage();
 
@@ -71,7 +85,7 @@ const statusItems = computed(() => {
 });
 
 type DisplayContentFile = {
-  type: 'image' | 'file'
+  type: 'image' | 'video' | 'file'
   name: string
   path?: string
   url?: string
@@ -168,6 +182,7 @@ const contentFiles = computed<DisplayContentFile[] | null>(() => {
   if (!isContentBlockArray.value) return null;
 
   return contentBlocks.value!.flatMap<DisplayContentFile>((block, index) => {
+    if ((block as any).video_frame === true) return []
     if (block.type === 'image') {
       return [{
         type: 'image' as const,
@@ -177,9 +192,11 @@ const contentFiles = computed<DisplayContentFile[] | null>(() => {
       }].filter(file => file.path)
     }
     if (block.type === 'file') {
+      const name = String((block as any).name || `file-${index + 1}`)
+      const mediaType = String((block as any).media_type || '')
       return [{
-        type: 'file' as const,
-        name: String((block as any).name || `file-${index + 1}`),
+        type: isVideo(mediaType, name) ? 'video' as const : 'file' as const,
+        name,
         path: String((block as any).path || ''),
         context: typeof (block as any).context === 'string' ? (block as any).context : undefined,
       }].filter(file => file.path)
@@ -209,12 +226,10 @@ const selectedToolChangeFileId = ref<number | null>(null);
 const chatStore = useChatStore();
 const filesStore = useFilesStore();
 const toolPanelStore = useToolPanelStore();
-const profilesStore = useProfilesStore();
 const settingsStore = useSettingsStore();
 const speech = useGlobalSpeech();
 const voiceSettings = useVoiceSettings();
-const assistantProfileName = computed(() => chatStore.activeSession?.profile || profilesStore.activeProfileName || "default");
-const assistantProfileAvatar = computed(() => profilesStore.profiles.find(profile => profile.name === assistantProfileName.value)?.avatar);
+const assistantAgent = computed(() => props.assistantAgent || chatSessionAgentAvatar(chatStore.activeSession));
 
 // Copy entire bubble content
 const copyableContent = computed(() => {
@@ -356,6 +371,10 @@ const timeStr = computed(() => formatChatTimestamp(props.message.timestamp));
 
 function isImage(type: string): boolean {
   return type.startsWith("image/");
+}
+
+function isVideo(type: string, name: string): boolean {
+  return type.startsWith("video/") || /\.(?:mp4|mov|m4v|webm)$/i.test(name);
 }
 
 function formatSize(bytes: number): string {
@@ -608,7 +627,11 @@ function toggleWorkspaceChange(changeId: string): void {
 }
 
 const hasToolDetails = computed(
-  () => !!(toolArgsPayload.value.full || toolResultPayload.value.full),
+  () => !!(
+    props.message.reasoning?.trim()
+    || toolArgsPayload.value.full
+    || toolResultPayload.value.full
+  ),
 );
 const isSubagentTool = computed(() => subagentIdFromToolCall(props.message.toolCallId) !== null);
 const hasInlineToolDetails = computed(() => hasToolDetails.value && !isSubagentTool.value);
@@ -756,6 +779,7 @@ function handleSpeechToggle() {
       model: voiceSettings.doubaoModel.value,
       voice: voiceSettings.doubaoVoice.value,
       stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
+      speed: voiceSettings.doubaoSpeed.value || undefined,
     })
     return
   }
@@ -837,6 +861,7 @@ onMounted(() => {
           model: voiceSettings.doubaoModel.value,
           voice: voiceSettings.doubaoVoice.value,
           stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
+          speed: voiceSettings.doubaoSpeed.value || undefined,
         }).catch(handleAutoplayTtsError)
       } else if (isServerTtsProvider(voiceSettings.provider.value)) {
         void speech.openaiPlay(props.message.id, content, {
@@ -875,7 +900,8 @@ onBeforeUnmount(() => {
     :class="[message.role, { highlight }]"
     :id="`message-${message.id}`"
   >
-    <template v-if="message.role === 'tool'">
+    <TaskPlanCard v-if="message.taskPlan" :plan="message.taskPlan" />
+    <template v-else-if="message.role === 'tool'">
       <div
         class="tool-line"
         :class="{ expandable: hasInlineToolDetails || isSubagentTool, 'subagent-entry': isSubagentTool }"
@@ -923,31 +949,89 @@ onBeforeUnmount(() => {
           v-if="message.toolStatus === 'running'"
           class="tool-spinner"
         ></span>
-        <span v-if="message.toolStatus === 'error'" class="tool-error-badge">{{
-          t("chat.error")
-        }}</span>
+        <svg
+          v-if="message.toolStatus === 'done'"
+          class="tool-status-icon tool-success-icon"
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          :aria-label="t('subagent.completed')"
+          role="img"
+        >
+          <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.14" />
+          <path
+            d="m8 12 3 3 5-6"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <svg
+          v-if="message.toolStatus === 'error'"
+          class="tool-error-badge tool-status-icon"
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          :aria-label="t('subagent.failed')"
+          role="img"
+        >
+          <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.14" />
+          <path
+            d="m9 9 6 6m0-6-6 6"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+          />
+        </svg>
       </div>
-      <div v-if="!isSubagentTool && toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
-        <div v-if="formattedToolArgs" class="tool-detail-section" data-copy-source="tool-args">
-          <div class="tool-detail-label">{{ t("chat.arguments") }}</div>
-          <div class="tool-detail-code-block" v-html="renderedToolArgs"></div>
+      <Transition name="tool-detail-expand">
+        <div
+          v-if="!isSubagentTool && toolExpanded && hasToolDetails"
+          class="tool-details-expand"
+        >
+          <div class="tool-details" @click="handleToolDetailClick">
+            <div v-if="message.reasoning?.trim()" class="tool-detail-section">
+              <div class="tool-detail-label">{{ t("chat.thinkingLabel") }}</div>
+              <div class="tool-detail-reasoning">
+                <MarkdownRenderer :content="message.reasoning" />
+              </div>
+            </div>
+            <div v-if="formattedToolArgs" class="tool-detail-section" data-copy-source="tool-args">
+              <div class="tool-detail-label">{{ t("chat.arguments") }}</div>
+              <div class="tool-detail-code-block" v-html="renderedToolArgs"></div>
+            </div>
+            <div v-if="formattedToolResult" class="tool-detail-section" data-copy-source="tool-result">
+              <div class="tool-detail-label">{{ t("chat.result") }}</div>
+              <div class="tool-detail-code-block" v-html="renderedToolResult"></div>
+            </div>
+          </div>
         </div>
-        <div v-if="formattedToolResult" class="tool-detail-section" data-copy-source="tool-result">
-          <div class="tool-detail-label">{{ t("chat.result") }}</div>
-          <div class="tool-detail-code-block" v-html="renderedToolResult"></div>
-        </div>
-      </div>
+      </Transition>
     </template>
     <template v-else>
       <div class="msg-body">
-        <ProfileAvatar
-          v-if="message.role === 'assistant'"
-          class="msg-avatar"
-          :name="assistantProfileName"
-          :avatar="assistantProfileAvatar"
-          :size="40"
-        />
         <div class="msg-content" :class="message.role">
+          <div v-if="message.role === 'user'" class="message-author user-message-author">
+            <span class="message-author-name" dir="auto">{{ userProfileName }}</span>
+            <ProfileAvatar
+              class="user-profile-avatar"
+              :name="userProfileName"
+              :avatar="userProfileAvatar"
+              :size="22"
+            />
+          </div>
+          <div v-if="message.role === 'assistant'" class="message-author assistant-message-author">
+            <img
+              class="msg-avatar"
+              :src="assistantAgent.src"
+              :alt="assistantAgent.label"
+              draggable="false"
+            >
+            <span class="message-author-name" dir="auto">{{ assistantAgent.label }}</span>
+          </div>
           <div
             class="message-bubble"
             :class="{
@@ -963,7 +1047,11 @@ onBeforeUnmount(() => {
                 v-for="att in message.attachments"
                 :key="att.id"
                 class="msg-attachment"
-                :class="{ image: isImage(att.type), 'has-context': !!att.context }"
+                :class="{
+                  image: isImage(att.type),
+                  video: message.role === 'user' && isVideo(att.type, att.name),
+                  'has-context': !!att.context,
+                }"
               >
                 <template v-if="isImage(att.type) && att.url">
                   <img
@@ -972,6 +1060,19 @@ onBeforeUnmount(() => {
                     class="msg-attachment-thumb"
                     @click="previewUrl = att.url"
                   />
+                </template>
+                <template v-else-if="message.role === 'user' && isVideo(att.type, att.name) && att.url">
+                  <video
+                    class="msg-attachment-video"
+                    :src="att.url"
+                    controls
+                    playsinline
+                    preload="metadata"
+                  ></video>
+                  <div class="msg-attachment-video-footer">
+                    <span class="att-name">{{ att.name }}</span>
+                    <span class="att-size">{{ formatSize(att.size) }}</span>
+                  </div>
                 </template>
                 <template v-else>
                   <div class="msg-attachment-file" @click="handleAttachmentDownload(att)" style="cursor: pointer;" :title="t('download.downloadFile')">
@@ -1055,7 +1156,11 @@ onBeforeUnmount(() => {
                     v-for="(file, idx) in contentFiles"
                     :key="idx"
                     class="msg-attachment"
-                    :class="{ image: file.type === 'image', 'has-context': !!file.context }"
+                    :class="{
+                      image: file.type === 'image',
+                      video: file.type === 'video',
+                      'has-context': !!file.context,
+                    }"
                   >
                     <template v-if="file.type === 'image'">
                       <img
@@ -1064,6 +1169,18 @@ onBeforeUnmount(() => {
                         class="msg-attachment-thumb"
                         @click="previewUrl = getContentFileUrl(file)"
                       />
+                    </template>
+                    <template v-else-if="file.type === 'video'">
+                      <video
+                        class="msg-attachment-video"
+                        :src="getContentFileUrl(file)"
+                        controls
+                        playsinline
+                        preload="metadata"
+                      ></video>
+                      <div class="msg-attachment-video-footer">
+                        <span class="att-name">{{ file.name }}</span>
+                      </div>
                     </template>
                     <template v-else>
                       <div
@@ -1200,11 +1317,12 @@ onBeforeUnmount(() => {
       </div>
     </template>
   </div>
-  <Teleport to="body">
-    <div v-if="previewUrl" class="image-preview-overlay" @click.self="previewUrl = null">
-      <img :src="previewUrl" class="image-preview-img" @click="previewUrl = null" />
-    </div>
-  </Teleport>
+  <ImagePreviewOverlay
+    v-if="previewUrl"
+    :src="previewUrl"
+    alt=""
+    @close="previewUrl = null"
+  />
 </template>
 
 <style scoped lang="scss">
@@ -1248,10 +1366,13 @@ onBeforeUnmount(() => {
     }
 
     .msg-avatar {
-      width: 40px;
-      height: 40px;
+      width: 22px;
+      height: 22px;
       flex-shrink: 0;
-      margin-top: 2px;
+      box-sizing: border-box;
+      border: 1px solid #fff;
+      border-radius: 50%;
+      object-fit: cover;
     }
 
     .message-bubble {
@@ -1314,6 +1435,40 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
 }
 
+.message-author {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-bottom: 6px;
+  color: $text-secondary;
+  font-size: 12px;
+  line-height: 22px;
+}
+
+.user-message-author {
+  align-self: flex-end;
+  justify-content: flex-end;
+}
+
+.assistant-message-author {
+  align-self: flex-start;
+  justify-content: flex-start;
+}
+
+.message-author-name {
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-profile-avatar {
+  box-sizing: border-box;
+  border: 1px solid #fff;
+}
+
 .message-bubble {
   padding: 10px 14px;
   font-size: var(--font-size-base);
@@ -1327,14 +1482,14 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
 
   &.system {
-    border-left: 3px solid $warning;
+    border-inline-start: 3px solid $warning;
     border-radius: $radius-sm;
     max-width: 80%;
     background-color: rgba(var(--warning-rgb), 0.06);
   }
 
   &.command {
-    border-left: none;
+    border-inline-start: none;
     border: 1px solid rgba(var(--accent-primary-rgb), 0.12);
     background-color: rgba(var(--accent-primary-rgb), 0.04);
     color: $text-secondary;
@@ -1511,6 +1666,11 @@ onBeforeUnmount(() => {
   &.image.has-context {
     max-width: 420px;
   }
+
+  &.video {
+    width: min(360px, 100%);
+    background: #000;
+  }
 }
 
 .msg-attachment-thumb {
@@ -1524,6 +1684,39 @@ onBeforeUnmount(() => {
 .msg-attachment.has-context .msg-attachment-thumb {
   max-width: 420px;
   max-height: 280px;
+}
+
+.msg-attachment-video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 280px;
+  background: #000;
+  object-fit: contain;
+}
+
+.msg-attachment-video-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  color: $text-secondary;
+  background: rgba(0, 0, 0, 0.04);
+  font-size: 12px;
+
+  .att-name {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .att-size {
+    flex-shrink: 0;
+    color: $text-muted;
+    font-size: 11px;
+  }
 }
 
 .msg-attachment-context {
@@ -1607,7 +1800,7 @@ onBeforeUnmount(() => {
   .thinking-body {
     margin-top: 6px;
     padding: 6px 10px;
-    border-left: 2px solid $border-light;
+    border-inline-start: 2px solid $border-light;
     font-size: 13px;
     opacity: 0.85;
     font-style: italic;
@@ -1759,21 +1952,55 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 
+.tool-status-icon {
+  flex: 0 0 auto;
+  margin-inline-start: 4px;
+}
+
+.tool-success-icon {
+  color: $success;
+}
+
 .tool-error-badge {
-  font-size: 9px;
   color: $error;
-  background: rgba(var(--error-rgb), 0.08);
-  padding: 0 4px;
-  border-radius: 3px;
-  line-height: 14px;
-  margin-left: 4px;
+}
+
+.tool-details-expand {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .tool-details {
-  margin-left: 16px;
+  min-height: 0;
+  overflow: hidden;
+  margin-inline-start: 16px;
   margin-top: 2px;
-  border-left: 2px solid $border-light;
-  padding-left: 10px;
+  border-inline-start: 2px solid $border-light;
+  padding-inline-start: 10px;
+}
+
+.tool-detail-expand-enter-active,
+.tool-detail-expand-leave-active {
+  transition:
+    grid-template-rows 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 150ms ease,
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tool-detail-expand-enter-from,
+.tool-detail-expand-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-detail-expand-enter-active,
+  .tool-detail-expand-leave-active {
+    transition: none;
+  }
 }
 
 .tool-detail-section {
@@ -1814,6 +2041,25 @@ onBeforeUnmount(() => {
   }
 }
 
+.tool-detail-reasoning {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid $border-light;
+  border-radius: $radius-sm;
+  background: rgba(var(--text-primary-rgb), 0.035);
+  color: $text-secondary;
+  font-size: 12px;
+
+  :deep(.markdown-body > :first-child) {
+    margin-top: 0;
+  }
+
+  :deep(.markdown-body > :last-child) {
+    margin-bottom: 0;
+  }
+}
+
 .tool-change-loading {
   color: $text-muted;
   font-size: 11px;
@@ -1834,7 +2080,7 @@ onBeforeUnmount(() => {
   width: 2px;
   height: 1em;
   background-color: $text-muted;
-  margin-left: 2px;
+  margin-inline-start: 2px;
   vertical-align: text-bottom;
   animation: blink 0.8s infinite;
 }
@@ -1880,24 +2126,6 @@ onBeforeUnmount(() => {
   }
 }
 
-.image-preview-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  background: rgba(0, 0, 0, 0.85);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-
-.image-preview-img {
-  max-width: 90vw;
-  max-height: 90vh;
-  object-fit: contain;
-  border-radius: 4px;
-}
-
 @media (max-width: $breakpoint-mobile) {
   .message.user .msg-body {
     max-width: 100%;
@@ -1912,13 +2140,13 @@ onBeforeUnmount(() => {
   }
 
   :global(.tool-change-drawer-header) {
-    padding-left: 12px !important;
-    padding-right: 12px !important;
+    padding-inline-start: 12px !important;
+    padding-inline-end: 12px !important;
   }
 
   :global(.tool-change-drawer-body-content) {
-    padding-left: 8px !important;
-    padding-right: 8px !important;
+    padding-inline-start: 8px !important;
+    padding-inline-end: 8px !important;
   }
 }
 </style>

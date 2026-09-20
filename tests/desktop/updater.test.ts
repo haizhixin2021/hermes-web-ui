@@ -14,8 +14,10 @@ describe('desktop updater helpers', () => {
     expect(pendingUpdateDirectories({
       appDataPath: 'C:\\Users\\A\\AppData\\Roaming',
       localAppData: 'C:\\Users\\A\\AppData\\Local',
-      appName: 'Hermes Studio',
+      appName: 'Ekko Studio',
     })).toEqual(expect.arrayContaining([
+      'C:\\Users\\A\\AppData\\Local/Ekko Studio-updater/pending',
+      'C:\\Users\\A\\AppData\\Local/ekko-studio-updater/pending',
       'C:\\Users\\A\\AppData\\Local/Hermes Studio-updater/pending',
       'C:\\Users\\A\\AppData\\Local/hermes-studio-updater/pending',
       'C:\\Users\\A\\AppData\\Roaming/hermes-studio-updater/pending',
@@ -42,7 +44,7 @@ describe('desktop updater helpers', () => {
     expect(mainSource).toContain('async function prepareAppShutdown(): Promise<void>')
     expect(mainSource).toContain('await stopWebUiServer().catch(() => undefined)')
     expect(mainSource).toContain('initAutoUpdater({ beforeQuitAndInstall: prepareAppShutdown })')
-    expect(mainSource).toContain('try {\n      await prepareAppShutdown()\n    } finally {\n      app.exit(0)')
+    expect(mainSource).toContain('try {\n      await prepareAppShutdown()\n    } finally {\n      appLifecycle.finalizeExit(0)')
 
     const prepareCurrentInstance = updaterSource.indexOf('await options.beforeQuitAndInstall?.()')
     const stopOtherInstances = updaterSource.indexOf('await stopOtherWindowsAppInstances()', prepareCurrentInstance)

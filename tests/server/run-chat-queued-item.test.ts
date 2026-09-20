@@ -5,6 +5,13 @@ const resumeBridgeRunMock = vi.hoisted(() => vi.fn(async () => {}))
 const handleCodingAgentRunMock = vi.hoisted(() => vi.fn(async () => {}))
 const loadSessionStateFromDbMock = vi.hoisted(() => vi.fn())
 const ensureReadyMock = vi.hoisted(() => vi.fn())
+const ekkoBoundaryInterruptMock = vi.hoisted(() => vi.fn())
+const codingAgentRunManagerMock = vi.hoisted(() => ({
+  interruptForQueueInsertion: vi.fn(),
+  resolveApproval: vi.fn(() => ({ handled: false, resolved: false })),
+  resolveClarification: vi.fn(() => ({ handled: false, resolved: false })),
+  stop: vi.fn(),
+}))
 const sessionCommandMocks = vi.hoisted(() => ({
   handleSessionCommand: vi.fn(),
   isSessionCommand: vi.fn(() => false),
@@ -14,76 +21,117 @@ const bridgeMock = vi.hoisted(() => ({
   status: vi.fn(),
   statusIfLoaded: vi.fn(),
   interrupt: vi.fn(),
+  requestBoundaryInterrupt: vi.fn(),
   approvalRespond: vi.fn(),
 }))
 const sessionStoreMocks = vi.hoisted(() => ({
   clearSessionMessages: vi.fn(),
 }))
+const listWorkspaceRunChangesForAssistantMessagesMock = vi.hoisted(() => vi.fn(() => []))
 
-vi.mock('../../packages/server/src/services/hermes/run-chat/handle-bridge-run', () => ({
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run', () => ({
   handleBridgeRun: handleBridgeRunMock,
   resumeBridgeRun: resumeBridgeRunMock,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/run-chat/load-state', () => ({
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/load-state', () => ({
   loadSessionStateFromDb: loadSessionStateFromDbMock,
   resolveRunSource: vi.fn((source?: string) => source || 'cli'),
 }))
 
-vi.mock('../../packages/server/src/services/hermes/run-chat/handle-coding-agent-run', () => ({
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/handle-coding-agent-run', () => ({
   handleCodingAgentRun: handleCodingAgentRunMock,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/run-chat/session-command', () => sessionCommandMocks)
+vi.mock('../../packages/server/src/modules/studio/services/chat-run/session-command', () => sessionCommandMocks)
 
-vi.mock('../../packages/server/src/services/hermes/agent-bridge', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/bridge/index', () => ({
   AgentBridgeClient: vi.fn(() => bridgeMock),
 }))
 
-vi.mock('../../packages/server/src/services/hermes/agent-bridge/manager', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/bridge/manager', () => ({
   getAgentBridgeManager: vi.fn(() => ({
     ensureReady: ensureReadyMock,
   })),
 }))
 
-vi.mock('../../packages/server/src/services/logger', () => ({
+vi.mock('../../packages/server/src/modules/ekko/services/manager', () => ({
+  getGlobalEkkoAgent: vi.fn(() => ({ requestBoundaryInterrupt: ekkoBoundaryInterruptMock })),
+  hasGlobalEkkoBackgroundTasks: vi.fn(() => false),
+  abortGlobalEkkoBackgroundTasks: vi.fn(async () => 0),
+}))
+
+vi.mock('../../packages/server/src/modules/coding-agents/services/runtime/run-manager', () => ({
+  codingAgentRunManager: codingAgentRunManagerMock,
+}))
+
+vi.mock('../../packages/server/src/modules/studio/public/chat-agent-runtime', () => ({
+  getChatCodingAgentMcpServers: vi.fn(() => ({ 'ekko-studio-interaction': { command: 'studio' }, 'ekko-studio-use': { command: 'studio' } })),
+  resolveChatEkkoMcpServers: vi.fn(() => ({ 'ekko-studio-use': { command: 'studio' } })),
+  createPrimaryAgentBridge: vi.fn(() => bridgeMock),
+  getPrimaryAgentBridgeManager: vi.fn(() => ({ start: vi.fn(async () => {}), ensureReady: ensureReadyMock })),
+  redactPrimaryAgentBridgeError: (error?: string) => error,
+  chatCodingAgentRunManager: codingAgentRunManagerMock,
+  handleChatCodingAgentSessionCommand: sessionCommandMocks.handleSessionCommand,
+  parseChatCodingAgentSessionCommand: sessionCommandMocks.parseSessionCommand,
+  getChatEkkoAgent: vi.fn(() => ({ requestBoundaryInterrupt: ekkoBoundaryInterruptMock })),
+  respondToChatEkkoToolApproval: vi.fn(() => ({ handled: false, resolved: false })),
+  respondToChatEkkoClarification: vi.fn(() => ({ handled: false, resolved: false })),
+}))
+
+vi.mock('../../packages/server/src/modules/studio/public/logging', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }))
 
-vi.mock('../../packages/server/src/lib/llm-prompt', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/runs/prompt', () => ({
   getSystemPrompt: vi.fn(() => 'system prompt'),
 }))
 
-vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
+vi.mock('../../packages/server/src/modules/studio/repositories/session-store', () => ({
   clearSessionMessages: sessionStoreMocks.clearSessionMessages,
   getSession: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli' })),
-  getSessionMetadata: vi.fn(() => ({ id: 'session-1', profile: 'default', source: 'cli' })),
+  getSessionMetadata: vi.fn(() => ({
+    id: 'session-1',
+    profile: 'default',
+    source: 'cli',
+    model: 'gpt-5.5',
+    provider: 'openai',
+    api_mode: 'responses',
+    reasoning_effort: 'high',
+    push_enabled: 1,
+  })),
   getSessionDetail: vi.fn(() => null),
 }))
 
-vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
+vi.mock('../../packages/server/src/modules/studio/repositories/workspace-run-changes-store', () => ({
+  listWorkspaceRunChangesForAssistantMessages: listWorkspaceRunChangesForAssistantMessagesMock,
+}))
+
+vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => ({
+  readConfigYamlForProfile: vi.fn(async () => ({ mcp_servers: { 'ekko-studio-interaction': { command: 'studio' }, 'ekko-studio-use': { command: 'studio' } } })),
   getActiveProfileName: vi.fn(() => 'default'),
   getProfileDir: vi.fn(() => '/tmp/hermes-default'),
   listProfileNamesFromDisk: vi.fn(() => ['default']),
 }))
 
-vi.mock('../../packages/server/src/middleware/user-auth', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({
   authenticateUserToken: vi.fn(),
   isAuthEnabled: vi.fn(async () => false),
 }))
 
-vi.mock('../../packages/server/src/db/hermes/users-store', () => ({
+vi.mock('../../packages/server/src/modules/studio/repositories/users-store', () => ({
   userCanAccessProfile: vi.fn(() => true),
 }))
 
 function makeServerHarness() {
   const handlers = new Map<string, Function>()
   const sockets = new Map<string, any>()
+  const roomEmit = vi.fn()
   const namespace = {
     adapter: { rooms: new Map([['session:session-1', new Set(['socket-1'])]]) },
     sockets,
     emit: vi.fn(),
-    to: vi.fn(() => ({ emit: vi.fn() })),
+    to: vi.fn(() => ({ emit: roomEmit })),
     use: vi.fn(),
     on: vi.fn(),
   }
@@ -101,12 +149,14 @@ function makeServerHarness() {
     }),
   }
   sockets.set(socket.id, socket)
-  return { handlers, io, namespace, socket }
+  return { handlers, io, namespace, roomEmit, socket }
 }
 
 describe('ChatRunSocket queued bridge runs', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    listWorkspaceRunChangesForAssistantMessagesMock.mockReset()
+    listWorkspaceRunChangesForAssistantMessagesMock.mockReturnValue([])
     ensureReadyMock.mockResolvedValue({
       reachable: true,
       status: 'ready',
@@ -114,6 +164,20 @@ describe('ChatRunSocket queued bridge runs', () => {
     })
     bridgeMock.statusIfLoaded.mockResolvedValue({ ok: true, exists: false, running: false, loaded: false })
     bridgeMock.interrupt.mockResolvedValue({ ok: true })
+    bridgeMock.requestBoundaryInterrupt.mockResolvedValue({
+      ok: true,
+      status: 'accepted',
+      session_id: 'session-1',
+      run_id: 'run-1',
+      phase: 'tool_batch',
+      guarantee: 'strict',
+    })
+    ekkoBoundaryInterruptMock.mockReturnValue({
+      status: 'accepted', runId: 'run-ekko', phase: 'model',
+    })
+    codingAgentRunManagerMock.interruptForQueueInsertion.mockReturnValue({
+      status: 'interrupted', runId: 'run-codex', responseId: 'response-codex',
+    })
     bridgeMock.approvalRespond.mockResolvedValue({ resolved: true })
     sessionStoreMocks.clearSessionMessages.mockReturnValue(2)
     loadSessionStateFromDbMock.mockResolvedValue({
@@ -125,8 +189,232 @@ describe('ChatRunSocket queued bridge runs', () => {
     })
   })
 
+  it('drops a queued shared message when its execution-time authorization fails', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, socket, roomEmit } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const authorize = vi.fn(async () => { throw new Error('share_revoked') })
+    ;(server as any).sessionMap.set('session-1', { isWorking: true, events: [], queue: [] })
+    ;(server as any).runQueuedItem(socket, 'session-1', { queue_id: 'revoked-queue', input: 'blocked', profile: 'default', authorize })
+    await vi.waitFor(() => expect(roomEmit).toHaveBeenCalledWith('run.failed', expect.objectContaining({ queue_id: 'revoked-queue', error: 'share_access_denied' })))
+    expect(handleBridgeRunMock).not.toHaveBeenCalled()
+    expect((server as any).sessionMap.get('session-1').isWorking).toBe(false)
+  })
+
+  it('promotes a selected queued Hermes message and arms one strict boundary request', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, roomEmit, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).onConnection(socket)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, isAborting: false, events: [],
+      source: 'cli', webhookAgent: 'bridge', profile: 'default', runId: 'run-1',
+      queue: [
+        { queue_id: 'queue-first', input: 'first', profile: 'default', source: 'cli' },
+        { queue_id: 'queue-selected', input: 'selected', profile: 'default', source: 'cli' },
+      ],
+    })
+
+    handlers.get('insert_queued_run')?.({ session_id: 'session-1', queue_id: 'queue-selected' })
+
+    await vi.waitFor(() => expect(bridgeMock.requestBoundaryInterrupt).toHaveBeenCalledOnce())
+    expect(bridgeMock.requestBoundaryInterrupt).toHaveBeenCalledWith('session-1', 'run-1', 'default')
+    expect((server as any).sessionMap.get('session-1').queue.map((item: any) => item.queue_id))
+      .toEqual(['queue-selected', 'queue-first'])
+    expect((server as any).sessionMap.get('session-1').queueInsertion).toEqual(expect.objectContaining({
+      queueId: 'queue-selected',
+      runId: 'run-1',
+      runtime: 'hermes',
+      phase: 'waiting_for_tool_batch',
+      guarantee: 'strict',
+    }))
+    expect(roomEmit).toHaveBeenCalledWith('run.queued', expect.objectContaining({
+      queued_messages: [
+        expect.objectContaining({ id: 'queue-selected', content: 'selected' }),
+        expect.objectContaining({ id: 'queue-first', content: 'first' }),
+      ],
+    }))
+    expect(roomEmit).toHaveBeenCalledWith('run.queue_insertion.updated', expect.objectContaining({
+      queue_id: 'queue-selected',
+      phase: 'waiting_for_tool_batch',
+      guarantee: 'strict',
+    }))
+  })
+
+  it('deduplicates rapid queue insertion clicks for the same active run', async () => {
+    let resolveBoundary!: (value: any) => void
+    bridgeMock.requestBoundaryInterrupt.mockImplementationOnce(() => new Promise(resolve => { resolveBoundary = resolve }))
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).onConnection(socket)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, events: [], source: 'cli', webhookAgent: 'bridge',
+      profile: 'default', runId: 'run-1',
+      queue: [
+        { queue_id: 'queue-first', input: 'first', profile: 'default', source: 'cli' },
+        { queue_id: 'queue-second', input: 'second', profile: 'default', source: 'cli' },
+      ],
+    })
+
+    handlers.get('insert_queued_run')?.({ session_id: 'session-1', queue_id: 'queue-first' })
+    handlers.get('insert_queued_run')?.({ session_id: 'session-1', queue_id: 'queue-second' })
+    await vi.waitFor(() => expect(bridgeMock.requestBoundaryInterrupt).toHaveBeenCalledOnce())
+    expect((server as any).sessionMap.get('session-1').queue.map((item: any) => item.queue_id))
+      .toEqual(['queue-first', 'queue-second'])
+
+    resolveBoundary({
+      ok: true, status: 'accepted', session_id: 'session-1', run_id: 'run-1',
+      phase: 'model', guarantee: 'strict',
+    })
+    await vi.waitFor(() => expect((server as any).sessionMap.get('session-1').queueInsertion.phase)
+      .toBe('stopping_current_turn'))
+  })
+
+  it('tags a Bridge run.failed terminal event as an intentional queue insertion stop', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, events: [], source: 'cli', webhookAgent: 'bridge',
+      profile: 'default', runId: 'run-1',
+      queue: [{ queue_id: 'queue-next', input: 'next', profile: 'default', source: 'cli' }],
+      queueInsertion: {
+        generation: 'generation-1', queueId: 'queue-next', runId: 'run-1', runtime: 'hermes',
+        phase: 'stopping_current_turn', guarantee: 'strict', requestedAt: 123,
+      },
+    })
+    const payload = {
+      event: 'run.failed',
+      run_id: 'run-1',
+      error: 'Agent reported failure',
+      queue_remaining: 1,
+    }
+
+    ;(server as any).observeQueueInsertionRunEvent('session-1', 'run.failed', payload)
+
+    expect(payload).toEqual(expect.objectContaining({
+      interrupted: true,
+      stop_reason: 'queue_insertion',
+      boundary_guarantee: 'strict',
+    }))
+  })
+
+  it('immediately interrupts a Codex run before starting the selected queued message', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).onConnection(socket)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, events: [], source: 'coding_agent', webhookAgent: 'codex',
+      profile: 'default', runId: 'run-codex',
+      queue: [{ queue_id: 'queue-codex', input: 'later', profile: 'default', source: 'coding_agent' }],
+    })
+
+    handlers.get('insert_queued_run')?.({ session_id: 'session-1', queue_id: 'queue-codex' })
+    await vi.waitFor(() => expect(codingAgentRunManagerMock.interruptForQueueInsertion).toHaveBeenCalledOnce())
+
+    expect(bridgeMock.requestBoundaryInterrupt).not.toHaveBeenCalled()
+    expect(codingAgentRunManagerMock.interruptForQueueInsertion)
+      .toHaveBeenCalledWith('session-1', 'run-codex')
+    expect((server as any).sessionMap.get('session-1').queueInsertion).toEqual(expect.objectContaining({
+      queueId: 'queue-codex',
+      runtime: 'codex',
+      phase: 'stopping_current_turn',
+      guarantee: 'immediate',
+    }))
+
+    server.markExternalRunCompleted('session-1', 'run.failed')
+    await vi.waitFor(() => expect(handleCodingAgentRunMock).toHaveBeenCalledOnce())
+    expect(handleCodingAgentRunMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+      session_id: 'session-1',
+      input: 'later',
+    }))
+    expect((server as any).sessionMap.get('session-1')).toEqual(expect.objectContaining({
+      queue: [],
+      queueInsertion: undefined,
+      isWorking: true,
+    }))
+  })
+
+  it('routes Ekko and Global Agent queue insertion through the Ekko-owned boundary', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).onConnection(socket)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, events: [], source: 'coding_agent', webhookAgent: 'ekko',
+      profile: 'default', runId: 'run-ekko',
+      queue: [{
+        queue_id: 'queue-global-ekko', input: 'follow up', profile: 'default',
+        source: 'coding_agent', sessionSource: 'global_agent', codingAgentId: 'ekko-agent',
+      }],
+    })
+
+    handlers.get('insert_queued_run')?.({ session_id: 'session-1', queue_id: 'queue-global-ekko' })
+
+    await vi.waitFor(() => expect(ekkoBoundaryInterruptMock).toHaveBeenCalledOnce())
+    expect(ekkoBoundaryInterruptMock).toHaveBeenCalledWith({
+      sessionId: 'session-1', expectedRunId: 'run-ekko',
+    })
+    expect((server as any).sessionMap.get('session-1').queueInsertion).toEqual(expect.objectContaining({
+      runtime: 'ekko', phase: 'stopping_current_turn', queueId: 'queue-global-ekko',
+    }))
+  })
+
+  it('broadcasts insertion completion before dequeuing the selected message', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io, roomEmit, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, events: [], source: 'cli', profile: 'default', runId: 'run-1',
+      queue: [{ queue_id: 'queue-selected', input: 'selected', profile: 'default', source: 'cli' }],
+      queueInsertion: {
+        generation: 'generation-1', queueId: 'queue-selected', runId: 'run-1', runtime: 'hermes',
+        phase: 'waiting_for_tool_batch', guarantee: 'strict', requestedAt: 123,
+      },
+    })
+
+    expect((server as any).dequeueNextQueuedRun(socket, 'session-1', 'default')).toBe(true)
+
+    expect(roomEmit).toHaveBeenCalledWith('run.queue_insertion.updated', expect.objectContaining({
+      generation: 'generation-1', queue_id: 'queue-selected', phase: 'starting_queued_message',
+    }))
+    expect((server as any).sessionMap.get('session-1').queueInsertion).toBeUndefined()
+    await vi.waitFor(() => expect(handleBridgeRunMock).toHaveBeenCalled())
+    expect(handleBridgeRunMock.mock.calls.at(-1)?.[2]).toEqual(expect.objectContaining({
+      queue_id: 'queue-selected', input: 'selected',
+    }))
+  })
+
+  it('restores the authoritative insertion phase when another page resumes the session', async () => {
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [], isWorking: true, isAborting: false, events: [], source: 'cli', profile: 'default',
+      runId: 'run-1',
+      queue: [{ queue_id: 'queue-selected', input: 'selected', profile: 'default', source: 'cli' }],
+      queueInsertion: {
+        generation: 'generation-1', queueId: 'queue-selected', runId: 'run-1', runtime: 'hermes',
+        phase: 'waiting_for_tool_batch', guarantee: 'strict', requestedAt: 123,
+      },
+    })
+    ;(server as any).onConnection(socket)
+
+    await handlers.get('resume')?.({ session_id: 'session-1' })
+
+    expect(socket.emit).toHaveBeenCalledWith('resumed', expect.objectContaining({
+      session_id: 'session-1',
+      queueInsertion: {
+        generation: 'generation-1', run_id: 'run-1', queue_id: 'queue-selected', runtime: 'hermes',
+        phase: 'waiting_for_tool_batch', guarantee: 'strict', requested_at: 123,
+      },
+    }))
+  })
+
   it('dispatches unknown slash bridge input through the normal bridge run path', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { handlers, io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
     ;(server as any).onConnection(socket)
@@ -155,7 +443,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('persists normal queued bridge messages when they are dequeued', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -189,7 +477,7 @@ describe('ChatRunSocket queued bridge runs', () => {
       })
     })
 
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, namespace } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -208,6 +496,38 @@ describe('ChatRunSocket queued bridge runs', () => {
     expect(namespace.to).toHaveBeenCalledWith('session:session-1')
   })
 
+  it('notifies an optional runAndWait observer without changing accumulated output', async () => {
+    handleBridgeRunMock.mockImplementationOnce(async (_nsp, _socket, data) => {
+      data.onEvent?.('reasoning.delta', { delta: 'thought' })
+      data.onEvent?.('message.delta', { delta: 'answer' })
+      data.onEvent?.('run.completed', { run_id: 'run-observed', output: 'answer' })
+    })
+
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { io } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    const onEvent = vi.fn()
+
+    const result = await server.runAndWait({
+      session_id: 'session-1',
+      input: 'observed workflow node',
+      source: 'workflow',
+      session_source: 'workflow',
+    }, { profile: 'default', onEvent })
+
+    expect(onEvent.mock.calls.map(call => call[0])).toEqual([
+      'reasoning.delta',
+      'message.delta',
+      'run.completed',
+    ])
+    expect(result).toMatchObject({
+      ok: true,
+      run_id: 'run-observed',
+      output: 'answer',
+      reasoning: 'thought',
+    })
+  })
+
   it('auto-responds once to approvals only when runAndWait enables it', async () => {
     handleBridgeRunMock.mockImplementationOnce(async (_nsp, _socket, data) => {
       data.onEvent?.('approval.requested', {
@@ -221,7 +541,7 @@ describe('ChatRunSocket queued bridge runs', () => {
       })
     })
 
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, namespace } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -254,7 +574,7 @@ describe('ChatRunSocket queued bridge runs', () => {
       })
     })
 
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -269,7 +589,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('persists the visible plan command when dequeuing expanded plan command runs', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -296,7 +616,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('queues coding-agent messages while a coding-agent turn is active', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { handlers, io, namespace, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
     ;(server as any).onConnection(socket)
@@ -333,7 +653,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('dequeues coding-agent messages when an external coding-agent run completes', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
     ;(server as any).sessionMap.set('session-1', {
@@ -368,7 +688,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('checks bridge resume status without cold-starting the profile worker', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { handlers, io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -381,7 +701,73 @@ describe('ChatRunSocket queued bridge runs', () => {
     expect(socket.emit).toHaveBeenCalledWith('resumed', expect.objectContaining({
       session_id: 'session-1',
       isWorking: false,
+      model: 'gpt-5.5',
+      provider: 'openai',
+      api_mode: 'responses',
+      reasoning_effort: 'high',
+      push_enabled: true,
     }))
+  })
+
+  it('serves App resume messages once and then accepts their cache id', async () => {
+    listWorkspaceRunChangesForAssistantMessagesMock.mockReturnValue([{
+      change_id: 'change-1',
+      assistant_message_id: '2',
+      files: [],
+    }])
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
+    const { handlers, io, socket } = makeServerHarness()
+    const server = new ChatRunSocket(io as any)
+    ;(server as any).sessionMap.set('session-1', {
+      messages: [
+        { id: 1, session_id: 'session-1', role: 'user', content: 'hello', timestamp: 1 },
+        { id: 2, session_id: 'session-1', role: 'assistant', content: 'world', timestamp: 2 },
+      ],
+      isWorking: false,
+      isAborting: false,
+      events: [],
+      queue: [],
+    })
+
+    ;(server as any).onConnection(socket)
+    await handlers.get('app.resume')?.({ session_id: 'session-1', id: '' })
+    const initial = socket.emit.mock.calls.find(([event]) => event === 'app.resumed')?.[1]
+
+    expect(initial).toMatchObject({
+      session_id: 'session-1',
+      messages: expect.any(Array),
+      workspaceRunChanges: [expect.objectContaining({ change_id: 'change-1' })],
+      messagesCached: false,
+    })
+    expect(initial.id).toMatch(/^[a-f0-9]{32}$/)
+    expect(socket.join).toHaveBeenCalledWith('session:session-1')
+
+    socket.emit.mockClear()
+    await handlers.get('app.resume')?.({ session_id: 'session-1', id: initial.id })
+
+    expect(socket.emit).toHaveBeenCalledWith('app.resumed', expect.objectContaining({
+      session_id: 'session-1',
+      id: initial.id,
+      messagesCached: true,
+    }))
+    const cached = socket.emit.mock.calls.find(([event]) => event === 'app.resumed')?.[1]
+    expect(cached).not.toHaveProperty('messages')
+    expect(cached).not.toHaveProperty('workspaceRunChanges')
+
+    listWorkspaceRunChangesForAssistantMessagesMock.mockReturnValue([{
+      change_id: 'change-2',
+      assistant_message_id: '2',
+      files: [],
+    }])
+    socket.emit.mockClear()
+    await handlers.get('app.resume')?.({ session_id: 'session-1', id: initial.id })
+
+    const changedDiff = socket.emit.mock.calls.find(([event]) => event === 'app.resumed')?.[1]
+    expect(changedDiff).toMatchObject({
+      messagesCached: false,
+      workspaceRunChanges: [expect.objectContaining({ change_id: 'change-2' })],
+    })
+    expect(changedDiff.id).not.toBe(initial.id)
   })
 
   it('reattaches a loaded running bridge run during resume', async () => {
@@ -392,7 +778,7 @@ describe('ChatRunSocket queued bridge runs', () => {
       current_run_id: 'run-1',
       loaded: true,
     })
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { handlers, io, socket } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
 
@@ -414,7 +800,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   })
 
   it('clears chat-run memory state when an external MCU clear removes history', async () => {
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io, namespace } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
     const abortController = new AbortController()
@@ -454,14 +840,15 @@ describe('ChatRunSocket queued bridge runs', () => {
     expect(abortSpy).toHaveBeenCalled()
     expect(bridgeMock.interrupt).toHaveBeenCalledWith('session-1', 'Session cleared', 'default')
     expect((server as any).sessionMap.has('session-1')).toBe(false)
-    expect(namespace.emit).toHaveBeenCalledWith('session.command', expect.objectContaining({
+    expect(namespace.to).toHaveBeenCalledWith(['studio-account', 'session:session-1'])
+    expect(namespace.to('session:session-1').emit).toHaveBeenCalledWith('session.command', expect.objectContaining({
       event: 'session.command',
       session_id: 'session-1',
       action: 'clear',
       clearHistory: true,
       deleted: 2,
     }))
-    expect(namespace.emit).toHaveBeenCalledWith('resumed', expect.objectContaining({
+    expect(namespace.to('session:session-1').emit).toHaveBeenCalledWith('resumed', expect.objectContaining({
       session_id: 'session-1',
       messages: [],
       messageTotal: 0,
@@ -472,7 +859,7 @@ describe('ChatRunSocket queued bridge runs', () => {
   it('aborts the underlying runner when runAndWait reaches its timeout', async () => {
     vi.useFakeTimers()
     handleBridgeRunMock.mockImplementationOnce(async () => new Promise(() => {}))
-    const { ChatRunSocket } = await import('../../packages/server/src/services/hermes/run-chat')
+    const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const { io } = makeServerHarness()
     const server = new ChatRunSocket(io as any)
     const abortSpy = vi.spyOn(server, 'abortSession').mockResolvedValue(undefined)

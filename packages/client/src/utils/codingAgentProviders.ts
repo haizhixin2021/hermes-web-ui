@@ -7,6 +7,7 @@ const SCOPED_EXTERNAL_AGENT_AUTH_PROVIDERS = new Set([
   'qwen-oauth',
   'nous',
   'claude-oauth',
+  'minimax-oauth',
 ])
 
 export function isAuthModelProvider(provider?: string): boolean {
@@ -25,4 +26,15 @@ export function usesServerManagedProviderAuth(
   provider?: string,
 ): boolean {
   return agentId === 'ekko-agent' && isAuthModelProvider(provider)
+}
+
+export function isKeylessModelProvider(provider?: string): boolean {
+  return provider === 'opencode-free'
+}
+
+export function openCodeFreeApiMode(model: string): 'chat_completions' | 'anthropic_messages' | 'codex_responses' {
+  const normalized = model.toLowerCase()
+  if (/^(claude-|qwen)/.test(normalized)) return 'anthropic_messages'
+  if (/^(gpt-|grok-|muse-spark)/.test(normalized)) return 'codex_responses'
+  return 'chat_completions'
 }

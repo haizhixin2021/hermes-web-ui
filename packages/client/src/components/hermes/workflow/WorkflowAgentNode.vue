@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DshSessionPresetSelect from "@/components/coding-agents/dsh/DshSessionPresetSelect.vue"
 import { computed, ref } from 'vue'
 import { Handle, Position, type NodeProps } from '@vue-flow/core'
 import { NodeResizer } from '@vue-flow/node-resizer'
@@ -7,10 +8,10 @@ import { useI18n } from 'vue-i18n'
 import WorkflowModelSelector from './WorkflowModelSelector.vue'
 import WorkflowFieldHelp from './WorkflowFieldHelp.vue'
 import type { WorkflowAgentNodeData, WorkflowAgentNodeEditableData } from './types'
-import type { CodingAgentApiMode } from '@/api/coding-agents'
-import type { ProviderApiMode } from '@/api/hermes/system'
-import { getFileDownloadUrl } from '@/api/hermes/files'
-import { isAuthModelProvider } from '@/utils/codingAgentProviders'
+import type { ChatCodingAgentId, CodingAgentApiMode } from '@/api/coding-agents'
+import type { ProviderApiMode } from '@/api/studio/provider-api-mode'
+import { getFileDownloadUrl } from '@/api/studio/files'
+import { canScopedCodingAgentUseProvider } from '@/utils/codingAgentProviders'
 
 import '@vue-flow/node-resizer/dist/style.css'
 
@@ -30,9 +31,18 @@ const statusTip = computed(() => (
     : ''
 ))
 const isCodingAgent = computed(() => props.data.agent !== 'hermes')
+const supportsGlobalMode = computed(() => ['claude-code', 'codex', 'pi', 'grok', 'opencode', 'dsh'].includes(props.data.agent))
+const usesScopedModel = computed(() => !supportsGlobalMode.value || props.data.agentMode !== 'global')
+const agentModeOptions = computed(() => [
+  { label: t('codingAgents.launchModeGlobal'), value: 'global' },
+  { label: t('codingAgents.launchModeScoped'), value: 'scoped' },
+])
 const selectableModelGroups = computed(() => (
   isCodingAgent.value
-    ? props.data.modelGroups.filter(group => !isAuthModelProvider(group.provider))
+    ? props.data.modelGroups.filter(group => canScopedCodingAgentUseProvider(
+        props.data.agent as ChatCodingAgentId,
+        group.provider,
+      ))
     : props.data.modelGroups
 ))
 const apiModeOptions = computed(() => [
@@ -178,7 +188,19 @@ async function uploadImages(files: File[]) {
         :placeholder="t('workflow.node.agent')"
         @update:value="value => updateField('agent', value as string)"
       />
+      <DshSessionPresetSelect v-if="data.agent === 'dsh'" :model-value="data.agentPreset" :disabled="data.readonly"
+        @update:model-value="updateField('agentPreset', $event)" @valid="updateField('agentPresetReady', $event)" />
+      <NSelect
+        v-if="supportsGlobalMode"
+        :value="data.agentMode"
+        :options="agentModeOptions"
+        size="small"
+        :disabled="data.readonly"
+        :placeholder="t('codingAgents.launchModeScope')"
+        @update:value="value => updateField('agentMode', value as 'scoped' | 'global')"
+      />
       <WorkflowModelSelector
+        v-if="usesScopedModel"
         :provider="data.provider"
         :model="data.model"
         :groups="selectableModelGroups"
@@ -186,7 +208,7 @@ async function uploadImages(files: File[]) {
         @select="handleModelSelect"
       />
       <NSelect
-        v-if="isCodingAgent"
+        v-if="isCodingAgent && usesScopedModel"
         :value="data.apiMode"
         :options="apiModeOptions"
         size="small"
@@ -195,6 +217,7 @@ async function uploadImages(files: File[]) {
         @update:value="value => updateField('apiMode', value as CodingAgentApiMode)"
       />
       <NSelect
+        v-if="usesScopedModel"
         :value="data.reasoningEffort"
         :options="reasoningEffortOptions"
         size="small"
@@ -477,6 +500,7 @@ async function uploadImages(files: File[]) {
   padding: 12px;
   flex: 1;
   min-height: 0;
+  overflow-y: auto;
 }
 
 .node-field-row {
@@ -534,7 +558,7 @@ async function uploadImages(files: File[]) {
   gap: 8px;
   max-height: 180px;
   overflow-y: auto;
-  padding-right: 2px;
+  padding-inline-end: 2px;
 }
 
 .image-upload-input {

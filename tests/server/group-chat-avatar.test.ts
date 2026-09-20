@@ -11,7 +11,7 @@ describe('group chat member avatars', () => {
     vi.stubEnv('AUTH_JWT_SECRET', 'test-secret')
     const { DatabaseSync } = await import('node:sqlite')
     db = new DatabaseSync(':memory:')
-    vi.doMock('../../packages/server/src/db/index', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
       getDb: () => db,
       getStoragePath: () => ':memory:',
     }))
@@ -24,16 +24,16 @@ describe('group chat member avatars', () => {
     chatServer = null
     httpServer = null
     db = null
-    vi.doUnmock('../../packages/server/src/db/index')
+    vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
     vi.unstubAllEnvs()
     vi.resetModules()
   })
 
   async function initStorage() {
-    const schemas = await import('../../packages/server/src/db/hermes/schemas')
+    const schemas = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
     schemas.initAllHermesTables()
-    const users = await import('../../packages/server/src/db/hermes/users-store')
-    const { GroupChatServer } = await import('../../packages/server/src/services/hermes/group-chat')
+    const users = await import('../../packages/server/src/modules/studio/repositories/users-store')
+    const { GroupChatServer } = await import('../../packages/server/src/modules/studio/sockets/group-chat')
     httpServer = createServer()
     chatServer = new GroupChatServer(httpServer)
     return {
@@ -80,6 +80,19 @@ describe('group chat member avatars', () => {
 
     expect(storage.getRoomMembers('room-1')).toMatchObject([
       { userId: 'anonymous-participant', name: 'Unmatched Display', avatar: '' },
+    ])
+  })
+
+  it('does not expose an account avatar to a guest that chooses the same display name', async () => {
+    const { users, storage } = await initStorage()
+    const alice = users.createUser({ username: 'alice', password: 'pw' })!
+    const aliceAvatar = JSON.stringify({ type: 'image', dataUrl: 'data:image/png;base64,ALICE' })
+    users.setUserAvatar(alice.id, aliceAvatar)
+
+    storage.addRoomMember('room-1', 'guest-browser-id', 'alice', '')
+
+    expect(storage.getRoomMembers('room-1')).toMatchObject([
+      { userId: 'guest-browser-id', name: 'alice', avatar: '' },
     ])
   })
 

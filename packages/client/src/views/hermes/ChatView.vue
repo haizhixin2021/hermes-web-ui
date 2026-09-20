@@ -25,7 +25,15 @@ const routeProfile = computed(() => {
 })
 
 const isStandaloneChat = computed(() => route.meta?.standaloneChat === true)
-const productTitle = 'Hermes Studio'
+type ChatContentMode = 'chat' | 'connections' | 'agents' | 'models'
+
+const contentMode = computed<ChatContentMode>(() => {
+  if (route.name === 'hermes.connections') return 'connections'
+  if (route.name === 'hermes.agentManager') return 'agents'
+  if (route.name === 'hermes.models') return 'models'
+  return 'chat'
+})
+const productTitle = 'Ekko Studio'
 const tabTitle = computed(() => {
   if (route.name !== 'hermes.session' && route.name !== 'desktop.chat') return productTitle
   return chatStore.activeSession?.title?.trim() || productTitle
@@ -46,6 +54,14 @@ async function loadRouteSession() {
   }
 }
 
+async function applyRouteProfile() {
+  const profile = routeProfile.value
+  if (!profile || profile === profilesStore.activeProfileName) return
+  if (!profilesStore.profiles.some(item => item.name === profile)) return
+  await profilesStore.switchProfile(profile)
+  chatStore.setSessionProfileFilter(profile)
+}
+
 onMounted(async () => {
   chatStore.setRuntimeMode('default')
   appStore.loadModels()
@@ -56,11 +72,13 @@ onMounted(async () => {
     settingsStore.fetchSettings(),
   ])
   chatStore.validateSessionProfileFilter(profilesStore.profiles.map(profile => profile.name))
+  await applyRouteProfile()
   await loadRouteSession()
 })
 
 watch([routeSessionId, routeProfile], async ([sessionId]) => {
   if (!chatStore.sessionsLoaded) return
+  await applyRouteProfile()
   if (!sessionId) {
     await chatStore.loadSessions(chatStore.sessionProfileFilter)
     return
@@ -79,7 +97,10 @@ watch([routeSessionId, routeProfile], async ([sessionId]) => {
 
 <template>
   <div class="chat-view" :class="{ 'chat-view--standalone': isStandaloneChat }">
-    <ChatPanel :standalone="isStandaloneChat" />
+    <ChatPanel
+      :standalone="isStandaloneChat"
+      :content-mode="contentMode"
+    />
   </div>
 </template>
 

@@ -1,7 +1,7 @@
 import { createHash, generateKeyPairSync, sign } from 'crypto'
 import { createServer, type Server } from 'http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { LanDeviceInfo } from '../../packages/server/src/services/lan-discovery'
+import type { LanDeviceInfo } from '../../packages/server/src/modules/studio/services/network/lan-discovery'
 
 const keyPair = generateKeyPairSync('ed25519', {
   publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -37,11 +37,11 @@ describe('devices controller', () => {
     vi.resetModules()
     const { DatabaseSync } = await import('node:sqlite')
     db = new DatabaseSync(':memory:')
-    vi.doMock('../../packages/server/src/db/index', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
       getDb: () => db,
       getStoragePath: () => ':memory:',
     }))
-    const { initAllHermesTables } = await import('../../packages/server/src/db/hermes/schemas')
+    const { initAllHermesTables } = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
     initAllHermesTables()
   })
 
@@ -49,13 +49,49 @@ describe('devices controller', () => {
     db?.close()
     db = null
     vi.unstubAllGlobals()
-    vi.doUnmock('../../packages/server/src/db/index')
-    vi.doUnmock('../../packages/server/src/services/login-limiter')
+    vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
+    vi.doUnmock('../../packages/server/src/modules/studio/services/auth/login-limiter')
     vi.resetModules()
   })
 
+  it('allows cross-origin reads of public device link info', async () => {
+    vi.doMock('../../packages/server/src/modules/studio/public/system-info', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/public/system-info')>(
+        '../../packages/server/src/modules/studio/public/system-info',
+      )
+      return {
+        ...actual,
+        getPublicSystemInfo: async () => ({
+          device_id: 'hwui_local',
+          device_public_key: keyPair.publicKey,
+          computer_name: 'local',
+          os: { type: 'TestOS', platform: 'linux', release: '1', arch: 'x64' },
+          hermes_agent_version: 'v1',
+          hermes_web_ui_version: '1',
+        }),
+      }
+    })
+
+    const set = vi.fn()
+    const ctx: any = { set }
+    const { deviceLinkInfoController } = await import('../../packages/server/src/modules/studio/controllers/devices')
+
+    await deviceLinkInfoController(ctx)
+
+    expect(set).toHaveBeenCalledWith('Access-Control-Allow-Origin', '*')
+    expect(ctx.body).toEqual(expect.objectContaining({
+      device_id: 'hwui_local',
+      http_port: expect.any(Number),
+      app_relay: {
+        protocol: 'socket.io',
+        namespace: '/app-relay',
+        direct: true,
+      },
+    }))
+  })
+
   it('returns the inbound pairing status for a signed device status request', async () => {
-    const { requestInboundDeviceLink, updateInboundStatus } = await import('../../packages/server/src/db/hermes/devices-store')
+    const { requestInboundDeviceLink, updateInboundStatus } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
     requestInboundDeviceLink(device)
     updateInboundStatus(device.id, 'approved')
 
@@ -74,7 +110,7 @@ describe('devices controller', () => {
       },
     }
 
-    const { requestDeviceLinkStatusController } = await import('../../packages/server/src/controllers/devices')
+    const { requestDeviceLinkStatusController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkStatusController(ctx)
 
     expect(ctx.status).toBeUndefined()
@@ -100,8 +136,8 @@ describe('devices controller', () => {
       },
     }
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestDeviceLinkController } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestDeviceLinkController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkController(ctx)
 
     expect(ctx.status).toBeUndefined()
@@ -127,8 +163,8 @@ describe('devices controller', () => {
       },
     }
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestDeviceLinkController } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestDeviceLinkController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkController(ctx)
 
     expect(ctx.status).toBe(403)
@@ -138,7 +174,7 @@ describe('devices controller', () => {
 
   it('does not trust forged forwarded private IPs for public pairing requests', async () => {
     const recordPairingFailure = vi.fn()
-    vi.doMock('../../packages/server/src/services/login-limiter', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/services/auth/login-limiter', () => ({
       checkPairing: (ip: string) => {
         expect(ip).toBe('8.8.8.8')
         return { allowed: true }
@@ -164,8 +200,8 @@ describe('devices controller', () => {
       },
     }
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestDeviceLinkController } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestDeviceLinkController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkController(ctx)
 
     expect(ctx.status).toBe(403)
@@ -193,8 +229,8 @@ describe('devices controller', () => {
       },
     }
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestDeviceLinkController } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestDeviceLinkController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkController(ctx)
 
     expect(ctx.status).toBe(403)
@@ -203,7 +239,7 @@ describe('devices controller', () => {
   })
 
   it('stores public pairing requests as pending when the startup pairing code is valid', async () => {
-    vi.doMock('../../packages/server/src/services/device-pairing-code', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/services/devices/pairing-code', () => ({
       getDevicePairingCode: () => 'pair-secret',
       verifyDevicePairingCode: (value: unknown) => value === 'pair-secret',
     }))
@@ -225,8 +261,8 @@ describe('devices controller', () => {
       },
     }
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestDeviceLinkController } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestDeviceLinkController } = await import('../../packages/server/src/modules/studio/controllers/devices')
     await requestDeviceLinkController(ctx)
 
     expect(ctx.status).toBeUndefined()
@@ -236,12 +272,12 @@ describe('devices controller', () => {
   })
 
   it('prefers public request hosts when building copyable pairing links', async () => {
-    vi.doMock('../../packages/server/src/services/device-pairing-code', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/services/devices/pairing-code', () => ({
       getDevicePairingCode: () => 'pair-secret',
       verifyDevicePairingCode: () => false,
     }))
 
-    const { getDevicePairingLink } = await import('../../packages/server/src/controllers/devices')
+    const { getDevicePairingLink } = await import('../../packages/server/src/modules/studio/controllers/devices')
     const ctx: any = {
       protocol: 'http',
       host: 'studio.example.com',
@@ -262,17 +298,17 @@ describe('devices controller', () => {
       return {
         ...actual,
         networkInterfaces: () => ({
-          lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
-          en0: [{ family: 'IPv4', internal: false, address: '192.168.1.88' }],
+          lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1', netmask: '255.0.0.0' }],
+          en0: [{ family: 'IPv4', internal: false, address: '192.168.1.88', netmask: '255.255.255.0' }],
         }),
       }
     })
-    vi.doMock('../../packages/server/src/services/device-pairing-code', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/services/devices/pairing-code', () => ({
       getDevicePairingCode: () => 'pair-secret',
       verifyDevicePairingCode: () => false,
     }))
 
-    const { getDevicePairingLink } = await import('../../packages/server/src/controllers/devices')
+    const { getDevicePairingLink } = await import('../../packages/server/src/modules/studio/controllers/devices')
     const ctx: any = {
       protocol: 'http',
       host: 'localhost:8648',
@@ -287,10 +323,33 @@ describe('devices controller', () => {
     })
   })
 
+  it('uses a private request host instead of a Docker container interface for pairing links', async () => {
+    vi.doMock('../../packages/server/src/modules/studio/services/devices/pairing-code', () => ({
+      getDevicePairingCode: () => 'pair-secret',
+      verifyDevicePairingCode: () => false,
+    }))
+
+    const { getDevicePairingLink } = await import('../../packages/server/src/modules/studio/controllers/devices')
+    const ctx: any = {
+      protocol: 'http',
+      host: '192.168.10.102:6060',
+      ip: '172.19.0.1',
+      req: { socket: { remoteAddress: '172.19.0.1' } },
+      get: () => '',
+    }
+
+    await getDevicePairingLink(ctx)
+
+    expect(ctx.body).toEqual({
+      code: 'pair-secret',
+      link: 'http://192.168.10.102:6060/#/hermes/devices?pairing_code=pair-secret',
+    })
+  })
+
   it('rejects peer socket connections until outbound pairing is approved locally', async () => {
-    vi.doMock('../../packages/server/src/services/lan-discovery', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/lan-discovery')>(
-        '../../packages/server/src/services/lan-discovery',
+    vi.doMock('../../packages/server/src/modules/studio/services/network/lan-discovery', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/services/network/lan-discovery')>(
+        '../../packages/server/src/modules/studio/services/network/lan-discovery',
       )
       return {
         ...actual,
@@ -302,7 +361,7 @@ describe('devices controller', () => {
       }
     })
 
-    const { connectPeerDevice } = await import('../../packages/server/src/controllers/devices')
+    const { connectPeerDevice } = await import('../../packages/server/src/modules/studio/controllers/devices')
     const ctx: any = {
       params: { id: device.id },
       request: { body: {} },
@@ -315,9 +374,9 @@ describe('devices controller', () => {
   })
 
   it('records outbound status when requesting pairing from a device with inbound history', async () => {
-    vi.doMock('../../packages/server/src/services/lan-discovery', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/lan-discovery')>(
-        '../../packages/server/src/services/lan-discovery',
+    vi.doMock('../../packages/server/src/modules/studio/services/network/lan-discovery', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/services/network/lan-discovery')>(
+        '../../packages/server/src/modules/studio/services/network/lan-discovery',
       )
       return {
         ...actual,
@@ -328,9 +387,9 @@ describe('devices controller', () => {
         }),
       }
     })
-    vi.doMock('../../packages/server/src/services/system-info', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/system-info')>(
-        '../../packages/server/src/services/system-info',
+    vi.doMock('../../packages/server/src/modules/studio/public/system-info', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/public/system-info')>(
+        '../../packages/server/src/modules/studio/public/system-info',
       )
       return {
         ...actual,
@@ -353,11 +412,11 @@ describe('devices controller', () => {
     }))
     vi.stubGlobal('fetch', fetchMock)
 
-    const { requestInboundDeviceLink, updateInboundStatus, getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
+    const { requestInboundDeviceLink, updateInboundStatus, getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
     requestInboundDeviceLink(device)
     updateInboundStatus(device.id, 'approved')
 
-    const { requestDevicePairing } = await import('../../packages/server/src/controllers/devices')
+    const { requestDevicePairing } = await import('../../packages/server/src/modules/studio/controllers/devices')
     const ctx: any = {
       params: { id: device.id },
       request: { body: {} },
@@ -405,9 +464,9 @@ describe('devices controller', () => {
     }
 
     try {
-      vi.doMock('../../packages/server/src/services/lan-discovery', async () => {
-        const actual = await vi.importActual<typeof import('../../packages/server/src/services/lan-discovery')>(
-          '../../packages/server/src/services/lan-discovery',
+      vi.doMock('../../packages/server/src/modules/studio/services/network/lan-discovery', async () => {
+        const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/services/network/lan-discovery')>(
+          '../../packages/server/src/modules/studio/services/network/lan-discovery',
         )
         return {
           ...actual,
@@ -418,9 +477,9 @@ describe('devices controller', () => {
           }),
         }
       })
-      vi.doMock('../../packages/server/src/services/system-info', async () => {
-        const actual = await vi.importActual<typeof import('../../packages/server/src/services/system-info')>(
-          '../../packages/server/src/services/system-info',
+      vi.doMock('../../packages/server/src/modules/studio/public/system-info', async () => {
+        const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/public/system-info')>(
+          '../../packages/server/src/modules/studio/public/system-info',
         )
         return {
           ...actual,
@@ -446,8 +505,8 @@ describe('devices controller', () => {
       })
       vi.stubGlobal('fetch', fetchMock)
 
-      const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-      const { requestDevicePairing } = await import('../../packages/server/src/controllers/devices')
+      const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+      const { requestDevicePairing } = await import('../../packages/server/src/modules/studio/controllers/devices')
       const ctx: any = {
         params: { id: fallbackDevice.id },
         request: { body: {} },
@@ -474,9 +533,9 @@ describe('devices controller', () => {
   })
 
   it('requests pairing from a manually entered remote URL', async () => {
-    vi.doMock('../../packages/server/src/services/lan-discovery', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/lan-discovery')>(
-        '../../packages/server/src/services/lan-discovery',
+    vi.doMock('../../packages/server/src/modules/studio/services/network/lan-discovery', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/services/network/lan-discovery')>(
+        '../../packages/server/src/modules/studio/services/network/lan-discovery',
       )
       return {
         ...actual,
@@ -487,9 +546,9 @@ describe('devices controller', () => {
         }),
       }
     })
-    vi.doMock('../../packages/server/src/services/system-info', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/system-info')>(
-        '../../packages/server/src/services/system-info',
+    vi.doMock('../../packages/server/src/modules/studio/public/system-info', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/public/system-info')>(
+        '../../packages/server/src/modules/studio/public/system-info',
       )
       return {
         ...actual,
@@ -543,8 +602,8 @@ describe('devices controller', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const { getDeviceRelation } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { requestManualDevicePairing } = await import('../../packages/server/src/controllers/devices')
+    const { getDeviceRelation } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { requestManualDevicePairing } = await import('../../packages/server/src/modules/studio/controllers/devices')
     const ctx: any = {
       request: {
         body: {
@@ -579,9 +638,9 @@ describe('devices controller', () => {
   })
 
   it('keeps a manually paired remote device in the list when it is offline', async () => {
-    vi.doMock('../../packages/server/src/services/lan-discovery', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/lan-discovery')>(
-        '../../packages/server/src/services/lan-discovery',
+    vi.doMock('../../packages/server/src/modules/studio/services/network/lan-discovery', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/services/network/lan-discovery')>(
+        '../../packages/server/src/modules/studio/services/network/lan-discovery',
       )
       return {
         ...actual,
@@ -592,9 +651,9 @@ describe('devices controller', () => {
         }),
       }
     })
-    vi.doMock('../../packages/server/src/services/system-info', async () => {
-      const actual = await vi.importActual<typeof import('../../packages/server/src/services/system-info')>(
-        '../../packages/server/src/services/system-info',
+    vi.doMock('../../packages/server/src/modules/studio/public/system-info', async () => {
+      const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/public/system-info')>(
+        '../../packages/server/src/modules/studio/public/system-info',
       )
       return {
         ...actual,
@@ -615,8 +674,8 @@ describe('devices controller', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const { updateOutboundStatus } = await import('../../packages/server/src/db/hermes/devices-store')
-    const { listDevices } = await import('../../packages/server/src/controllers/devices')
+    const { updateOutboundStatus } = await import('../../packages/server/src/modules/studio/repositories/devices-store')
+    const { listDevices } = await import('../../packages/server/src/modules/studio/controllers/devices')
     updateOutboundStatus(device.id, 'approved', {
       ...device,
       ip: 'remote.example.com',

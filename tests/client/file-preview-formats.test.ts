@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'fs'
 import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import HtmlFilePreview from '@/components/hermes/files/HtmlFilePreview.vue'
@@ -63,11 +64,15 @@ describe('generated file preview formats', () => {
     expect(getFilePreviewKind('deck.pptx')).toBe('presentation')
     expect(getFilePreviewKind('metrics.xlsx')).toBe('spreadsheet')
     expect(getFilePreviewKind('metrics.csv')).toBe('csv')
+    expect(getFilePreviewKind('recording.mp4')).toBe('video')
+    expect(getFilePreviewKind('recording.MOV')).toBe('video')
     expect(getFilePreviewKind('legacy.xls')).toBeNull()
     expect(previewMimeMatches('pdf', 'application/pdf')).toBe(true)
     expect(previewMimeMatches('pdf', 'text/html')).toBe(false)
     expect(previewMimeMatches('presentation', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')).toBe(true)
     expect(previewMimeMatches('csv', 'text/csv; charset=utf-8')).toBe(true)
+    expect(previewMimeMatches('video', 'video/mp4')).toBe(true)
+    expect(previewMimeMatches('video', 'application/octet-stream')).toBe(false)
   })
 
   it('renders HTML in a restrictive iframe and strips active content and URLs', async () => {
@@ -102,6 +107,26 @@ describe('generated file preview formats', () => {
     await wrapper.findAll('button')[1].trigger('click')
     expect(wrapper.find('.source-view code.hljs').exists()).toBe(true)
     expect(wrapper.find('.source-view').html()).toContain('hljs-tag')
+  })
+
+  it('lets the HTML preview fill the available drawer height', () => {
+    const htmlPreviewSource = readFileSync('packages/client/src/components/hermes/files/HtmlFilePreview.vue', 'utf8')
+    const filePreviewSource = readFileSync('packages/client/src/components/hermes/files/FilePreview.vue', 'utf8')
+
+    expect(htmlPreviewSource).toMatch(/\.html-preview\s*\{[\s\S]*flex: 1;[\s\S]*height: 100%;[\s\S]*min-height: 0;/)
+    expect(htmlPreviewSource).toMatch(/\.html-frame\s*\{[\s\S]*flex: 1;[\s\S]*height: 100%;[\s\S]*min-height: 0;/)
+    expect(htmlPreviewSource).not.toContain('min-height: 420px')
+    expect(filePreviewSource).toMatch(/\.file-preview\s*\{[\s\S]*height: 100%;[\s\S]*width: 100%;[\s\S]*min-height: 0;/)
+    expect(filePreviewSource).toMatch(/\.preview-content\s*\{[\s\S]*width: 100%;[\s\S]*height: 100%;[\s\S]*min-height: 0;/)
+    expect(filePreviewSource).toMatch(/<video[\s\S]*class="preview-video"[\s\S]*controls/)
+  })
+
+  it('renders only user video attachments inline in single chat', () => {
+    const messageItemSource = readFileSync('packages/client/src/components/hermes/chat/MessageItem.vue', 'utf8')
+
+    expect(messageItemSource).toMatch(/message\.role === 'user' && isVideo\(att\.type, att\.name\)/)
+    expect(messageItemSource).toMatch(/file\.type === 'video'[\s\S]*class="msg-attachment-video"/)
+    expect(messageItemSource).toMatch(/class="msg-attachment-video"[\s\S]*controls[\s\S]*playsinline/)
   })
 
   it('parses quoted CSV cells and enforces table and cell limits', () => {

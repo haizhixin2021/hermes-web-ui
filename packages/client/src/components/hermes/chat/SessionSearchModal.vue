@@ -3,9 +3,10 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NInput, NModal, NSpin, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
-import { fetchSessions, searchSessions, type SessionSearchResult, type SessionSummary } from '@/api/hermes/sessions'
+import { fetchSessions, searchSessions, type SessionSearchResult, type SessionSummary } from '@/api/studio/sessions'
 import { useChatStore } from '@/stores/hermes/chat'
 import { useSessionSearch } from '@/composables/useSessionSearch'
+import type { Session } from '@/stores/hermes/chat'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -133,6 +134,18 @@ async function openItem(item: SearchItem) {
 
   await ensureChatSessionsLoaded()
   if (!chatStore.sessions.some(session => session.id === item.id) && typeof chatStore.addOrUpdateSession === 'function') {
+    const isCodingAgentSession = item.source === 'coding_agent' || item.agent === 'claude' || item.agent === 'codex' || item.agent === 'pi' || item.agent === 'grok' || (item.agent === 'opencode' || item.agent === 'dsh')
+    const codingAgentId: Session['codingAgentId'] = item.agent === 'codex'
+      ? 'codex'
+      : item.agent === 'pi'
+        ? 'pi'
+      : item.agent === 'grok'
+        ? 'grok'
+      : item.agent === 'dsh' ? 'dsh' : item.agent === 'opencode'
+        ? 'opencode'
+      : item.agent === 'claude'
+          ? 'claude-code'
+          : undefined
     chatStore.addOrUpdateSession({
       id: item.id,
       profile: item.profile || 'default',
@@ -147,6 +160,15 @@ async function openItem(item: SearchItem) {
       endedAt: item.ended_at != null ? Math.round(item.ended_at * 1000) : null,
       lastActiveAt: item.last_active != null ? Math.round(item.last_active * 1000) : undefined,
       workspace: item.workspace || null,
+      agent: item.agent || undefined,
+      agentSessionId: item.agent_session_id || undefined,
+      agentNativeSessionId: item.agent_native_session_id || undefined,
+      codingAgentId,
+      codingAgentMode: isCodingAgentSession
+        ? (item.agent_mode === 'global' || item.agent_mode === 'scoped'
+            ? item.agent_mode
+            : item.provider === 'global' ? 'global' : 'scoped')
+        : undefined,
     })
   }
   await chatStore.switchSession(item.id, messageId)
@@ -283,10 +305,10 @@ onUnmounted(() => {
             >
               <div class="result-main">
                 <div class="result-title-row">
-                  <span class="result-title">{{ getItemTitle(item) }}</span>
+                  <span class="result-title" dir="auto">{{ getItemTitle(item) }}</span>
                   <span class="result-source">{{ formatSource(item.source) }}</span>
                 </div>
-                <div class="result-snippet">
+                <div class="result-snippet" dir="auto">
                   {{ hasQuery ? item.snippet || t('chat.searchNoSnippet') : item.preview || t('chat.searchRecent') }}
                 </div>
               </div>
@@ -360,7 +382,7 @@ onUnmounted(() => {
   gap: 8px;
   max-height: min(60vh, 540px);
   overflow-y: auto;
-  padding-right: 2px;
+  padding-inline-end: 2px;
 }
 
 .result-item {
@@ -373,7 +395,7 @@ onUnmounted(() => {
   border-radius: $radius-md;
   background: $bg-card;
   color: $text-primary;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   transition: border-color $transition-fast, background-color $transition-fast, transform $transition-fast;
 

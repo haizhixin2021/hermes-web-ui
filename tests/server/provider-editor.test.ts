@@ -28,7 +28,8 @@ function readYaml(path: string): any {
 }
 
 async function loadEditor() {
-  return import('../../packages/server/src/services/hermes/provider-editor')
+  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+  return import('../../packages/server/src/modules/hermes/services/providers/provider-editor')
 }
 
 beforeEach(() => {
@@ -39,7 +40,7 @@ beforeEach(() => {
   db = new DatabaseSync(':memory:')
   db.exec('PRAGMA foreign_keys=ON')
   vi.resetModules()
-  vi.doMock('../../packages/server/src/db/index', () => ({
+  vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
     getDb: () => db,
     getStoragePath: () => ':memory:',
   }))
@@ -47,7 +48,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
-  vi.doUnmock('../../packages/server/src/db/index')
+  vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
   vi.resetModules()
   db?.close()
   db = null
@@ -60,6 +61,19 @@ afterEach(() => {
 })
 
 describe('provider editor service', () => {
+  it('keeps the OpenCode probe affinity header across same-origin redirects', async () => {
+    const { fetchProviderCatalogForTest } = await loadEditor()
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: '/zen/go/v1/models/' } }))
+      .mockResolvedValueOnce(Response.json({ data: [{ id: 'glm-5' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await fetchProviderCatalogForTest('https://opencode.ai/zen/go/v1', 'test-key')).toEqual(['glm-5'])
+    const headers = fetchMock.mock.calls.map(([, init]) => new Headers(init.headers))
+    expect(headers[0].get('x-opencode-session')).toMatch(/^[a-f0-9]{64}$/)
+    expect(headers[1].get('x-opencode-session')).toBe(headers[0].get('x-opencode-session'))
+    expect(headers[1].get('authorization')).toBe('Bearer test-key')
+  })
+
   it('returns capability metadata without exposing the stored credential', async () => {
     const storedCredential = ['stored', 'credential'].join('-')
     writeProfile('research', [
@@ -390,6 +404,50 @@ describe('provider editor service', () => {
       .rejects.toMatchObject<Partial<InstanceType<typeof ProviderEditorError>>>({
         status: 422,
         code: 'PROVIDER_REDIRECT_REJECTED',
+      })
+  })
+
+  it('reports a missing model catalog as its own outcome rather than a failed connection', async () => {
+    const credential = ['catalog', 'credential'].join('-')
+    writeProfile('research', [
+      'model:',
+      '  provider: custom:nocatalog',
+      '  default: glm-5.2',
+      'custom_providers:',
+      '  - name: nocatalog',
+      '    base_url: https://plan.example/v3',
+      `    api_key: ${credential}`,
+      '    model: glm-5.2',
+      '',
+    ].join('\n'))
+
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const { testProviderEditorDraft, ProviderEditorError } = await loadEditor()
+
+    // Token-plan endpoints answer the catalog probe with 404 or 405 while the
+    // chat path they exist for works fine.
+    for (const status of [404, 405]) {
+      fetchMock.mockResolvedValueOnce(new Response('not found', { status }))
+      await expect(testProviderEditorDraft('research', 'custom:nocatalog', {}))
+        .resolves.toEqual({ models: [], model_count: 0, catalog_unavailable: true })
+    }
+
+    // Anything else is still a failure, so a broken provider cannot pass.
+    fetchMock.mockResolvedValueOnce(new Response('boom', { status: 500 }))
+    await expect(testProviderEditorDraft('research', 'custom:nocatalog', {}))
+      .rejects.toMatchObject<Partial<InstanceType<typeof ProviderEditorError>>>({
+        status: 422,
+        code: 'PROVIDER_TEST_FAILED',
+      })
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    await expect(testProviderEditorDraft('research', 'custom:nocatalog', {}))
+      .rejects.toMatchObject<Partial<InstanceType<typeof ProviderEditorError>>>({
+        code: 'PROVIDER_EMPTY_CATALOG',
       })
   })
 

@@ -4,8 +4,13 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import YAML from 'js-yaml'
 
-vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
+const mockInvalidateProviderRuntime = vi.hoisted(() => vi.fn())
+
+vi.mock('../../packages/server/src/modules/hermes/services/runtime/cli', () => ({
   restartGateway: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock('../../packages/server/src/modules/studio/public/provider-runtime', () => ({
+  invalidateProviderRuntime: mockInvalidateProviderRuntime,
 }))
 
 let hermesHome = ''
@@ -13,7 +18,8 @@ let hermesHome = ''
 async function loadProvidersController() {
   vi.resetModules()
   process.env.HERMES_HOME = hermesHome
-  return import('../../packages/server/src/controllers/hermes/providers')
+  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+  return import('../../packages/server/src/modules/hermes/controllers/providers')
 }
 
 function makeCtx(poolKey: string, overrides: Record<string, any> = {}) {
@@ -36,6 +42,7 @@ function readYaml(filePath: string) {
 
 describe('providers controller delete', () => {
   beforeEach(() => {
+    mockInvalidateProviderRuntime.mockReset()
     hermesHome = mkdtempSync(join(tmpdir(), 'hwui-provider-delete-'))
     mkdirSync(hermesHome, { recursive: true })
     writeFileSync(join(hermesHome, 'config.yaml'), 'model:\n  provider: openai-codex\n  default: gpt-5.5\n')
@@ -43,7 +50,7 @@ describe('providers controller delete', () => {
 
   afterEach(() => {
     delete process.env.HERMES_HOME
-    vi.doUnmock('../../packages/server/src/controllers/hermes/providers')
+    vi.doUnmock('../../packages/server/src/modules/hermes/controllers/providers')
     vi.clearAllMocks()
     if (hermesHome) rmSync(hermesHome, { recursive: true, force: true })
     hermesHome = ''
@@ -87,6 +94,17 @@ describe('providers controller delete', () => {
     expect(authAfter.credential_pool.openrouter).toEqual([
       { label: 'OPENROUTER_API_KEY', source: 'env:OPENROUTER_API_KEY' },
     ])
+    expect(mockInvalidateProviderRuntime).toHaveBeenCalledWith('default', 'deepseek')
+  })
+
+  it('does not invalidate a runtime when a custom provider removal is rejected', async () => {
+    const { remove } = await loadProvidersController()
+    const ctx = makeCtx('custom:missing-provider')
+
+    await remove(ctx)
+
+    expect(ctx.status).toBe(404)
+    expect(mockInvalidateProviderRuntime).not.toHaveBeenCalled()
   })
 
   it('does not remove unrelated base URL env for a provider without a base URL env mapping', async () => {

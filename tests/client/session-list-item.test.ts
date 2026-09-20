@@ -93,6 +93,31 @@ describe('SessionListItem', () => {
     expect(wrapper.find('a.session-item').exists()).toBe(false)
   })
 
+  it('renders a plain text category tag only when a category label is provided', async () => {
+    const wrapper = mount(SessionListItem, {
+      props: {
+        session,
+        active: false,
+        pinned: false,
+        canDelete: true,
+        categoryLabel: 'Work - Mobile',
+      },
+      global: {
+        stubs: {
+          ProfileAvatar: true,
+        },
+      },
+    })
+
+    const tag = wrapper.get('.session-item-category-tag')
+    expect(tag.text()).toBe('Work - Mobile')
+    expect(tag.attributes('title')).toBe('Work - Mobile')
+    expect(tag.element.tagName).toBe('SPAN')
+
+    await wrapper.setProps({ categoryLabel: undefined })
+    expect(wrapper.find('.session-item-category-tag').exists()).toBe(false)
+  })
+
   it('does not select the row when clicking nested action controls', async () => {
     const wrapper = mount(SessionListItem, {
       props: {
@@ -136,29 +161,6 @@ describe('SessionListItem', () => {
     expect(wrapper.emitted('open-new')).toBeUndefined()
   })
 
-  it('routes modified clicks through the desktop window handler when requested', async () => {
-    const wrapper = mount(SessionListItem, {
-      props: {
-        session,
-        active: false,
-        pinned: false,
-        canDelete: true,
-        to: '/session/s1',
-        interceptModifiedNavigation: true,
-      },
-      global: {
-        stubs: {
-          ProfileAvatar: true,
-        },
-      },
-    })
-
-    await wrapper.get('a.session-item').trigger('click', { ctrlKey: true })
-
-    expect(wrapper.emitted('open-new')).toHaveLength(1)
-    expect(wrapper.emitted('select')).toBeUndefined()
-  })
-
   it('renders the Hermes logo for Hermes sessions', () => {
     const wrapper = mount(SessionListItem, {
       props: {
@@ -178,6 +180,51 @@ describe('SessionListItem', () => {
     expect(logo.attributes('src')).toBe('/coding-agents/hermes.png')
     expect(logo.attributes('alt')).toBe('Hermes')
     expect(wrapper.find('.session-item-agent-name').exists()).toBe(false)
+  })
+
+  it('renders the Hermes logo for Hermes Global Agent sessions', () => {
+    const wrapper = mount(SessionListItem, {
+      props: {
+        session: { ...session, source: 'global_agent', agent: 'hermes' },
+        active: false,
+        pinned: false,
+        canDelete: true,
+      },
+      global: {
+        stubs: {
+          ProfileAvatar: true,
+        },
+      },
+    })
+
+    const logo = wrapper.get('.session-item-agent-logo')
+    expect(logo.attributes('src')).toBe('/coding-agents/hermes.png')
+    expect(logo.attributes('alt')).toBe('Hermes')
+  })
+
+  it('renders the Ekko logo for Ekko Global Agent sessions', () => {
+    const wrapper = mount(SessionListItem, {
+      props: {
+        session: {
+          ...session,
+          source: 'global_agent',
+          agent: 'ekko-agent',
+          codingAgentId: 'ekko-agent',
+        },
+        active: false,
+        pinned: false,
+        canDelete: true,
+      },
+      global: {
+        stubs: {
+          ProfileAvatar: true,
+        },
+      },
+    })
+
+    const logo = wrapper.get('.session-item-agent-logo')
+    expect(logo.attributes('src')).toBe('/coding-agents/ekko-agent.png')
+    expect(logo.attributes('alt')).toBe('Ekko')
   })
 
   it('defaults old sessions without agent metadata to the Hermes logo', () => {
@@ -201,7 +248,7 @@ describe('SessionListItem', () => {
     expect(wrapper.find('.session-item-agent-name').exists()).toBe(false)
   })
 
-  it('renders the Claude Code logo for Claude coding agent sessions', () => {
+  it('renders the Claude logo for Claude coding agent sessions', () => {
     const wrapper = mount(SessionListItem, {
       props: {
         session: { ...session, source: 'coding_agent', agent: 'claude', codingAgentId: 'claude-code' },
@@ -218,7 +265,7 @@ describe('SessionListItem', () => {
 
     const logo = wrapper.get('.session-item-agent-logo')
     expect(logo.attributes('src')).toBe('/coding-agents/claude-code.svg')
-    expect(logo.attributes('alt')).toBe('Claude Code')
+    expect(logo.attributes('alt')).toBe('Claude')
     expect(wrapper.find('.session-item-agent-name').exists()).toBe(false)
   })
 

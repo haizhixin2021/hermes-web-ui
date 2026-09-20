@@ -1,7 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('../../packages/server/src/services/hermes/voice-config-sync', () => ({
+const localModelState = vi.hoisted(() => ({ usable: false, validationError: '' }))
+const localStreamMocks = vi.hoisted(() => ({
+  create: vi.fn(),
+  push: vi.fn(),
+  finish: vi.fn(),
+  cancel: vi.fn(),
+}))
+
+vi.mock('../../packages/server/src/modules/studio/services/voice/config-sync', () => ({
   syncVoiceConfigToHermesProfile: vi.fn(async () => ({ stt: 'synced', tts: 'unchanged' })),
+}))
+
+vi.mock('../../packages/server/src/modules/studio/services/voice/stt/local-model-manager', () => ({
+  LocalSttStreamSessionError: class LocalSttStreamSessionError extends Error {},
+  LOCAL_STT_MODEL_ID: 'test-local-stt-model',
+  getLocalSttModelStatus: () => ({
+    usable: localModelState.usable,
+    validationError: localModelState.validationError,
+  }),
+  transcribeWithLocalStt: vi.fn(),
+  startLocalSttModelDownload: vi.fn(),
+  createLocalSttStreamSession: localStreamMocks.create,
+  pushLocalSttStreamAudio: localStreamMocks.push,
+  finishLocalSttStreamSession: localStreamMocks.finish,
+  cancelLocalSttStreamSession: localStreamMocks.cancel,
 }))
 
 describe('stt settings controller', () => {
@@ -11,7 +34,13 @@ describe('stt settings controller', () => {
     vi.resetModules()
     const { DatabaseSync } = await import('node:sqlite')
     db = new DatabaseSync(':memory:')
-    vi.doMock('../../packages/server/src/db/index', () => ({
+    localModelState.usable = false
+    localModelState.validationError = ''
+    localStreamMocks.create.mockReset()
+    localStreamMocks.push.mockReset()
+    localStreamMocks.finish.mockReset()
+    localStreamMocks.cancel.mockReset()
+    vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
       getDb: () => db,
       getStoragePath: () => ':memory:',
     }))
@@ -20,14 +49,14 @@ describe('stt settings controller', () => {
   afterEach(() => {
     db?.close()
     db = null
-    vi.doUnmock('../../packages/server/src/db/index')
+    vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
     vi.resetModules()
   })
 
   async function initController() {
-    const schemas = await import('../../packages/server/src/db/hermes/schemas')
+    const schemas = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
     schemas.initAllHermesTables()
-    return await import('../../packages/server/src/controllers/hermes/stt')
+    return await import('../../packages/server/src/modules/studio/controllers/stt')
   }
 
   function makeCtx(user: any | null, body: any = {}, params: Record<string, string> = {}, query: Record<string, string> = {}) {
@@ -279,14 +308,61 @@ describe('stt settings controller', () => {
     await ctrl.listSettings(listCtx)
     expect(listCtx.body).toEqual({ settings: [], activeProvider: 'browser' })
   })
+
+  it('only activates the fixed local STT provider after its model is usable', async () => {
+    const ctrl = await initController()
+    const user = { id: 12, username: 'local-user', role: 'admin' }
+
+    const unavailableCtx = makeCtx(user, { provider: 'local' })
+    await ctrl.saveActiveProvider(unavailableCtx)
+    expect(unavailableCtx.status).toBe(409)
+    expect(unavailableCtx.body).toEqual({ error: 'Local STT model is not installed and usable' })
+
+    localModelState.usable = true
+    const availableCtx = makeCtx(user, { provider: 'local' })
+    await ctrl.saveActiveProvider(availableCtx)
+    expect(availableCtx.body).toEqual({ activeProvider: 'local' })
+
+    const listCtx = makeCtx(user)
+    await ctrl.listSettings(listCtx)
+    expect(listCtx.body).toMatchObject({
+      activeProvider: 'local',
+      settings: [{
+        provider: 'local',
+        settings: { model: 'test-local-stt-model' },
+        secrets: {},
+      }],
+    })
+  })
+
+  it('starts and finishes an authenticated local stream only for the active local profile', async () => {
+    const ctrl = await initController()
+    const user = { id: 12, username: 'local-user', role: 'admin' }
+    localModelState.usable = true
+    await ctrl.saveActiveProvider(makeCtx(user, { provider: 'local' }))
+    localStreamMocks.create.mockResolvedValueOnce({ sessionId: 'stream-1' })
+    localStreamMocks.finish.mockResolvedValueOnce({
+      sessionId: 'stream-1', text: '完成', model: 'test-local-stt-model', durationMs: 2,
+    })
+
+    const startCtx = makeCtx(user)
+    await ctrl.startLocalStream(startCtx)
+    expect(localStreamMocks.create).toHaveBeenCalledWith('12:default')
+    expect(startCtx.body).toEqual({ sessionId: 'stream-1' })
+
+    const finishCtx = makeCtx(user, {}, { sessionId: 'stream-1' })
+    await ctrl.finishLocalStream(finishCtx)
+    expect(localStreamMocks.finish).toHaveBeenCalledWith('stream-1', '12:default', expect.any(AbortSignal))
+    expect(finishCtx.body).toMatchObject({ text: '完成' })
+  })
 })
 
 describe('stt routes', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    vi.doUnmock('../../packages/server/src/routes/hermes/stt')
-    vi.doUnmock('../../packages/server/src/controllers/hermes/stt')
+    vi.doUnmock('../../packages/server/src/modules/studio/routes/stt')
+    vi.doUnmock('../../packages/server/src/modules/studio/controllers/stt')
   })
 
   it('registers the protected STT settings and transcribe routes', async () => {
@@ -301,8 +377,12 @@ describe('stt routes', () => {
     const mcuVoiceTurn = vi.fn(async (ctx: any) => { ctx.body = { route: 'mcuVoiceTurn' } })
     const transcribe = vi.fn(async (ctx: any) => { ctx.body = { route: 'transcribe' } })
     const transcribeVoiceProxy = vi.fn(async (ctx: any) => { ctx.body = { route: 'transcribeVoiceProxy' } })
+    const startLocalStream = vi.fn()
+    const pushLocalStreamChunk = vi.fn()
+    const finishLocalStream = vi.fn()
+    const cancelLocalStream = vi.fn()
 
-    vi.doMock('../../packages/server/src/controllers/hermes/stt', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/controllers/stt', () => ({
       listSettings,
       saveActiveProvider,
       saveSettings,
@@ -314,26 +394,36 @@ describe('stt routes', () => {
       mcuVoiceTurn,
       transcribe,
       transcribeVoiceProxy,
+      startLocalStream,
+      pushLocalStreamChunk,
+      finishLocalStream,
+      cancelLocalStream,
     }))
 
-    const { sttProtectedRoutes } = await import('../../packages/server/src/routes/hermes/stt')
+    const { sttProtectedRoutes } = await import('../../packages/server/src/modules/studio/routes/stt')
     const protectedPaths = sttProtectedRoutes.stack.map((entry: any) => entry.path)
 
     expect(protectedPaths).toEqual(expect.arrayContaining([
-      '/api/hermes/stt/settings',
-      '/api/hermes/voice/proxy/:profile/v1/audio/transcriptions',
-      '/api/hermes/stt/profile-status',
-      '/api/hermes/stt/profile-status/missing-audio',
-      '/api/hermes/mcu/voice-turn',
-      '/api/hermes/stt/settings/active',
-      '/api/hermes/stt/settings/:provider',
-      '/api/hermes/stt/settings/:provider',
-      '/api/hermes/stt/settings/:provider/base-url-preset',
-      '/api/hermes/stt/settings/:provider/secret/:secretName',
-      '/api/hermes/stt/transcribe',
+      '/api/studio/stt/settings',
+      '/api/studio/stt/local-model',
+      '/api/studio/stt/local-model/download',
+      '/api/studio/voice/proxy/:profile/v1/audio/transcriptions',
+      '/api/studio/stt/profile-status',
+      '/api/studio/stt/profile-status/missing-audio',
+      '/api/studio/mcu/voice-turn',
+      '/api/studio/stt/settings/active',
+      '/api/studio/stt/settings/:provider',
+      '/api/studio/stt/settings/:provider',
+      '/api/studio/stt/settings/:provider/base-url-preset',
+      '/api/studio/stt/settings/:provider/secret/:secretName',
+      '/api/studio/stt/local-stream',
+      '/api/studio/stt/local-stream/:sessionId/chunk',
+      '/api/studio/stt/local-stream/:sessionId/finish',
+      '/api/studio/stt/local-stream/:sessionId',
+      '/api/studio/stt/transcribe',
     ]))
 
-    const transcribeLayer: any = sttProtectedRoutes.stack.find((entry: any) => entry.path === '/api/hermes/stt/transcribe')
+    const transcribeLayer: any = sttProtectedRoutes.stack.find((entry: any) => entry.path === '/api/studio/stt/transcribe')
     const ctx: any = { request: { body: {} }, body: null }
 
     await transcribeLayer.stack[0](ctx, undefined)

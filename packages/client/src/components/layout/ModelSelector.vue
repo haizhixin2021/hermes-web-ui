@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { NModal, NInput, NSelect } from 'naive-ui'
 import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
+import { useCollapsedProviderGroups } from '@/composables/useCollapsedProviderGroups'
 import { useI18n } from 'vue-i18n'
 
 const emit = defineEmits<{
@@ -15,7 +16,7 @@ const profilesStore = useProfilesStore()
 
 const showModal = ref(false)
 const searchQuery = ref('')
-const collapsedGroups = ref<Record<string, boolean>>({})
+const { isGroupCollapsed, toggleGroup } = useCollapsedProviderGroups()
 const customInput = ref('')
 const customProvider = ref('')
 
@@ -79,14 +80,6 @@ const filteredGroups = computed(() => {
     .filter(g => g.models.length > 0 || safeLower(g.label).includes(q))
 })
 
-function toggleGroup(provider: string) {
-  collapsedGroups.value[provider] = !collapsedGroups.value[provider]
-}
-
-function isGroupCollapsed(provider: string) {
-  return !!collapsedGroups.value[provider]
-}
-
 function handleSelect(model: string, provider: string) {
   const meta = activeModelGroups.value.find(g => g.provider === provider)?.model_meta?.[model]
   if (meta?.disabled) return
@@ -121,7 +114,6 @@ function setModalShow(show: boolean) {
 }
 
 function openModal() {
-  collapsedGroups.value = {}
   searchQuery.value = ''
   customInput.value = ''
   customProvider.value = appStore.selectedProvider
@@ -246,25 +238,25 @@ async function handleRefresh() {
         <div v-if="filteredGroups.length === 0" class="model-empty">
           {{ searchQuery ? 'No results' : 'No models' }}
         </div>
-        <div class="model-custom">
-          <div class="model-custom-row">
-            <NSelect
-              v-model:value="customProvider"
-              :options="providerOptions"
-              size="small"
-              class="model-custom-provider"
-            />
-            <NInput
-              v-model:value="customInput"
-              :placeholder="t('models.customModelPlaceholder')"
-              size="small"
-              class="model-custom-input"
-              @keydown.enter="handleCustomSubmit"
-            />
-          </div>
-          <div class="model-custom-hint">
-            {{ t('models.customModelHint') }}
-          </div>
+      </div>
+      <div class="model-custom">
+        <div class="model-custom-row">
+          <NSelect
+            v-model:value="customProvider"
+            :options="providerOptions"
+            size="small"
+            class="model-custom-provider"
+          />
+          <NInput
+            v-model:value="customInput"
+            :placeholder="t('models.customModelPlaceholder')"
+            size="small"
+            class="model-custom-input"
+            @keydown.enter="handleCustomSubmit"
+          />
+        </div>
+        <div class="model-custom-hint">
+          {{ t('models.customModelHint') }}
         </div>
       </div>
     </NModal>
@@ -353,7 +345,7 @@ async function handleRefresh() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-align: left;
+  text-align: start;
 }
 
 .model-arrow {
@@ -413,7 +405,7 @@ async function handleRefresh() {
 }
 
 .model-group-items {
-  padding-left: 8px;
+  padding-inline-start: 8px;
 }
 
 .model-item {
@@ -488,7 +480,7 @@ async function handleRefresh() {
   background: $accent-primary;
   padding: 1px 5px;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   letter-spacing: 0.03em;
 }
 
@@ -519,7 +511,7 @@ async function handleRefresh() {
   background: #d97706;
   padding: 1px 5px;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   letter-spacing: 0.03em;
 }
 
@@ -532,7 +524,7 @@ async function handleRefresh() {
   border: 1px solid $border-color;
   padding: 0 5px;
   border-radius: 3px;
-  margin-right: 4px;
+  margin-inline-end: 4px;
   letter-spacing: 0.03em;
 }
 

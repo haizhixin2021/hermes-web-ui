@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { doubaoTtsProvider } from '../../packages/server/src/services/hermes/tts-providers/doubao'
+import { doubaoTtsProvider } from '../../packages/server/src/modules/studio/services/voice/tts/providers/doubao'
 
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
@@ -59,6 +59,31 @@ describe('doubaoTtsProvider', () => {
       format: 'mp3',
       sample_rate: 24000,
     })
+  })
+
+  it('passes the configured speed to Doubao audio parameters', async () => {
+    const audio = Buffer.from('mp3-audio')
+    mockFetch.mockResolvedValueOnce(textResponse(JSON.stringify({
+      data: audio.toString('base64'),
+    })))
+
+    await doubaoTtsProvider.synthesize(
+      { text: '慢一点说。' },
+      { apiKey: 'secret', speed: 0.5 },
+    )
+
+    expect(getJsonBody().req_params.audio_params).toMatchObject({
+      speech_rate: -50,
+    })
+  })
+
+  it('rejects speeds outside Doubao limits before calling the provider', async () => {
+    await expect(doubaoTtsProvider.synthesize(
+      { text: '太快了。' },
+      { apiKey: 'secret', speed: 2.1 },
+    )).rejects.toThrow('Doubao TTS speed must be between 0.5 and 2')
+
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
   it('overrides audio format and sample rate when requested for MCU playback', async () => {

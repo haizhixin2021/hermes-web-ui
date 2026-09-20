@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NButton, NSpin, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
-import { fetchPerformanceRuntime, type PerformanceRuntimeSnapshot } from '@/api/hermes/performance-monitor'
+import { fetchPerformanceRuntime, type PerformanceRuntimeSnapshot } from '@/api/studio/performance-monitor'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -381,7 +381,7 @@ onBeforeUnmount(() => {
   td {
     padding: 11px 14px;
     border-bottom: 1px solid $border-light;
-    text-align: left;
+    text-align: start;
     white-space: nowrap;
   }
 

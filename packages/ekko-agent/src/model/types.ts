@@ -16,11 +16,28 @@ export type ModelProviderType =
 
 export type AgentMessageRole = 'system' | 'user' | 'assistant' | 'tool'
 
+export type AgentReasoningFormat =
+  | 'openai-reasoning-details'
+  | 'openai-responses-items'
+  | 'anthropic-thinking-blocks'
+  | 'gemini-content-parts'
+
+export interface AgentReasoningNative {
+  format: AgentReasoningFormat
+  data: unknown
+}
+
+export interface AgentReasoning {
+  text?: string
+  native?: AgentReasoningNative
+  estimatedTokens?: number
+}
+
 export interface AgentMessage {
   role: AgentMessageRole
   content: string
   contentParts?: AgentMessageContentPart[]
-  reasoning?: string
+  reasoning?: AgentReasoning
   name?: string
   toolCallId?: string
   toolCalls?: AgentToolCall[]
@@ -63,6 +80,12 @@ export type ModelReasoningEffort =
 
 export type ModelReasoningSummary = 'auto' | 'concise' | 'detailed'
 
+export type OpenAIChatReasoningReplayFormat =
+  | 'reasoning'
+  | 'reasoning_content'
+  | 'reasoning_details'
+  | 'none'
+
 export interface ModelRequest {
   model?: string
   messages: AgentMessage[]
@@ -82,7 +105,7 @@ export interface ModelResponse {
   id?: string
   model?: string
   content: string
-  reasoning?: string
+  reasoning?: string | AgentReasoning
   toolCalls?: AgentToolCall[]
   usage?: ModelUsage
   finishReason?: string
@@ -110,7 +133,14 @@ export interface ModelCapabilities {
 export interface ModelProviderConfig {
   id: string
   type: ModelProviderType
+  /** Persisted/public API mode name; requestStyle is its adapter-level form. */
+  apiMode?: import('./provider-presets').EkkoModelApiMode
   requestStyle?: ModelRequestStyle
+  /**
+   * Provider-specific assistant reasoning field used only by the OpenAI Chat
+   * Completions adapter. Other request styles use their native replay shape.
+   */
+  openAIChatReasoningReplayFormat?: OpenAIChatReasoningReplayFormat
   apiKey?: string
   baseUrl?: string
   endpointPath?: string
@@ -124,6 +154,8 @@ export interface ModelClient {
   provider: string
   requestStyle: ModelRequestStyle
   capabilities: ModelCapabilities
+  /** Resolve the credential-free request target used for diagnostics. */
+  requestTarget?(request: ModelRequest): string
   create(request: ModelRequest): Promise<ModelResponse>
   stream(request: ModelRequest): AsyncIterable<ModelEvent>
 }

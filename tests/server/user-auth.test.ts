@@ -1,3 +1,4 @@
+import { createHmac } from 'crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 describe('user auth tables and middleware', () => {
@@ -8,28 +9,31 @@ describe('user auth tables and middleware', () => {
     vi.stubEnv('AUTH_JWT_SECRET', 'test-secret')
     const { DatabaseSync } = await import('node:sqlite')
     db = new DatabaseSync(':memory:')
-    vi.doMock('../../packages/server/src/db/index', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
       getDb: () => db,
       getStoragePath: () => ':memory:',
+    }))
+    vi.doMock('../../packages/server/src/modules/studio/public/profile-config', () => ({
+      listProfileNamesFromDisk: () => ['default'],
     }))
   })
 
   afterEach(() => {
     db?.close()
     db = null
-    vi.doUnmock('../../packages/server/src/db/index')
-    vi.doUnmock('../../packages/server/src/services/hermes/hermes-profile')
+    vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
+    vi.doUnmock('../../packages/server/src/modules/studio/public/profile-config')
     vi.unstubAllEnvs()
     vi.resetModules()
   })
 
   async function initUsers() {
-    const schemas = await import('../../packages/server/src/db/hermes/schemas')
+    const schemas = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
     schemas.initAllHermesTables()
     return {
       schemas,
-      users: await import('../../packages/server/src/db/hermes/users-store'),
-      auth: await import('../../packages/server/src/middleware/user-auth'),
+      users: await import('../../packages/server/src/modules/studio/repositories/users-store'),
+      auth: await import('../../packages/server/src/modules/studio/middleware/auth'),
     }
   }
 
@@ -86,6 +90,24 @@ describe('user auth tables and middleware', () => {
     const { auth } = await initUsers()
 
     expect(auth.parseJwtExpirySeconds(value)).toBe(seconds)
+  })
+
+  it('allows configuring the model-run JWT lifetime independently', async () => {
+    vi.stubEnv('HERMES_WEB_UI_MODEL_RUN_JWT_EXPIRES_IN', '12h')
+    const { auth } = await initUsers()
+    vi.setSystemTime(new Date('2026-06-30T00:00:00Z'))
+
+    const token = await auth.issueModelRunJwt({ id: 1, username: 'admin', role: 'super_admin' })
+    const payload = jwtPayload(token)
+
+    expect(payload.exp - payload.iat).toBe(12 * 60 * 60)
+  })
+
+  it('falls back to the one-hour model-run JWT lifetime for invalid overrides', async () => {
+    vi.stubEnv('HERMES_WEB_UI_MODEL_RUN_JWT_EXPIRES_IN', 'forever')
+    const { auth } = await initUsers()
+
+    expect(auth.getModelRunJwtExpiresSeconds()).toBe(60 * 60)
   })
 
   it('creates the default super admin without profile bindings', async () => {
@@ -190,10 +212,10 @@ describe('user auth tables and middleware', () => {
   })
 
   it.each([
-    '/api/hermes/media/apikey-image-generate',
-    '/api/hermes/media/grok-image-to-video',
-    '/api/hermes/voice/proxy/default/v1/tts',
-    '/api/hermes/voice/proxy/work/v1/audio/transcriptions',
+    '/api/studio/media/apikey-image-generate',
+    '/api/studio/media/grok-image-to-video',
+    '/api/studio/voice/proxy/default/v1/tts',
+    '/api/studio/voice/proxy/work/v1/audio/transcriptions',
   ])('allows server token for an approved loopback agent endpoint %s', async (path) => {
     vi.stubEnv('AUTH_TOKEN', 'server-token')
     const { auth } = await initUsers()
@@ -217,10 +239,10 @@ describe('user auth tables and middleware', () => {
   })
 
   it.each([
-    '/api/hermes/media/apikey-image-generate',
-    '/api/hermes/media/grok-image-to-video',
-    '/api/hermes/voice/proxy/default/v1/tts',
-    '/api/hermes/voice/proxy/work/v1/audio/transcriptions',
+    '/api/studio/media/apikey-image-generate',
+    '/api/studio/media/grok-image-to-video',
+    '/api/studio/voice/proxy/default/v1/tts',
+    '/api/studio/voice/proxy/work/v1/audio/transcriptions',
     '/api/devices',
     '/api/devices/scan',
     '/api/devices/device-1/connect',
@@ -347,6 +369,24 @@ describe('user auth tables and middleware', () => {
     expect(auth.verifyUserJwt(token, 'wrong', 1000)).toBeNull()
   })
 
+  it('rejects tokens issued for the legacy hermes-web-ui audience', async () => {
+    const { auth } = await initUsers()
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+    const body = Buffer.from(JSON.stringify({
+      sub: '1',
+      username: 'admin',
+      role: 'super_admin',
+      type: 'access',
+      aud: 'hermes-web-ui',
+      iat: 1,
+      exp: 3601,
+    })).toString('base64url')
+    const unsigned = `${header}.${body}`
+    const signature = createHmac('sha256', 'secret').update(unsigned).digest('base64url')
+
+    expect(auth.verifyUserJwt(`${unsigned}.${signature}`, 'secret', 1000)).toBeNull()
+  })
+
   it('signs model run JWTs with the same payload shape and a one hour expiry', async () => {
     const { auth } = await initUsers()
     const token = auth.signUserJwt(
@@ -362,7 +402,7 @@ describe('user auth tables and middleware', () => {
       username: 'admin',
       role: 'super_admin',
       type: 'access',
-      aud: 'hermes-web-ui',
+      aud: 'hermes-studio',
       iat: 1,
       exp: 3601,
     })
@@ -374,7 +414,7 @@ describe('user auth tables and middleware', () => {
     const user = users.bootstrapDefaultSuperAdmin('admin', '123456')!
     const token = auth.signUserJwt(user, 'test-secret')
     const ctx = {
-      path: '/api/hermes/download',
+      path: '/api/studio/files/download',
       headers: {},
       query: { token },
       state: {},
@@ -413,7 +453,7 @@ describe('user auth tables and middleware', () => {
   it('still requires a JWT for protected API paths', async () => {
     const { auth } = await initUsers()
     const ctx = {
-      path: '/api/hermes/sessions',
+      path: '/api/studio/sessions',
       headers: {},
       query: {},
       state: {},
@@ -432,7 +472,7 @@ describe('user auth tables and middleware', () => {
 
   it('bootstraps the default super admin through password login and returns a user JWT', async () => {
     await initUsers()
-    const ctrl = await import('../../packages/server/src/controllers/auth')
+    const ctrl = await import('../../packages/server/src/modules/studio/controllers/auth')
     const ctx = {
       request: { body: { username: 'admin', password: '123456' } },
       headers: {},
@@ -446,6 +486,7 @@ describe('user auth tables and middleware', () => {
     expect(ctx.status).toBe(200)
     expect(ctx.body.token).toMatch(/^[^.]+\.[^.]+\.[^.]+$/)
     expect(ctx.body.userId).toBeGreaterThan(0)
+    expect(ctx.body.profiles).toContain('default')
     expect(ctx.body.theme).toEqual({
       fontSize: 14,
       textColor: null,
@@ -459,7 +500,7 @@ describe('user auth tables and middleware', () => {
     vi.stubEnv('HERMES_DESKTOP', 'false')
     const { users } = await initUsers()
     const admin = users.bootstrapDefaultSuperAdmin('admin', '123456')!
-    const ctrl = await import('../../packages/server/src/controllers/auth')
+    const ctrl = await import('../../packages/server/src/modules/studio/controllers/auth')
 
     const defaultCtx = {
       state: { user: { id: admin.id, username: 'admin', role: 'super_admin' } },
@@ -491,10 +532,10 @@ describe('user auth tables and middleware', () => {
 
   it('lets super admins create regular admins with profile bindings', async () => {
     const { users } = await initUsers()
-    vi.doMock('../../packages/server/src/services/hermes/hermes-profile', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/public/profile-config', () => ({
       listProfileNamesFromDisk: () => ['default', 'research'],
     }))
-    const ctrl = await import('../../packages/server/src/controllers/auth')
+    const ctrl = await import('../../packages/server/src/modules/studio/controllers/auth')
     const ctx = {
       state: { user: { id: 1, username: 'admin', role: 'super_admin' } },
       request: {
@@ -521,10 +562,10 @@ describe('user auth tables and middleware', () => {
   it('does not allow disabling the last active super admin', async () => {
     const { users } = await initUsers()
     const admin = users.bootstrapDefaultSuperAdmin('admin', '123456')!
-    vi.doMock('../../packages/server/src/services/hermes/hermes-profile', () => ({
+    vi.doMock('../../packages/server/src/modules/studio/public/profile-config', () => ({
       listProfileNamesFromDisk: () => ['default'],
     }))
-    const ctrl = await import('../../packages/server/src/controllers/auth')
+    const ctrl = await import('../../packages/server/src/modules/studio/controllers/auth')
     const ctx = {
       state: { user: { id: admin.id, username: 'admin', role: 'super_admin' } },
       params: { id: String(admin.id) },

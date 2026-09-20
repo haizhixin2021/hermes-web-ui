@@ -3,13 +3,18 @@ import {
   AgentRuntime,
   AgentToolRegistry,
   AnthropicMessagesModelClient,
+  collectModelEvents,
   ModelProviderError,
   ModelProviderRegistry,
   authorizedModelProviderPreset,
   createModelClient,
+  modelResponseToAgentMessage,
+  normalizeAnthropicResponse,
+  normalizeGeminiResponse,
   toAnthropicMessagesPayload,
   toGeminiContentsPayload,
   normalizeOpenAIChatResponse,
+  normalizeOpenAIResponsesResponse,
   resolveModelProviderConfigs,
   toOpenAIResponsesPayload,
   toOpenAIChatPayload,
@@ -26,6 +31,193 @@ const providerConfig: ModelProviderConfig = {
 }
 
 describe('ekko-agent model requests', () => {
+  it('replays streamed DeepSeek reasoning_content through a complete tool loop', async () => {
+    const encoder = new TextEncoder()
+    let call = 0
+    const requestBodies: Array<Record<string, any>> = []
+    const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)))
+      call += 1
+      const frames = call === 1
+        ? [
+            'data: {"id":"chatcmpl_tool","model":"deepseek-chat","choices":[{"delta":{"reasoning_content":"I need the weather tool.","tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"weather","arguments":"{\\"city\\":\\"Xiamen\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+            'data: [DONE]\n\n',
+          ]
+        : [
+            'data: {"id":"chatcmpl_final","model":"deepseek-chat","choices":[{"delta":{"content":"Sunny"},"finish_reason":"stop"}]}\n\n',
+            'data: [DONE]\n\n',
+          ]
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const frame of frames) controller.enqueue(encoder.encode(frame))
+          controller.close()
+        },
+      }), { status: 200 })
+    })
+    const tools = new AgentToolRegistry()
+    tools.register({
+      definition: {
+        name: 'weather',
+        parameters: {
+          type: 'object',
+          properties: { city: { type: 'string' } },
+          required: ['city'],
+        },
+      },
+      async execute(input) {
+        return { ok: true, content: `${input.city}: Sunny` }
+      },
+    })
+    const client = createModelClient(providerConfig, { fetch: fetchMock })
+    const runtime = new AgentRuntime({ modelClient: client, tools })
+
+    const result = await runtime.run({ messages: ['Check Xiamen weather'] })
+
+    expect(result.output.content).toBe('Sunny')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(requestBodies[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'assistant',
+        content: '',
+        reasoning_content: 'I need the weather tool.',
+        tool_calls: [expect.objectContaining({ id: 'call_weather' })],
+      }),
+      expect.objectContaining({
+        role: 'tool',
+        tool_call_id: 'call_weather',
+        content: 'Xiamen: Sunny',
+      }),
+    ]))
+  })
+
+  it('retries a streamed response whose tool call has an empty function name', async () => {
+    const encoder = new TextEncoder()
+    let call = 0
+    const fetchMock = vi.fn(async () => {
+      call += 1
+      const frames = call === 1
+        ? [
+            'data: {"id":"chatcmpl_invalid","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_invalid","type":"function","function":{"name":"","arguments":""}}]},"finish_reason":"tool_calls"}]}\n\n',
+            'data: [DONE]\n\n',
+          ]
+        : [
+            'data: {"id":"chatcmpl_recovered","choices":[{"delta":{"content":"Recovered"},"finish_reason":"stop"}]}\n\n',
+            'data: [DONE]\n\n',
+          ]
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const frame of frames) controller.enqueue(encoder.encode(frame))
+          controller.close()
+        },
+      }), { status: 200 })
+    })
+    const client = createModelClient(providerConfig, { fetch: fetchMock })
+    const runtime = new AgentRuntime({ modelClient: client })
+
+    const result = await runtime.run({ messages: ['Answer without an empty tool call.'] })
+
+    expect(result.output.content).toBe('Recovered')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'model.retry',
+        error: expect.stringContaining('complete id and function name'),
+      }),
+    ]))
+  })
+
+  it('filters invalid Chat tool history and its orphaned tool result', () => {
+    const payload = toOpenAIChatPayload(providerConfig, {
+      messages: [
+        { role: 'user', content: 'Check the weather.' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_invalid', name: '', arguments: {} }],
+        },
+        {
+          role: 'tool',
+          content: 'orphaned result',
+          toolCallId: 'call_invalid',
+          name: '',
+        },
+        { role: 'user', content: 'Try again.' },
+      ],
+      tools: [{ name: 'weather', parameters: { type: 'object' } }],
+    })
+
+    expect(payload.messages).toEqual([
+      expect.objectContaining({ role: 'user', content: 'Check the weather.' }),
+      expect.objectContaining({ role: 'user', content: 'Try again.' }),
+    ])
+  })
+
+  it('normalizes empty Chat tool arguments and drops incomplete parallel calls', () => {
+    const response = normalizeOpenAIChatResponse('deepseek', {
+      choices: [{
+        message: {
+          content: '',
+          tool_calls: [
+            { id: 'call_valid', type: 'function', function: { name: 'weather', arguments: '' } },
+            { id: 'call_invalid', type: 'function', function: { name: '', arguments: '{}' } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      }],
+    })
+
+    expect(response.toolCalls).toEqual([{
+      id: 'call_valid',
+      name: 'weather',
+      arguments: {},
+      rawArguments: '{}',
+    }])
+  })
+
+  it('remembers image-rejecting Chat targets across client instances', async () => {
+    const model = `text-only-memory-test-${Date.now()}-${Math.random()}`
+    const config: ModelProviderConfig = {
+      id: 'custom:adaptive-chat-test',
+      type: 'openai-compatible',
+      apiKey: 'test-key',
+      baseUrl: 'https://adaptive-chat.example.com/v1',
+      defaultModel: model,
+    }
+    const bodies: Array<Record<string, any>> = []
+    const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({
+          error: {
+            message: 'Failed to deserialize messages[14]: unknown variant `image_url`, expected `text`',
+          },
+        }), { status: 400 })
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'Text fallback worked.' }, finish_reason: 'stop' }],
+      }), { status: 200 })
+    })
+    const request = {
+      messages: [{
+        role: 'user' as const,
+        content: 'Keep this text.',
+        contentParts: [{ type: 'image' as const, mimeType: 'image/png', data: 'aGVsbG8=' }],
+      }],
+    }
+
+    await expect(createModelClient(config, { fetch: fetchMock }).create(request))
+      .resolves.toMatchObject({ content: 'Text fallback worked.' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(bodies[0])).toContain('image_url')
+    expect(JSON.stringify(bodies[1])).not.toContain('image_url')
+    expect(JSON.stringify(bodies[1])).toContain('Keep this text.')
+
+    await expect(createModelClient(config, { fetch: fetchMock }).create(request))
+      .resolves.toMatchObject({ content: 'Text fallback worked.' })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(bodies[2])).not.toContain('image_url')
+  })
+
   it('completes a Codex Responses tool loop when terminal output arrays are empty', async () => {
     const encoder = new TextEncoder()
     let call = 0
@@ -101,6 +293,7 @@ describe('ekko-agent model requests', () => {
     expect(authorizedModelProviderPreset('openai-codex')).toMatchObject({
       id: 'openai-codex',
       baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiMode: 'codex_responses',
       requestStyle: 'openai-responses',
     })
     expect(authorizedModelProviderPreset('xai-oauth')).toMatchObject({
@@ -111,7 +304,19 @@ describe('ekko-agent model requests', () => {
     expect(authorizedModelProviderPreset('qwen-oauth')).toMatchObject({
       id: 'qwen-oauth',
       baseUrl: 'https://portal.qwen.ai/v1',
+      apiMode: 'chat_completions',
       requestStyle: 'openai-chat',
+    })
+    expect(authorizedModelProviderPreset('claude-oauth')).toMatchObject({
+      id: 'claude-oauth',
+      baseUrl: 'https://api.anthropic.com',
+      requestStyle: 'anthropic-messages',
+    })
+    expect(authorizedModelProviderPreset('minimax-oauth')).toMatchObject({
+      id: 'minimax-oauth',
+      baseUrl: 'https://api.minimax.io/anthropic',
+      apiMode: 'anthropic_messages',
+      requestStyle: 'anthropic-messages',
     })
   })
 
@@ -260,7 +465,7 @@ describe('ekko-agent model requests', () => {
       type: 'done',
       response: expect.objectContaining({
         content: 'Done',
-        reasoning: 'Checked the constraints.',
+        reasoning: { text: 'Checked the constraints.' },
       }),
     }))
   })
@@ -299,7 +504,7 @@ describe('ekko-agent model requests', () => {
       type: 'done',
       response: expect.objectContaining({
         content: 'Ready.',
-        reasoning: '**Loading model skill**',
+        reasoning: { text: '**Loading model skill**' },
       }),
     }))
   })
@@ -380,6 +585,137 @@ describe('ekko-agent model requests', () => {
     expect(payload.previous_response_id).toBeUndefined()
   })
 
+  it('omits tool choice from every provider payload when no tools are present', async () => {
+    const request = {
+      messages: [{ role: 'user' as const, content: 'Compress this context.' }],
+      toolChoice: 'none' as const,
+      stream: false,
+    }
+    const responsesPayload = toOpenAIResponsesPayload({
+      id: 'xai-oauth',
+      type: 'openai-compatible',
+      requestStyle: 'openai-responses',
+      defaultModel: 'grok-4.5',
+    }, request)
+    const chatPayload = toOpenAIChatPayload(providerConfig, request)
+    const anthropicPayload = toAnthropicMessagesPayload({
+      id: 'anthropic',
+      type: 'anthropic',
+      defaultModel: 'claude-sonnet',
+    }, request)
+
+    for (const payload of [responsesPayload, chatPayload, anthropicPayload]) {
+      expect(payload).not.toHaveProperty('tools')
+      expect(payload).not.toHaveProperty('tool_choice')
+    }
+
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ content: 'OK' })))
+    const customClient = createModelClient({
+      id: 'runtime',
+      type: 'custom',
+      requestStyle: 'custom-runtime',
+      baseUrl: 'http://127.0.0.1:11434',
+      defaultModel: 'runtime-agent',
+    }, { fetch: fetchMock })
+    await customClient.create(request)
+
+    const customPayload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))
+    expect(customPayload).not.toHaveProperty('tools')
+    expect(customPayload).not.toHaveProperty('toolChoice')
+  })
+
+  it('preserves tool choice when provider payloads include tools', () => {
+    const request = {
+      messages: [{ role: 'user' as const, content: 'Use the tool.' }],
+      tools: [{ name: 'lookup', parameters: { type: 'object' } }],
+      toolChoice: 'required' as const,
+    }
+
+    expect(toOpenAIResponsesPayload({
+      id: 'xai-oauth',
+      type: 'openai-compatible',
+      requestStyle: 'openai-responses',
+      defaultModel: 'grok-4.5',
+    }, request)).toMatchObject({
+      tools: [expect.objectContaining({ name: 'lookup' })],
+      tool_choice: 'required',
+    })
+    expect(toOpenAIChatPayload(providerConfig, request)).toMatchObject({
+      tools: [expect.objectContaining({ function: expect.objectContaining({ name: 'lookup' }) })],
+      tool_choice: 'required',
+    })
+    expect(toAnthropicMessagesPayload({
+      id: 'anthropic',
+      type: 'anthropic',
+      defaultModel: 'claude-sonnet',
+    }, request)).toMatchObject({
+      tools: [expect.objectContaining({ name: 'lookup' })],
+      tool_choice: { type: 'any' },
+    })
+  })
+
+  it('omits tool choice for DeepSeek thinking models across providers', () => {
+    const request = {
+      messages: [{ role: 'user' as const, content: 'Remember this.' }],
+      tools: [{ name: 'memory_write', parameters: { type: 'object' } }],
+      toolChoice: 'required' as const,
+    }
+    const thinkingPayload = toOpenAIChatPayload({
+      id: 'custom:deepseek-relay',
+      type: 'openai-compatible',
+      requestStyle: 'openai-chat',
+      baseUrl: 'https://relay.example/v1',
+      defaultModel: 'deepseek/deepseek-v4-flash',
+    }, request)
+    const legacyNonThinkingPayload = toOpenAIChatPayload({
+      id: 'custom:deepseek-relay',
+      type: 'openai-compatible',
+      requestStyle: 'openai-chat',
+      baseUrl: 'https://relay.example/v1',
+      defaultModel: 'deepseek-chat',
+    }, request)
+
+    expect(thinkingPayload).toMatchObject({
+      tools: [expect.objectContaining({
+        function: expect.objectContaining({ name: 'memory_write' }),
+      })],
+    })
+    expect(thinkingPayload).not.toHaveProperty('tool_choice')
+    expect(legacyNonThinkingPayload.tool_choice).toBe('required')
+  })
+
+  it('strips tool choice inside AgentRuntime when its tool registry is empty', async () => {
+    const create = vi.fn(async () => ({ content: 'done' }))
+    const runtime = new AgentRuntime({
+      modelClient: {
+        provider: 'test',
+        requestStyle: 'custom-runtime',
+        capabilities: {
+          streaming: false,
+          tools: true,
+          vision: false,
+          jsonMode: false,
+          systemPrompt: true,
+        },
+        create,
+        stream: vi.fn(),
+      },
+      toolsEnabled: false,
+      modelDefaults: {
+        model: 'test-model',
+        toolChoice: 'none',
+      },
+    })
+
+    await runtime.run({ messages: ['Hello'] })
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'test-model',
+      tools: undefined,
+      toolChoice: undefined,
+    }))
+  })
+
   it('sends Qwen OAuth identity headers to the Portal Chat Completions endpoint', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       choices: [{ message: { content: 'Qwen' }, finish_reason: 'stop' }],
@@ -426,11 +762,32 @@ describe('ekko-agent model requests', () => {
       baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
       apiKey: 'secret',
       defaultModel: 'glm-5.2',
+      timeoutMs: 300_000,
+      capabilities: { vision: false },
     })
     expect(resolved.fallbackProviderConfig).toMatchObject({
       requestStyle: 'openai-chat',
       defaultModel: 'glm-5.2',
+      capabilities: { vision: false },
     })
+  })
+
+  it('marks GLM V models as vision-capable while keeping text GLM models text-only', () => {
+    const text = resolveModelProviderConfigs({
+      provider: 'glm',
+      baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      model: 'glm-5.3',
+      apiMode: 'codex_responses',
+    })
+    const vision = resolveModelProviderConfigs({
+      provider: 'glm',
+      baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      model: 'glm-5v-turbo',
+      apiMode: 'chat_completions',
+    })
+
+    expect(text.providerConfig.capabilities?.vision).toBe(false)
+    expect(vision.providerConfig.capabilities?.vision).toBe(true)
   })
 
   it('infers anthropic provider configs from anthropic URLs', () => {
@@ -489,6 +846,257 @@ describe('ekko-agent model requests', () => {
       ],
     })
     expect(payload).not.toHaveProperty('metadata')
+  })
+
+  it('replays assistant reasoning_content for providers that require it during tool calls', () => {
+    const payload = toOpenAIChatPayload(providerConfig, {
+      messages: [
+        { role: 'user', content: 'Check the weather.' },
+        {
+          role: 'assistant',
+          content: '',
+          reasoning: { text: 'I need the weather tool.' },
+          toolCalls: [{
+            id: 'call_weather',
+            name: 'weather',
+            arguments: { city: 'Xiamen' },
+          }],
+        },
+        {
+          role: 'tool',
+          content: 'Sunny',
+          toolCallId: 'call_weather',
+          name: 'weather',
+        },
+      ],
+    })
+
+    expect(payload.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: '',
+      reasoning_content: 'I need the weather tool.',
+      tool_calls: [expect.objectContaining({ id: 'call_weather' })],
+    })
+    expect(payload.messages[1]).not.toHaveProperty('reasoning')
+  })
+
+  it('includes empty reasoning_content for synthetic DeepSeek tool-call messages', () => {
+    const payload = toOpenAIChatPayload(providerConfig, {
+      messages: [
+        { role: 'user', content: 'Use the matched skill.' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{
+            id: 'skill-auto-1',
+            name: 'skill_view',
+            arguments: { name: 'matched-skill' },
+          }],
+        },
+        {
+          role: 'tool',
+          content: 'Matched skill instructions.',
+          toolCallId: 'skill-auto-1',
+          name: 'skill_view',
+        },
+      ],
+      tools: [{ name: 'memory_search' }],
+    })
+
+    expect(payload.messages[1]).toMatchObject({
+      role: 'assistant',
+      content: '',
+      reasoning_content: '',
+      tool_calls: [expect.objectContaining({ id: 'skill-auto-1' })],
+    })
+  })
+
+  it.each([
+    {
+      id: 'moonshot',
+      baseUrl: 'https://api.moonshot.ai/v1',
+      model: 'kimi-k2-thinking',
+    },
+    {
+      id: 'xiaomi',
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      model: 'mimo-v2-flash',
+    },
+    {
+      id: 'qwen-oauth',
+      baseUrl: 'https://portal.qwen.ai/v1',
+      model: 'qwen3.7-plus',
+    },
+    {
+      id: 'glm',
+      baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      model: 'glm-5.2',
+    },
+  ])('maps unified reasoning to reasoning_content for $model', ({ id, baseUrl, model }) => {
+    const payload = toOpenAIChatPayload({
+      id,
+      type: 'openai-compatible',
+      baseUrl,
+      defaultModel: model,
+    }, {
+      messages: [{
+        role: 'assistant',
+        content: '',
+        reasoning: { text: 'Previous analysis.' },
+        toolCalls: [{
+          id: 'call_1',
+          name: 'lookup',
+          arguments: { q: 'weather' },
+        }],
+      }],
+    })
+
+    expect(payload.messages[0]).toMatchObject({
+      reasoning_content: 'Previous analysis.',
+    })
+    expect(payload.messages[0]?.content).not.toBeNull()
+    expect(payload.messages[0]).not.toHaveProperty('reasoning')
+  })
+
+  it('allows an OpenAI Chat provider to override its reasoning replay format', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: 'Previous answer.',
+      reasoning: { text: 'Previous analysis.' },
+    }
+    const reasoningContentPayload = toOpenAIChatPayload({
+      id: 'custom:reasoning-content',
+      type: 'openai-compatible',
+      requestStyle: 'openai-chat',
+      openAIChatReasoningReplayFormat: 'reasoning_content',
+      baseUrl: 'https://chat.example/v1',
+      defaultModel: 'custom-model',
+    }, { messages: [message] })
+    const disabledPayload = toOpenAIChatPayload({
+      id: 'custom:no-reasoning-replay',
+      type: 'openai-compatible',
+      requestStyle: 'openai-chat',
+      openAIChatReasoningReplayFormat: 'none',
+      baseUrl: 'https://strict.example/v1',
+      defaultModel: 'strict-chat',
+    }, { messages: [message] })
+
+    expect(reasoningContentPayload.messages[0]).toMatchObject({
+      reasoning_content: 'Previous analysis.',
+    })
+    expect(reasoningContentPayload.messages[0]).not.toHaveProperty('reasoning')
+    expect(disabledPayload.messages[0]).not.toHaveProperty('reasoning')
+    expect(disabledPayload.messages[0]).not.toHaveProperty('reasoning_content')
+    expect(disabledPayload.messages[0]).not.toHaveProperty('reasoning_details')
+  })
+
+  it('uses one reasoning field for OpenRouter fallback and other compatible endpoints', () => {
+    const messages = [{
+      role: 'assistant' as const,
+      content: 'Previous answer.',
+      reasoning: { text: 'Previous analysis.' },
+    }]
+    const openRouterPayload = toOpenAIChatPayload({
+      id: 'openrouter',
+      type: 'openai-compatible',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      defaultModel: 'anthropic/claude-sonnet-4.6',
+    }, { messages })
+    const strictPayload = toOpenAIChatPayload({
+      id: 'custom:strict',
+      type: 'openai-compatible',
+      baseUrl: 'https://strict.example/v1',
+      defaultModel: 'strict-chat',
+    }, { messages })
+
+    expect(openRouterPayload.messages[0]).toMatchObject({
+      role: 'assistant',
+      content: 'Previous answer.',
+      reasoning: 'Previous analysis.',
+    })
+    expect(openRouterPayload.messages[0]).not.toHaveProperty('reasoning_content')
+    expect(strictPayload.messages[0]).toMatchObject({
+      reasoning: 'Previous analysis.',
+    })
+    expect(strictPayload.messages[0]).not.toHaveProperty('reasoning_content')
+  })
+
+  it('preserves OpenRouter reasoning_details signatures across a streamed tool loop', async () => {
+    const encoder = new TextEncoder()
+    let call = 0
+    const requestBodies: Array<Record<string, any>> = []
+    const reasoningDetails = [{
+      type: 'reasoning.text',
+      text: 'I need the weather tool.',
+      signature: 'openrouter-signature',
+      index: 0,
+    }]
+    const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)))
+      call += 1
+      const frames = call === 1
+        ? [
+            `data: ${JSON.stringify({
+              id: 'chatcmpl_tool',
+              model: 'anthropic/claude-sonnet-4.6',
+              choices: [{
+                delta: {
+                  reasoning_details: reasoningDetails,
+                  tool_calls: [{
+                    index: 0,
+                    id: 'call_weather',
+                    type: 'function',
+                    function: { name: 'weather', arguments: '{"city":"Xiamen"}' },
+                  }],
+                },
+                finish_reason: 'tool_calls',
+              }],
+            })}\n\n`,
+            'data: [DONE]\n\n',
+          ]
+        : [
+            'data: {"id":"chatcmpl_final","choices":[{"delta":{"content":"Sunny"},"finish_reason":"stop"}]}\n\n',
+            'data: [DONE]\n\n',
+          ]
+      return new Response(new ReadableStream({
+        start(controller) {
+          for (const frame of frames) controller.enqueue(encoder.encode(frame))
+          controller.close()
+        },
+      }), { status: 200 })
+    })
+    const tools = new AgentToolRegistry()
+    tools.register({
+      definition: {
+        name: 'weather',
+        parameters: { type: 'object', properties: { city: { type: 'string' } } },
+      },
+      async execute() {
+        return { ok: true, content: 'Sunny' }
+      },
+    })
+    const runtime = new AgentRuntime({
+      modelClient: createModelClient({
+        id: 'openrouter',
+        type: 'openai-compatible',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: 'test-key',
+        defaultModel: 'anthropic/claude-sonnet-4.6',
+      }, { fetch: fetchMock }),
+      tools,
+    })
+
+    await runtime.run({ messages: ['Check Xiamen weather'] })
+
+    expect(requestBodies[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'assistant',
+        reasoning_details: reasoningDetails,
+        tool_calls: [expect.objectContaining({ id: 'call_weather' })],
+      }),
+    ]))
+    expect(requestBodies[1]?.messages[1]).not.toHaveProperty('reasoning')
+    expect(requestBodies[1]?.messages[1]).not.toHaveProperty('reasoning_content')
   })
 
   it('normalizes OpenAI-compatible responses into the internal shape', () => {
@@ -687,6 +1295,89 @@ describe('ekko-agent model requests', () => {
     ])
   })
 
+  it('replays encrypted OpenAI Responses reasoning items without flattening them', () => {
+    const response = normalizeOpenAIResponsesResponse({
+      id: 'resp_reasoning',
+      model: 'gpt-5.4',
+      status: 'completed',
+      output: [
+        {
+          id: 'rs_1',
+          type: 'reasoning',
+          summary: [{ type: 'summary_text', text: 'Checked the weather.' }],
+          encrypted_content: 'encrypted-reasoning',
+          status: 'completed',
+        },
+        {
+          type: 'function_call',
+          call_id: 'call_weather',
+          name: 'weather',
+          arguments: '{"city":"Xiamen"}',
+        },
+      ],
+    })
+    const message = modelResponseToAgentMessage(response)
+    const payload = toOpenAIResponsesPayload({
+      id: 'openai',
+      type: 'openai',
+      requestStyle: 'openai-responses',
+      defaultModel: 'gpt-5.4',
+    }, {
+      messages: [message],
+    })
+
+    expect(message.reasoning).toEqual({
+      text: 'Checked the weather.',
+      native: {
+        format: 'openai-responses-items',
+        data: [expect.objectContaining({
+          id: 'rs_1',
+          type: 'reasoning',
+          encrypted_content: 'encrypted-reasoning',
+        })],
+      },
+    })
+    expect(payload.include).toEqual(['reasoning.encrypted_content'])
+    expect(payload.input).toEqual([
+      {
+        type: 'reasoning',
+        id: 'rs_1',
+        summary: [{ type: 'summary_text', text: 'Checked the weather.' }],
+        encrypted_content: 'encrypted-reasoning',
+        status: 'completed',
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_weather',
+        name: 'weather',
+        arguments: '{"city":"Xiamen"}',
+      },
+    ])
+  })
+
+  it('only asks the official OpenAI Responses endpoint for encrypted reasoning', () => {
+    const request = {
+      messages: [{ role: 'user' as const, content: 'Hello' }],
+    }
+    const xaiPayload = toOpenAIResponsesPayload({
+      id: 'xai-oauth',
+      type: 'openai-compatible',
+      requestStyle: 'openai-responses',
+      baseUrl: 'https://api.x.ai/v1',
+      defaultModel: 'grok-code',
+    }, request)
+    const codexPayload = toOpenAIResponsesPayload({
+      id: 'openai-codex',
+      type: 'openai-compatible',
+      requestStyle: 'openai-responses',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      defaultModel: 'gpt-5-codex',
+    }, request)
+
+    expect(xaiPayload).not.toHaveProperty('include')
+    expect(codexPayload).not.toHaveProperty('include')
+  })
+
   it('omits invalid empty-name tool history from Responses replay', () => {
     const payload = toOpenAIResponsesPayload({
       id: 'custom:fun-codex',
@@ -743,6 +1434,139 @@ describe('ekko-agent model requests', () => {
     })
   })
 
+  it('replays signed Claude thinking blocks and never invents unsigned Claude blocks', () => {
+    const signedThinking = {
+      type: 'thinking' as const,
+      thinking: 'I should call the tool.',
+      signature: 'claude-signature',
+    }
+    const response = normalizeAnthropicResponse({
+      content: [
+        signedThinking,
+        {
+          type: 'tool_use',
+          id: 'call_weather',
+          name: 'weather',
+          input: { city: 'Xiamen' },
+        },
+      ],
+      stop_reason: 'tool_use',
+    })
+    const config: ModelProviderConfig = {
+      id: 'anthropic',
+      type: 'anthropic',
+      defaultModel: 'claude-sonnet-4-6',
+    }
+    const signedPayload = toAnthropicMessagesPayload(config, {
+      messages: [modelResponseToAgentMessage(response)],
+    })
+    const plainPayload = toAnthropicMessagesPayload(config, {
+      messages: [{
+        role: 'assistant',
+        content: 'Answer',
+        reasoning: { text: 'Unsigned internal summary.' },
+      }],
+    })
+
+    expect(signedPayload.messages[0]?.content).toEqual([
+      signedThinking,
+      {
+        type: 'tool_use',
+        id: 'call_weather',
+        name: 'weather',
+        input: { city: 'Xiamen' },
+      },
+    ])
+    expect(plainPayload.messages[0]?.content).toEqual([
+      { type: 'text', text: 'Answer' },
+    ])
+  })
+
+  it('converts unified reasoning text to unsigned thinking for non-Claude Anthropic-compatible models', () => {
+    const payload = toAnthropicMessagesPayload({
+      id: 'minimax-oauth',
+      type: 'anthropic',
+      requestStyle: 'anthropic-messages',
+      defaultModel: 'MiniMax-M3',
+    }, {
+      messages: [{
+        role: 'assistant',
+        content: '',
+        reasoning: {
+          text: 'I should call the tool.',
+          native: {
+            format: 'anthropic-thinking-blocks',
+            data: [{
+              type: 'thinking',
+              thinking: 'I should call the tool.',
+              signature: 'claude-only-signature',
+            }],
+          },
+        },
+        toolCalls: [{
+          id: 'call_weather',
+          name: 'weather',
+          arguments: { city: 'Xiamen' },
+        }],
+      }],
+    })
+
+    expect(payload.messages[0]?.content).toEqual([
+      { type: 'thinking', thinking: 'I should call the tool.' },
+      {
+        type: 'tool_use',
+        id: 'call_weather',
+        name: 'weather',
+        input: { city: 'Xiamen' },
+      },
+    ])
+  })
+
+  it('captures streamed Claude thinking signatures for the next request', async () => {
+    const encoder = new TextEncoder()
+    const fetchMock = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n'))
+        controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Use a tool."}}\n\n'))
+        controller.enqueue(encoder.encode('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-thinking"}}\n\n'))
+        controller.enqueue(encoder.encode('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'))
+        controller.enqueue(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const config: ModelProviderConfig = {
+      id: 'anthropic',
+      type: 'anthropic',
+      apiKey: 'test-key',
+      defaultModel: 'claude-sonnet-4-6',
+    }
+    const client = new AnthropicMessagesModelClient(config, { fetch: fetchMock })
+
+    const streamed = await collectModelEvents(client.stream({
+      messages: [{ role: 'user', content: 'Think' }],
+    }))
+    const replay = toAnthropicMessagesPayload(config, {
+      messages: [streamed.message],
+    })
+
+    expect(streamed.message.reasoning).toEqual({
+      text: 'Use a tool.',
+      native: {
+        format: 'anthropic-thinking-blocks',
+        data: [{
+          type: 'thinking',
+          thinking: 'Use a tool.',
+          signature: 'signed-thinking',
+        }],
+      },
+    })
+    expect(replay.messages[0]?.content).toEqual([{
+      type: 'thinking',
+      thinking: 'Use a tool.',
+      signature: 'signed-thinking',
+    }])
+  })
+
   it('calls Anthropic-compatible /anthropic bases through /v1/messages', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       content: [{ type: 'text', text: 'OK' }],
@@ -767,6 +1591,29 @@ describe('ekko-agent model requests', () => {
       authorization: 'Bearer test-key',
       'x-api-key': 'test-key',
     })
+  })
+
+  it('uses Bearer-only auth for MiniMax Coding Plan', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      content: [{ type: 'text', text: 'OK' }],
+      stop_reason: 'end_turn',
+    }), { status: 200 }))
+    const client = new AnthropicMessagesModelClient({
+      id: 'minimax-oauth',
+      type: 'anthropic',
+      requestStyle: 'anthropic-messages',
+      baseUrl: 'https://api.minimax.io/anthropic',
+      apiKey: 'oauth-access-token',
+      defaultModel: 'MiniMax-M3',
+    }, { fetch: fetchMock })
+
+    await client.create({ messages: [{ role: 'user', content: 'hi' }] })
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://api.minimax.io/anthropic/v1/messages')
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({
+      authorization: 'Bearer oauth-access-token',
+    })
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toHaveProperty('x-api-key')
   })
 
   it('merges Anthropic streaming input, output, and cache usage', async () => {
@@ -851,6 +1698,43 @@ describe('ekko-agent model requests', () => {
       generationConfig: { temperature: 0.1 },
       tools: [{ functionDeclarations: [{ name: 'lookup' }] }],
     })
+  })
+
+  it('replays Gemini thought signatures with their original content parts', () => {
+    const originalParts = [
+      { text: 'I should call the tool.', thought: true },
+      {
+        functionCall: { name: 'weather', args: { city: 'Xiamen' } },
+        thoughtSignature: 'gemini-signature',
+      },
+    ]
+    const response = normalizeGeminiResponse({
+      candidates: [{
+        content: { parts: originalParts },
+        finishReason: 'STOP',
+      }],
+    }, 'gemini-3-pro')
+    const message = modelResponseToAgentMessage(response)
+    const payload = toGeminiContentsPayload({
+      id: 'gemini',
+      type: 'gemini',
+      defaultModel: 'gemini-3-pro',
+    }, {
+      messages: [message],
+    })
+
+    expect(message.content).toBe('')
+    expect(message.reasoning).toEqual({
+      text: 'I should call the tool.',
+      native: {
+        format: 'gemini-content-parts',
+        data: originalParts,
+      },
+    })
+    expect(payload.contents).toEqual([{
+      role: 'model',
+      parts: originalParts,
+    }])
   })
 
   it('converts internal requests to prompt completion payloads', () => {

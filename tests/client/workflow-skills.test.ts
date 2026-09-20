@@ -4,8 +4,11 @@ import { buildWorkflowSkillOptions, workflowAgentToSkillTarget } from '@/utils/h
 describe('workflow skill helpers', () => {
   it('maps workflow agents to skill API targets', () => {
     expect(workflowAgentToSkillTarget('hermes')).toBe('hermes')
+    expect(workflowAgentToSkillTarget('ekko-agent')).toBe('hermes')
     expect(workflowAgentToSkillTarget('claude-code')).toBe('claude')
     expect(workflowAgentToSkillTarget('codex')).toBe('codex')
+    expect(workflowAgentToSkillTarget('pi')).toBe('pi')
+    expect(workflowAgentToSkillTarget('dsh')).toBe('dsh')
     expect(workflowAgentToSkillTarget('unknown-agent')).toBe('hermes')
   })
 

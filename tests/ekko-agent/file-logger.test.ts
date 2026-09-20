@@ -1,9 +1,11 @@
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   EKKO_LOG_FILE_NAME,
+  EkkoFileLogReader,
   EkkoFileLogger,
 } from '../../packages/ekko-agent/src'
 
@@ -32,6 +34,9 @@ describe('EkkoFileLogger', () => {
       runId: 'run-1',
       data: {
         apiKey: 'top-secret',
+        accessToken: 'oauth-access-secret',
+        refreshToken: 'oauth-refresh-secret',
+        clientSecret: 'oauth-client-secret',
         header: 'Bearer actual-token',
       },
     })).toBe(true)
@@ -48,6 +53,9 @@ describe('EkkoFileLogger', () => {
     const raw = await readFile(join(root, EKKO_LOG_FILE_NAME), 'utf8')
     expect(raw).not.toContain('top-secret')
     expect(raw).not.toContain('actual-token')
+    expect(raw).not.toContain('oauth-access-secret')
+    expect(raw).not.toContain('oauth-refresh-secret')
+    expect(raw).not.toContain('oauth-client-secret')
     expect(raw).toContain('[REDACTED]')
     expect(logger.query({ sessionId: 'session-1' })).toMatchObject([
       {
@@ -82,5 +90,28 @@ describe('EkkoFileLogger', () => {
     expect(raw).toContain('log.size_limit_reset')
     expect(raw).toContain('current-session')
     expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(700)
+  })
+
+  it('does not create files or directories when opened for reading', () => {
+    const missingDirectory = join(root, 'missing')
+    const reader = new EkkoFileLogReader({ directory: missingDirectory })
+
+    expect(reader.query()).toEqual([])
+    expect(existsSync(missingDirectory)).toBe(false)
+  })
+
+  it('degrades without throwing when the log directory is blocked', async () => {
+    const blockedDirectory = join(root, 'blocked')
+    await rm(root, { recursive: true })
+    await writeFile(root, 'not a directory')
+    const errors: unknown[] = []
+
+    const logger = new EkkoFileLogger({
+      directory: blockedDirectory,
+      onError: error => errors.push(error),
+    })
+
+    expect(logger.write({ category: 'system', event: 'logging.degraded' })).toBe(false)
+    expect(errors.length).toBeGreaterThanOrEqual(2)
   })
 })

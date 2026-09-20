@@ -4,22 +4,20 @@ import { useI18n } from 'vue-i18n'
 import { NAlert, NButton, NDrawer, NDrawerContent, NPopconfirm, NProgress, NSpin, NTag, useMessage } from 'naive-ui'
 import {
   activateRuntimeVersion,
-  activateWebUiVersion,
   deleteRuntimeVersion,
-  deleteWebUiVersion,
   downloadRuntimeVersion,
-  downloadWebUiVersion,
   fetchRuntimeVersionStatus,
   fetchVersionDownloadJobs,
   selectRuntimeRoot,
   type InstalledRuntimeVersion,
-  type InstalledWebUiVersion,
   type RuntimeVersionStatus,
   type VersionDownloadJob,
   type VersionDownloadJobStatus,
   type VersionDownloadKind,
   type VersionDownloadSource,
 } from '@/api/hermes/runtime-versions'
+import HermesDataDirectoryHint from '@/components/hermes/HermesDataDirectoryHint.vue'
+import { useRuntimeRestartPrompt } from '@/composables/useRuntimeRestartPrompt'
 import { desktopBridge } from '@/utils/desktop-bridge'
 
 const props = defineProps<{ show: boolean }>()
@@ -27,12 +25,14 @@ const emit = defineEmits<{ (event: 'update:show', value: boolean): void }>()
 
 const { t } = useI18n()
 const message = useMessage()
+const { requestRuntimeRestart, checkRuntimeDownloads } = useRuntimeRestartPrompt()
 
 const status = ref<RuntimeVersionStatus | null>(null)
 const jobs = ref<VersionDownloadJob[]>([])
 const loading = ref(false)
 const actionLoading = ref<Record<string, boolean>>({})
 const loadError = ref('')
+const cliDetailsShow = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const canSelectRuntimeDirectory = computed(() => typeof desktopBridge()?.selectRuntimeDirectory === 'function')
@@ -42,6 +42,12 @@ const isDefaultRuntimeDirectory = computed(() => {
   return !defaultDirectory || selectedDirectory === defaultDirectory
 })
 
+const currentHermesSource = computed(() =>
+  status.value?.hermes.source
+  || status.value?.hermes.cliInstallations?.find(item => item.selected)?.source
+  || 'none',
+)
+
 const currentPlatformRuntime = computed(() =>
   (status.value?.hermes.installed || []).filter(item => item.platform === status.value?.platform),
 )
@@ -49,23 +55,25 @@ const currentPlatformRuntime = computed(() =>
 const runtimeVersions = computed(() => uniqueVersions([
   ...(status.value?.hermes.remoteVersions || []),
   ...currentPlatformRuntime.value.map(item => item.version),
+  ...(status.value?.active?.runtimeValidationFailures || [])
+    .filter(failure => failure.platform === status.value?.platform)
+    .map(failure => failure.version),
 ]))
 
-const webUiVersions = computed(() => uniqueVersions([
-  ...(status.value?.webui.remoteVersions || []),
-  ...(status.value?.webui.installed || []).map(item => item.version),
-  status.value?.webui.currentVersion || '',
-]))
+const runtimeJobs = computed(() => jobs.value.filter(job => job.kind === 'runtime'))
 
 watch(() => props.show, show => {
   if (show) {
     void loadAll()
   } else {
+    cliDetailsShow.value = false
     stopPolling()
   }
 })
 
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(() => {
+  stopPolling()
+})
 
 function updateShow(show: boolean) {
   emit('update:show', show)
@@ -81,6 +89,7 @@ async function loadAll() {
   loadError.value = ''
   try {
     await Promise.all([loadStatus(), loadJobs()])
+    checkRuntimeDownloads()
     if (hasRunningJobs()) startPolling()
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : String(err)
@@ -127,15 +136,11 @@ function stopPolling() {
 }
 
 function hasRunningJobs(): boolean {
-  return jobs.value.some(job => job.status === 'queued' || job.status === 'running')
+  return runtimeJobs.value.some(job => job.status === 'queued' || job.status === 'running')
 }
 
 function runtimeFor(version: string): InstalledRuntimeVersion | undefined {
   return currentPlatformRuntime.value.find(item => item.version === version)
-}
-
-function webUiFor(version: string): InstalledWebUiVersion | undefined {
-  return status.value?.webui.installed.find(item => item.version === version)
 }
 
 function activeJob(kind: VersionDownloadKind, version: string): VersionDownloadJob | undefined {
@@ -195,6 +200,10 @@ function formatBytes(value?: number): string {
   return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`
 }
 
+function displayHermesAgentVersion(value?: string): string {
+  return value?.split('·')[0]?.trim() || '-'
+}
+
 function jobProgressText(job: VersionDownloadJob): string {
   if (job.receivedBytes && job.totalBytes) {
     return `${formatBytes(job.receivedBytes)} / ${formatBytes(job.totalBytes)}`
@@ -207,15 +216,7 @@ async function startRuntimeDownload(version: string, source: VersionDownloadSour
   await runAction(`download-runtime-${source}-${version}`, async () => {
     const response = await downloadRuntimeVersion(version, source)
     jobs.value = [response.job, ...jobs.value.filter(job => job.id !== response.job.id)]
-    message.success(t('runtimeVersions.downloadStarted'))
-    startPolling()
-  })
-}
-
-async function startWebUiDownload(version: string, source: VersionDownloadSource) {
-  await runAction(`download-webui-${source}-${version}`, async () => {
-    const response = await downloadWebUiVersion(version, source)
-    jobs.value = [response.job, ...jobs.value.filter(job => job.id !== response.job.id)]
+    checkRuntimeDownloads()
     message.success(t('runtimeVersions.downloadStarted'))
     startPolling()
   })
@@ -225,7 +226,7 @@ async function useRuntime(version: string) {
   await runAction(`activate-runtime-${version}`, async () => {
     await activateRuntimeVersion(version)
     message.success(t('runtimeVersions.activateSuccess'))
-    await loadAll()
+    requestRuntimeRestart(version)
   })
 }
 
@@ -263,21 +264,6 @@ async function removeRuntime(version: string) {
   })
 }
 
-async function useWebUi(version: string) {
-  await runAction(`activate-webui-${version}`, async () => {
-    await activateWebUiVersion(version)
-    message.success(t('runtimeVersions.activateSuccess'))
-    await loadAll()
-  })
-}
-
-async function removeWebUi(version: string) {
-  await runAction(`delete-webui-${version}`, async () => {
-    await deleteWebUiVersion(version)
-    message.success(t('runtimeVersions.deleteWebUiSuccess'))
-    await loadAll()
-  })
-}
 </script>
 
 <template>
@@ -303,12 +289,65 @@ async function removeWebUi(version: string) {
               <h3>{{ t('runtimeVersions.runtimeTitle') }}</h3>
               <p>{{ t('runtimeVersions.platform') }}: {{ status?.platform || '-' }}</p>
             </div>
-            <NButton size="small" secondary @click="loadAll">{{ t('runtimeVersions.refresh') }}</NButton>
+            <div class="section-heading-actions">
+              <NButton
+                v-if="currentHermesSource === 'user-cli'"
+                data-testid="view-cli-details"
+                size="small"
+                secondary
+                @click="cliDetailsShow = true"
+              >
+                {{ t('runtimeVersions.viewCliDetails') }}
+              </NButton>
+              <NButton size="small" secondary @click="loadAll">{{ t('runtimeVersions.refresh') }}</NButton>
+            </div>
           </div>
-          <div class="active-path">
-            <span>{{ t('runtimeVersions.activeVersion') }}: {{ status?.hermes.activeVersion || '-' }}</span>
-            <span :title="status?.hermes.activeDirectory || ''">{{ status?.hermes.activeDirectory || '-' }}</span>
+          <div class="active-path stacked">
+            <span
+              data-testid="active-hermes-agent-version"
+              :title="status?.hermes.agentVersion || ''"
+            >
+              {{ t('runtimeVersions.currentHermesAgentVersion') }}: {{ displayHermesAgentVersion(status?.hermes.agentVersion) }}
+            </span>
+            <span
+              data-testid="active-runtime-directory"
+              :title="status?.hermes.activeDirectory || ''"
+            >
+              {{ t('runtimeVersions.activeRuntimeDirectory') }}: {{ status?.hermes.activeDirectory || '-' }}
+            </span>
+            <span
+              v-if="currentHermesSource !== 'user-cli'"
+              data-testid="active-python-path"
+              :title="status?.hermes.pythonPath || ''"
+            >
+              {{ t('runtimeVersions.activePythonPath') }}: {{ status?.hermes.pythonPath || '-' }}
+            </span>
+            <span
+              v-if="currentHermesSource !== 'user-cli'"
+              data-testid="active-agent-root"
+              :title="status?.hermes.agentRoot || ''"
+            >
+              {{ t('runtimeVersions.activeAgentRoot') }}: {{ status?.hermes.agentRoot || '-' }}
+            </span>
+            <span
+              v-if="currentHermesSource === 'managed-runtime'"
+              data-testid="active-data-directory"
+              :title="status?.hermes.dataDirectory || ''"
+            >
+              {{ t('runtimeVersions.activeDataDirectory') }}: {{ status?.hermes.dataDirectory || '-' }}
+            </span>
           </div>
+          <HermesDataDirectoryHint v-if="currentHermesSource === 'managed-runtime'" />
+          <NAlert
+            data-testid="runtime-cli-update-note"
+            type="info"
+            :bordered="false"
+          >
+            <div class="runtime-update-note">
+              <span>{{ t('runtimeVersions.cliUpdateDescription') }}</span>
+              <code>ekko-studio cli update</code>
+            </div>
+          </NAlert>
           <div class="runtime-directory-control">
             <div class="runtime-directory-value">
               <strong>{{ t('runtimeVersions.runtimeDirectory') }}</strong>
@@ -346,6 +385,14 @@ async function removeWebUi(version: string) {
           </NAlert>
           <NAlert v-if="status?.hermes.migrationError" type="error" :bordered="false">
             {{ t('runtimeVersions.runtimeMigrationFailed') }}: {{ status.hermes.migrationError }}
+          </NAlert>
+          <NAlert
+            v-if="status?.hermes.activationError"
+            data-testid="runtime-activation-error"
+            type="error"
+            :bordered="false"
+          >
+            {{ t('runtimeVersions.runtimeActivationFailed') }}: {{ status.hermes.activationError }}
           </NAlert>
           <div class="version-list">
             <div v-for="version in runtimeVersions" :key="`runtime-${version}`" class="version-row">
@@ -415,93 +462,14 @@ async function removeWebUi(version: string) {
           </div>
         </section>
 
-        <section class="version-section">
-          <div class="section-heading">
-            <div>
-              <h3>{{ t('runtimeVersions.webUiTitle') }}</h3>
-              <p>{{ t('runtimeVersions.currentWebUi') }}: {{ status?.webui.currentVersion || '-' }}</p>
-            </div>
-          </div>
-          <div class="active-path">
-            <span>{{ t('runtimeVersions.activeVersion') }}: {{ status?.webui.activeVersion || '-' }}</span>
-            <span :title="status?.webui.activeDirectory || ''">{{ status?.webui.activeDirectory || '-' }}</span>
-          </div>
-          <div class="version-list">
-            <div v-for="version in webUiVersions" :key="`webui-${version}`" class="version-row">
-              <div class="version-main">
-                <strong>{{ version }}</strong>
-                <NTag v-if="webUiFor(version)?.active || version === status?.webui.activeVersion" size="small" type="success" :bordered="false">
-                  {{ t('runtimeVersions.active') }}
-                </NTag>
-                <NTag v-else-if="webUiFor(version)" size="small" :bordered="false">
-                  {{ t('runtimeVersions.installed') }}
-                </NTag>
-                <NTag v-if="activeJob('webui', version)" size="small" :type="jobType(activeJob('webui', version)!.status)" :bordered="false">
-                  {{ jobLabel(activeJob('webui', version)!) }}
-                </NTag>
-              </div>
-              <div class="version-actions">
-                <NButton
-                  v-if="webUiFor(version) && !webUiFor(version)?.active && version !== status?.webui.activeVersion"
-                  size="small"
-                  secondary
-                  :loading="actionLoading[`activate-webui-${version}`]"
-                  @click="useWebUi(version)"
-                >
-                  {{ t('runtimeVersions.useVersion') }}
-                </NButton>
-                <NPopconfirm
-                  v-if="webUiFor(version) && !webUiFor(version)?.active && version !== status?.webui.activeVersion"
-                  @positive-click="removeWebUi(version)"
-                >
-                  <template #trigger>
-                    <NButton
-                      size="small"
-                      type="error"
-                      secondary
-                      :loading="actionLoading[`delete-webui-${version}`]"
-                    >
-                      {{ t('runtimeVersions.deleteVersion') }}
-                    </NButton>
-                  </template>
-                  {{ t('runtimeVersions.deleteWebUiConfirm', { version }) }}
-                </NPopconfirm>
-                <NButton
-                  v-if="!webUiFor(version) && version !== status?.webui.activeVersion"
-                  size="small"
-                  type="primary"
-                  secondary
-                  :disabled="!!activeJob('webui', version)"
-                  :loading="actionLoading[`download-webui-github-${version}`]"
-                  @click="startWebUiDownload(version, 'github')"
-                >
-                  {{ t('runtimeVersions.downloadGithub') }}
-                </NButton>
-                <NButton
-                  v-if="!webUiFor(version) && version !== status?.webui.activeVersion"
-                  size="small"
-                  type="primary"
-                  secondary
-                  :disabled="!!activeJob('webui', version)"
-                  :loading="actionLoading[`download-webui-cf-${version}`]"
-                  @click="startWebUiDownload(version, 'cf')"
-                >
-                  {{ t('runtimeVersions.downloadCf') }}
-                </NButton>
-              </div>
-            </div>
-            <div v-if="webUiVersions.length === 0" class="empty-row">{{ t('runtimeVersions.noVersions') }}</div>
-          </div>
-        </section>
-
-        <section class="version-section" v-if="jobs.length > 0">
+        <section class="version-section" v-if="runtimeJobs.length > 0">
           <div class="section-heading compact">
             <h3>{{ t('runtimeVersions.downloadTasks') }}</h3>
           </div>
           <div class="job-list">
-            <div v-for="job in jobs.slice(0, 6)" :key="job.id" class="job-row">
+            <div v-for="job in runtimeJobs.slice(0, 6)" :key="job.id" class="job-row">
               <div class="job-main">
-                <span>{{ job.kind === 'runtime' ? t('runtimeVersions.runtimeTitle') : t('runtimeVersions.webUiTitle') }} {{ job.version }} · {{ sourceLabel(job.source) }}</span>
+                <span>{{ t('runtimeVersions.runtimeTitle') }} {{ job.version }} · {{ sourceLabel(job.source) }}</span>
                 <div v-if="job.status === 'running' || job.status === 'queued'" class="job-progress">
                   <NProgress
                     type="line"
@@ -519,6 +487,30 @@ async function removeWebUi(version: string) {
         </section>
         </div>
       </NSpin>
+    </NDrawerContent>
+  </NDrawer>
+  <NDrawer
+    :show="cliDetailsShow"
+    placement="right"
+    :width="'min(620px, calc(100vw - 24px))'"
+    @update:show="cliDetailsShow = $event"
+  >
+    <NDrawerContent :title="t('runtimeVersions.cliDetailsTitle')" closable>
+      <div data-testid="cli-details" class="cli-details">
+        <div class="cli-detail-row">
+          <strong>{{ t('runtimeVersions.activePythonPath') }}</strong>
+          <code :title="status?.hermes.pythonPath || ''">{{ status?.hermes.pythonPath || '-' }}</code>
+        </div>
+        <div class="cli-detail-row">
+          <strong>{{ t('runtimeVersions.activeAgentRoot') }}</strong>
+          <code :title="status?.hermes.agentRoot || ''">{{ status?.hermes.agentRoot || '-' }}</code>
+        </div>
+        <div class="cli-detail-row">
+          <strong>{{ t('runtimeVersions.activeDataDirectory') }}</strong>
+          <code :title="status?.hermes.dataDirectory || ''">{{ status?.hermes.dataDirectory || '-' }}</code>
+        </div>
+        <HermesDataDirectoryHint />
+      </div>
     </NDrawerContent>
   </NDrawer>
 </template>
@@ -559,6 +551,12 @@ async function removeWebUi(version: string) {
   }
 }
 
+.section-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .active-path {
   display: grid;
   grid-template-columns: minmax(130px, auto) minmax(0, 1fr);
@@ -575,6 +573,22 @@ async function removeWebUi(version: string) {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+
+  &.stacked {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+
+    span {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    span:last-child {
+      color: var(--text-color-3);
+    }
+  }
 }
 
 .runtime-directory-control {
@@ -585,6 +599,21 @@ async function removeWebUi(version: string) {
   padding: 8px 10px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
+}
+
+.runtime-update-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+
+  code {
+    width: fit-content;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--hover-color);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+  }
 }
 
 .runtime-directory-value {
@@ -613,6 +642,33 @@ async function removeWebUi(version: string) {
   margin: -4px 2px 0;
   color: var(--text-color-3);
   font-size: 12px;
+}
+
+.cli-details {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cli-detail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+
+  strong {
+    color: var(--text-color-2);
+    font-size: 12px;
+  }
+
+  code {
+    overflow-wrap: anywhere;
+    color: var(--text-color-1);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+  }
 }
 
 .version-list,
@@ -697,6 +753,10 @@ async function removeWebUi(version: string) {
 
   .runtime-directory-actions {
     flex-wrap: wrap;
+  }
+
+  .section-heading-actions {
+    justify-content: flex-start;
   }
 
   .active-path {

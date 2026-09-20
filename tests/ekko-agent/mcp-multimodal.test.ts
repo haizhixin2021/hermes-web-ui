@@ -21,6 +21,11 @@ const toolImage: AgentMessage = {
   contentParts: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }],
 }
 
+const screenshotCall: AgentMessage = {
+  role: 'assistant', content: '',
+  toolCalls: [{ id: 'call-1', name: 'browser_screenshot', arguments: {} }],
+}
+
 const userImage: AgentMessage = {
   role: 'user',
   content: 'Describe this image.',
@@ -48,9 +53,9 @@ describe('Ekko MCP multimodal results', () => {
   })
 
   it('maps tool images into each visual provider wire format', () => {
-    const openai = toOpenAIChatPayload(config, { messages: [toolImage] })
-    expect(openai.messages).toHaveLength(2)
-    expect(JSON.stringify(openai.messages[1])).toContain('data:image/png;base64,aGVsbG8=')
+    const openai = toOpenAIChatPayload(config, { messages: [screenshotCall, toolImage] })
+    expect(openai.messages).toHaveLength(3)
+    expect(JSON.stringify(openai.messages[2])).toContain('data:image/png;base64,aGVsbG8=')
 
     const responses = toOpenAIResponsesPayload(config, {
       messages: [
@@ -87,5 +92,28 @@ describe('Ekko MCP multimodal results', () => {
 
     const gemini = toGeminiContentsPayload({ ...config, type: 'gemini' }, { messages: [userImage] })
     expect(JSON.stringify(gemini.contents)).toContain('inlineData')
+  })
+
+  it('omits images when OpenAI-compatible vision is explicitly disabled', () => {
+    const payload = toOpenAIChatPayload({
+      id: 'custom:text-proxy',
+      type: 'openai-compatible',
+      baseUrl: 'https://chat.example.com/v1',
+      apiKey: 'test',
+      defaultModel: 'future-chat-model',
+      capabilities: { vision: false },
+    }, { messages: [userImage, screenshotCall, toolImage] })
+
+    expect(payload.messages).toHaveLength(3)
+    expect(payload.messages[0]).toMatchObject({
+      role: 'user',
+      content: 'Describe this image.',
+    })
+    expect(payload.messages[2]).toMatchObject({
+      role: 'tool',
+      content: 'browser screenshot',
+    })
+    expect(JSON.stringify(payload.messages)).not.toContain('image_url')
+    expect(JSON.stringify(payload.messages)).not.toContain('aGVsbG8=')
   })
 })

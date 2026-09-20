@@ -81,6 +81,8 @@ approval = types.ModuleType("tools.approval")
 approval._session_key = contextvars.ContextVar("approval_session_key", default="")
 approval._notify = {}
 approval._resolved_gateway = []
+approval._resolved_gateway_requests = []
+approval._gateway_waiters = {}
 approval._session_approved = {}
 approval._session_yolo = set()
 approval._permanent_approved = set()
@@ -102,9 +104,21 @@ def register_gateway_notify(session_key, callback):
 def unregister_gateway_notify(session_key):
     approval._notify.pop(session_key, None)
 
-def resolve_gateway_approval(session_key, choice):
+def queue_gateway_approval(session_key, request_id):
+    approval._gateway_waiters.setdefault(session_key, []).append(request_id)
+
+def resolve_gateway_approval(session_key, choice, request_id=None):
+    waiters = approval._gateway_waiters.get(session_key, [])
+    if request_id is None:
+        resolved_request_id = waiters.pop(0) if waiters else None
+    elif request_id in waiters:
+        waiters.remove(request_id)
+        resolved_request_id = request_id
+    else:
+        resolved_request_id = None
     approval._resolved_gateway.append((session_key, choice))
-    return 1
+    approval._resolved_gateway_requests.append((session_key, choice, request_id, resolved_request_id))
+    return 1 if resolved_request_id else 0
 
 def is_approved(session_key, pattern_key):
     return (
@@ -144,6 +158,7 @@ approval.get_current_session_key = get_current_session_key
 approval.register_gateway_notify = register_gateway_notify
 approval.unregister_gateway_notify = unregister_gateway_notify
 approval.resolve_gateway_approval = resolve_gateway_approval
+approval.queue_gateway_approval = queue_gateway_approval
 approval.is_approved = is_approved
 approval.approve_session = approve_session
 approval.enable_session_yolo = enable_session_yolo
@@ -155,11 +170,12 @@ approval.load_permanent_allowlist = load_permanent_allowlist
 approval.check_execute_code_guard = check_execute_code_guard
 sys.modules["tools.approval"] = approval
 
-path = Path("packages/server/src/services/hermes/agent-bridge/python/hermes_bridge.py")
+path = Path("packages/server/src/modules/hermes/services/bridge/python/hermes_bridge.py")
 spec = importlib.util.spec_from_file_location("hermes_bridge", path)
 bridge = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bridge
 spec.loader.exec_module(bridge)
+bridge._load_reasoning_config = lambda *_args, **_kwargs: {}
 
 class FakeDb:
     def __init__(self):
@@ -226,6 +242,121 @@ def wait_for(condition, timeout=20):
 `
 
 describe('agent bridge Python session concurrency', () => {
+  it('denies only the interrupted session run generation approval queues', () => {
+    runPython(String.raw`
+${harness}
+
+pool, _fake_db = make_pool()
+
+class InterruptibleAgent:
+    def __init__(self):
+        self.session = None
+
+    def interrupt(self, _message=None):
+        self.session.running = False
+
+agents = {sid: InterruptibleAgent() for sid in ("session-a", "session-b")}
+for sid, agent in agents.items():
+    session = bridge.AgentSession(session_id=sid, agent=agent, current_run_id="run-current")
+    session.running = True
+    agent.session = session
+    with pool._lock:
+        pool._sessions[sid] = session
+
+choices = {}
+threads = []
+for sid, run_id in (("session-a", "run-previous"), ("session-a", "run-current"), ("session-b", "run-current")):
+    with pool._lock:
+        pool._sessions[sid].current_run_id = run_id
+    thread = threading.Thread(
+        target=lambda current=sid, generation=run_id: choices.__setitem__(
+            f"{current}:{generation}",
+            pool._approval_callback(current)(
+                f"printf harmless {current} {generation}",
+                "harmless test command",
+                allow_permanent=False,
+            ),
+        ),
+        daemon=True,
+    )
+    thread.start()
+    threads.append(thread)
+    assert wait_for(lambda current=sid, generation=run_id: (
+        current,
+        generation,
+    ) in set(pool._approval_request_generations.values()))
+with pool._lock:
+    pool._sessions["session-a"].current_run_id = "run-previous"
+approval.queue_gateway_approval("session-a", "request-previous")
+pool._gateway_approval_notify("session-a")({
+    "request_id": "request-previous",
+    "command": "printf harmless previous gateway",
+    "description": "harmless test command",
+})
+with pool._lock:
+    pool._sessions["session-a"].current_run_id = "run-current"
+approval.queue_gateway_approval("session-a", "request-current")
+pool._gateway_approval_notify("session-a")({
+    "request_id": "request-current",
+    "command": "printf harmless current gateway",
+    "description": "harmless test command",
+})
+with pool._lock:
+    pool._sessions["session-a"].current_run_id = "run-later"
+approval.queue_gateway_approval("session-a", "request-later")
+pool._gateway_approval_notify("session-a")({
+    "request_id": "request-later",
+    "command": "printf harmless later gateway",
+    "description": "harmless test command",
+})
+with pool._lock:
+    pool._sessions["session-a"].current_run_id = "run-current"
+approval.queue_gateway_approval("session-b", "request-other-session")
+pool._gateway_approval_notify("session-b")({
+    "request_id": "request-other-session",
+    "command": "printf harmless other session gateway",
+    "description": "harmless test command",
+})
+
+result = pool.interrupt("session-a", "test interrupt")
+assert result["status"] == "interrupted"
+threads[1].join(timeout=5)
+assert not threads[1].is_alive()
+assert choices["session-a:run-current"] == "deny"
+assert threads[0].is_alive()
+with pool._lock:
+    assert set(pool._approval_request_generations.values()) == {
+        ("session-a", "run-previous"),
+        ("session-b", "run-current"),
+    }
+    remaining = dict(pool._approval_request_generations)
+    previous_id = next(key for key, value in remaining.items() if value == ("session-a", "run-previous"))
+    other_session_id = next(key for key, value in remaining.items() if value == ("session-b", "run-current"))
+    assert set(pool._gateway_approval_requests.values()) == {
+        ("session-a", "run-previous", "request-previous"),
+        ("session-a", "run-later", "request-later"),
+        ("session-b", "run-current", "request-other-session"),
+    }
+assert approval._resolved_gateway_requests == [
+    ("session-a", "deny", "request-current", "request-current"),
+]
+assert approval._gateway_waiters == {
+    "session-a": ["request-previous", "request-later"],
+    "session-b": ["request-other-session"],
+}
+
+assert pool.respond_approval(previous_id, "deny")["resolved"] is True
+assert pool.respond_approval(other_session_id, "deny")["resolved"] is True
+threads[0].join(timeout=5)
+threads[2].join(timeout=5)
+assert not threads[0].is_alive()
+assert not threads[2].is_alive()
+assert choices["session-a:run-previous"] == "deny"
+assert choices["session-b:run-current"] == "deny"
+assert pool.respond_approval(other_session_id, "once")["resolved"] is False
+`)
+  })
+
   it('toggles YOLO for a session before its first Agent session exists', () => {
     runPython(String.raw`
 ${harness}
@@ -626,6 +757,288 @@ assert polled["sessions"][0]["events"][-1]["status"] == "interrupted"
 `)
   })
 
+  it('honors rapid Hermes boundary requests after the complete tool batch', () => {
+    runPython(String.raw`
+${harness}
+
+interrupt_signals = []
+run_agent_module = types.ModuleType("run_agent")
+run_agent_module._set_interrupt = lambda value, thread_id=None: interrupt_signals.append(
+    (value, thread_id)
+)
+sys.modules["run_agent"] = run_agent_module
+
+class BoundaryToolAgent:
+    def __init__(self):
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        self._pending_redirect = None
+        self._pending_redirect_lock = threading.Lock()
+        self._model_request_active = threading.Event()
+        self._execution_thread_id = None
+        self._interrupt_thread_signal_pending = False
+        self._active_request_abort = None
+        self.tool_started = threading.Event()
+        self.release_tool = threading.Event()
+        self.tool_order = []
+        self.clear_count = 0
+
+    def _execute_tool_calls(self, assistant_message, messages, effective_task_id, api_call_count=0):
+        self.tool_order.append("first:start")
+        self.tool_started.set()
+        assert self.release_tool.wait(10)
+        self.tool_order.extend(["first:end", "second"])
+
+    def run_conversation(self, message, **kwargs):
+        self._execution_thread_id = threading.current_thread().ident
+        self._execute_tool_calls(None, [], kwargs.get("task_id") or "", 1)
+        return {"interrupted": self._interrupt_requested, "messages": []}
+
+    def clear_interrupt(self):
+        self.clear_count += 1
+        self._interrupt_requested = False
+
+pool, _fake_db = make_pool()
+agent = BoundaryToolAgent()
+session = bridge.AgentSession(session_id="boundary-tools", agent=agent)
+assert pool._install_boundary_interrupt(session) is True
+run_id = "run-boundary-tools"
+record = bridge.RunRecord(run_id=run_id, session_id=session.session_id)
+session.running = True
+session.current_run_id = run_id
+session.boundary_phase = "model"
+with pool._lock:
+    pool._sessions[session.session_id] = session
+    pool._runs[run_id] = record
+thread = threading.Thread(
+    target=pool._run_chat,
+    args=(session, record, "use both tools", None, None, [], "default", False, None, "api_server"),
+    daemon=True,
+)
+thread.start()
+
+assert agent.tool_started.wait(10)
+first = pool.request_boundary_interrupt(session.session_id, run_id)
+second = pool.request_boundary_interrupt(session.session_id, run_id)
+assert first == {
+    "status": "accepted",
+    "session_id": session.session_id,
+    "run_id": run_id,
+    "phase": "tool_batch",
+    "guarantee": "strict",
+}
+assert second == {
+    "status": "already_pending",
+    "session_id": session.session_id,
+    "run_id": run_id,
+    "phase": "tool_batch",
+    "guarantee": "strict",
+}
+assert interrupt_signals == []
+agent.release_tool.set()
+thread.join(10)
+
+assert not thread.is_alive()
+assert agent.tool_order == ["first:start", "first:end", "second"]
+assert record.status == "interrupted"
+assert record.result["finish_reason"] == "boundary_interrupt"
+assert record.result["boundary_interrupt"] is True
+assert [event["event"] for event in record.events if event.get("event") == "run.boundary_interrupt"] == [
+    "run.boundary_interrupt"
+]
+assert agent.clear_count == 1
+assert session.boundary_phase == "idle"
+assert session.boundary_pending_run_id is None
+`)
+  })
+
+  it('interrupts only the active Hermes model request at the boundary', () => {
+    runPython(String.raw`
+${harness}
+
+interrupt_signals = []
+run_agent_module = types.ModuleType("run_agent")
+run_agent_module._set_interrupt = lambda value, thread_id=None: interrupt_signals.append(
+    (value, thread_id)
+)
+sys.modules["run_agent"] = run_agent_module
+
+class BoundaryModelAgent:
+    def __init__(self):
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        self._pending_redirect = None
+        self._pending_redirect_lock = threading.Lock()
+        self._model_request_active = threading.Event()
+        self._execution_thread_id = None
+        self._interrupt_thread_signal_pending = False
+        self._active_request_abort = None
+        self.model_started = threading.Event()
+        self.model_aborted = threading.Event()
+        self.abort_reasons = []
+        self.clear_count = 0
+
+    def _execute_tool_calls(self, assistant_message, messages, effective_task_id, api_call_count=0):
+        raise AssertionError("model boundary must not execute tools")
+
+    def run_conversation(self, message, **kwargs):
+        self._execution_thread_id = threading.current_thread().ident
+        self._model_request_active.set()
+        self._active_request_abort = lambda reason: (
+            self.abort_reasons.append(reason),
+            self.model_aborted.set(),
+        )
+        self.model_started.set()
+        assert self.model_aborted.wait(10)
+        self._model_request_active.clear()
+        self._active_request_abort = None
+        return {"interrupted": self._interrupt_requested, "messages": []}
+
+    def clear_interrupt(self):
+        self.clear_count += 1
+        self._interrupt_requested = False
+        if self._execution_thread_id is not None:
+            run_agent_module._set_interrupt(False, self._execution_thread_id)
+
+    def interrupt(self, message):
+        raise AssertionError("boundary interrupt must not call the broad interrupt method")
+
+pool, _fake_db = make_pool()
+agent = BoundaryModelAgent()
+session = bridge.AgentSession(session_id="boundary-model", agent=agent)
+assert pool._install_boundary_interrupt(session) is True
+run_id = "run-boundary-model"
+record = bridge.RunRecord(run_id=run_id, session_id=session.session_id)
+session.running = True
+session.current_run_id = run_id
+session.boundary_phase = "model"
+with pool._lock:
+    pool._sessions[session.session_id] = session
+    pool._runs[run_id] = record
+thread = threading.Thread(
+    target=pool._run_chat,
+    args=(session, record, "wait for model", None, None, [], "default", False, None, "api_server"),
+    daemon=True,
+)
+thread.start()
+
+assert agent.model_started.wait(10)
+assert pool.request_boundary_interrupt(session.session_id, "stale-run") == {
+    "status": "run_mismatch",
+    "session_id": session.session_id,
+    "run_id": run_id,
+    "guarantee": "strict",
+}
+first = pool.request_boundary_interrupt(session.session_id, run_id)
+second = pool.request_boundary_interrupt(session.session_id, run_id)
+assert first["status"] == "accepted" and first["phase"] == "model"
+assert second["status"] == "already_pending" and second["phase"] == "model"
+thread.join(10)
+
+assert not thread.is_alive()
+assert agent.abort_reasons == ["boundary_interrupt_abort"]
+assert [value for value, _thread_id in interrupt_signals] == [True, False]
+assert record.status == "interrupted"
+assert record.result["finish_reason"] == "boundary_interrupt"
+assert agent.clear_count == 1
+`)
+  })
+
+  it('waits for every concurrent Hermes tool worker before crossing the boundary', () => {
+    runPython(String.raw`
+${harness}
+
+run_agent_module = types.ModuleType("run_agent")
+run_agent_module._set_interrupt = lambda value, thread_id=None: None
+sys.modules["run_agent"] = run_agent_module
+
+class ParallelBoundaryAgent:
+    def __init__(self):
+        self._interrupt_requested = False
+        self._interrupt_message = None
+        self._pending_redirect = None
+        self._pending_redirect_lock = threading.Lock()
+        self._model_request_active = threading.Event()
+        self._execution_thread_id = None
+        self._interrupt_thread_signal_pending = False
+        self.started = [threading.Event(), threading.Event()]
+        self.release = [threading.Event(), threading.Event()]
+        self.completed = []
+
+    def _execute_tool_calls(self, assistant_message, messages, effective_task_id, api_call_count=0):
+        def execute(index):
+            self.started[index].set()
+            assert self.release[index].wait(10)
+            self.completed.append(index)
+
+        workers = [threading.Thread(target=execute, args=(index,)) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+pool, _fake_db = make_pool()
+agent = ParallelBoundaryAgent()
+session = bridge.AgentSession(session_id="boundary-parallel", agent=agent)
+session.running = True
+session.current_run_id = "run-boundary-parallel"
+session.boundary_phase = "model"
+pool._sessions[session.session_id] = session
+assert pool._install_boundary_interrupt(session) is True
+
+execution = threading.Thread(
+    target=agent._execute_tool_calls,
+    args=(None, [], session.session_id, 1),
+    daemon=True,
+)
+execution.start()
+assert all(started.wait(10) for started in agent.started)
+assert pool.request_boundary_interrupt(
+    session.session_id,
+    session.current_run_id,
+)["status"] == "accepted"
+
+agent.release[0].set()
+assert wait_for(lambda: agent.completed == [0])
+assert execution.is_alive()
+assert agent._interrupt_requested is False
+agent.release[1].set()
+execution.join(10)
+
+assert not execution.is_alive()
+assert sorted(agent.completed) == [0, 1]
+assert agent._interrupt_requested is True
+assert session.boundary_reached_run_id == session.current_run_id
+`)
+  })
+
+  it('fails closed when the Hermes private tool boundary is incompatible', () => {
+    runPython(String.raw`
+${harness}
+
+run_agent_module = types.ModuleType("run_agent")
+run_agent_module._set_interrupt = lambda value, thread_id=None: None
+sys.modules["run_agent"] = run_agent_module
+
+class UnsupportedAgent:
+    _interrupt_requested = False
+    _model_request_active = threading.Event()
+
+pool, _fake_db = make_pool()
+session = bridge.AgentSession(session_id="unsupported-boundary", agent=UnsupportedAgent())
+session.running = True
+session.current_run_id = "run-unsupported"
+pool._sessions[session.session_id] = session
+
+assert pool._install_boundary_interrupt(session) is False
+result = pool.request_boundary_interrupt(session.session_id, session.current_run_id)
+assert result["status"] == "unsupported"
+assert result["guarantee"] == "none"
+assert "_execute_tool_calls" in result["reason"]
+assert session.agent._interrupt_requested is False
+`)
+  })
+
   it('keeps idle sessions alive while durable background delegations are active', () => {
     runPython(String.raw`
 ${harness}
@@ -954,7 +1367,9 @@ ${harness}
 pool, _fake_db = make_pool()
 
 notify = pool._gateway_approval_notify("session-a")
+approval.queue_gateway_approval("session-a", "request-session-a")
 notify({
+    "request_id": "request-session-a",
     "command": "execute_code <<'PY'\nprint(1)\nPY",
     "description": "execute_code script execution",
     "pattern_key": "execute_code",
@@ -967,7 +1382,9 @@ assert approval.is_approved("session-a", "execute_code") is True
 assert approval._saved_permanent == set()
 
 notify = pool._gateway_approval_notify("session-b")
+approval.queue_gateway_approval("session-b", "request-session-b")
 notify({
+    "request_id": "request-session-b",
     "command": "execute_code <<'PY'\nprint(2)\nPY",
     "description": "execute_code script execution",
     "pattern_key": "execute_code",
@@ -1012,7 +1429,10 @@ class FakeAgent:
         notify = approval._notify.get(self.session_id)
         if notify is None:
             raise RuntimeError(f"missing gateway notify for {self.session_id}")
+        request_id = f"request:{self.session_id}"
+        approval.queue_gateway_approval(self.session_id, request_id)
         notify({
+            "request_id": request_id,
             "command": f"gateway:{self.session_id}",
             "description": f"gateway-desc:{self.session_id}",
         })
@@ -1232,6 +1652,62 @@ assert resp["active_sessions"] == 1
 assert resp["running_sessions"] == 1
 assert resp["sessions_by_profile"] == {"default": 1}
 assert resp["running_sessions_by_profile"] == {"default": 1}
+`)
+  })
+
+  it('routes boundary interrupts through the worker server and profile broker', () => {
+    runPython(String.raw`
+${harness}
+
+server_calls = []
+server = bridge.BridgeServer.__new__(bridge.BridgeServer)
+server.pool = types.SimpleNamespace(
+    request_boundary_interrupt=lambda session_id, run_id: server_calls.append(
+        (session_id, run_id)
+    ) or {"status": "accepted", "run_id": run_id}
+)
+server_response = server.handle({
+    "action": "request_boundary_interrupt",
+    "session_id": "session-a",
+    "expected_run_id": "run-a",
+})
+assert server_calls == [("session-a", "run-a")]
+assert server_response == {"status": "accepted", "run_id": "run-a"}
+
+class BoundaryWorker:
+    running = True
+    pid = 12345
+    endpoint = "ipc:///tmp/boundary-worker.sock"
+    last_used_at = 12.5
+    profile = "work"
+    key = "work"
+
+    def __init__(self):
+        self.requests = []
+
+    def request(self, req, timeout=None):
+        self.requests.append(req)
+        return {"ok": True, "status": "accepted", "run_id": req["expected_run_id"]}
+
+broker = bridge.BridgeBroker("ipc:///tmp/unused.sock")
+worker = BoundaryWorker()
+broker._workers["work"] = worker
+broker._session_profile["session-a"] = "work"
+broker._session_worker_key["session-a"] = "work"
+
+broker_response = broker.handle({
+    "action": "request_boundary_interrupt",
+    "session_id": "session-a",
+    "expected_run_id": "run-a",
+    "profile": "work",
+})
+assert broker_response["status"] == "accepted"
+assert worker.requests == [{
+    "action": "request_boundary_interrupt",
+    "session_id": "session-a",
+    "expected_run_id": "run-a",
+    "profile": "work",
+}]
 `)
   })
 

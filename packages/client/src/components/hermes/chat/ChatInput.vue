@@ -4,8 +4,9 @@ import { useChatStore } from '@/stores/hermes/chat'
 import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
 import { useSettingsStore } from '@/stores/hermes/settings'
-import { fetchContextLength } from '@/api/hermes/sessions'
+import { fetchContextLength } from '@/api/studio/sessions'
 import { setModelContext } from '@/api/hermes/model-context'
+import { fetchSocialMessagePlatforms } from '@/api/studio/social-messages'
 import { fetchSkills, type SkillCategory, type SkillInfo } from '@/api/hermes/skills'
 import { deleteSkillBundleApi, fetchSkillBundles, type SkillBundleInfo } from '@/api/hermes/skill-bundles'
 import { NButton, NTooltip, NModal, NInputNumber, NPopover, NSlider, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
@@ -15,18 +16,11 @@ import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
 import { extractClipboardFiles } from '@/utils/clipboard-files'
 import VoiceDialogueControls from './VoiceDialogueControls.vue'
 import BundleCreateModal from './BundleCreateModal.vue'
-import { useMicRecorder } from '@/composables/useMicRecorder'
-import { usePcmStreamRecorder } from '@/composables/usePcmStreamRecorder'
-import { useGlobalSpeech } from '@/composables/useSpeech'
-import { useVoiceDialogue } from '@/composables/useVoiceDialogue'
-import { transcribeSpeech } from '@/api/hermes/stt'
-import type { StoredSttProvider } from '@/api/hermes/stt-settings'
-import { useSttSettings } from '@/composables/useSttSettings'
-import { useBrowserSpeechRecognition } from '@/composables/useBrowserSpeechRecognition'
 import { BRIDGE_SESSION_COMMAND_DEFINITIONS } from '@/utils/hermes/bridge-session-commands'
 import { clampChatInputHeight, isMobileChatInputViewport } from '@/utils/chat-input-height'
-import { isDesktopShell } from '@/utils/desktop-bridge'
-import { isMobileDevice } from '@/utils/device'
+import { normalizeComposerVoiceTranscript, useComposerVoiceInput } from '@/composables/useComposerVoiceInput'
+import { extractRepresentativeVideoFrames, isVideoFile } from '@/utils/video-frame-extraction'
+import ImagePreviewOverlay from './ImagePreviewOverlay.vue'
 
 const chatStore = useChatStore()
 const appStore = useAppStore()
@@ -39,8 +33,14 @@ const { toolTraceVisible, toggleToolTraceVisible } = useToolTraceVisibility()
 
 const props = withDefaults(defineProps<{
   modelLabel?: string
+  modelDisabled?: boolean
+  initialText?: string
+  persistDraft?: boolean
 }>(), {
   modelLabel: '',
+  modelDisabled: false,
+  initialText: '',
+  persistDraft: true,
 })
 
 const emit = defineEmits<{
@@ -80,6 +80,9 @@ const reasoningEffortAccentStyle = computed(() => ({
     || reasoningEffortAccentColors[0],
 }))
 const isMoaSession = computed(() => chatStore.activeSession?.provider === 'moa')
+const isGlobalCodingAgentSession = computed(() =>
+  chatStore.activeSession?.codingAgentMode === 'global'
+)
 const reasoningEffortLabel = computed<string>(() => {
   const v = currentReasoningEffort.value
   if (!v) return t('chat.reasoningEffort.defaultLabel')
@@ -101,6 +104,7 @@ function onReasoningEffortSliderChange(value: number | [number, number]) {
 }
 
 function handleModelButtonClick() {
+  if (props.modelDisabled) return
   emit('modelClick')
 }
 
@@ -117,6 +121,10 @@ const textareaRef = ref<HTMLTextAreaElement>()
 const commandDropdownRef = ref<HTMLDivElement>()
 const fileInputRef = ref<HTMLInputElement>()
 const attachments = ref<Attachment[]>([])
+const previewAttachment = ref<Attachment | null>(null)
+const pendingVideoFrameJobs = new Set<Promise<void>>()
+const isPreparingAttachments = ref(false)
+let sendAwaitingAttachments = false
 const isDragging = ref(false)
 const dragCounter = ref(0)
 const isComposing = ref(false)
@@ -126,29 +134,6 @@ const messageReferencePreview = computed(() =>
 )
 const isMobileViewport = ref(typeof window !== 'undefined' ? isMobileChatInputViewport(window.innerWidth) : false)
 const manualTextareaResize = ref(false)
-const speech = useGlobalSpeech()
-const micRecorder = useMicRecorder({
-  messages: {
-    unsupported: t('chat.voiceInput.microphoneUnsupported'),
-    recordingFailed: t('chat.voiceInput.microphoneRecordingFailed'),
-  },
-})
-const pcmRecorder = usePcmStreamRecorder({
-  voiceActivityThreshold: 0.02,
-  messages: {
-    unsupported: t('chat.voiceInput.microphoneUnsupported'),
-    recordingFailed: t('chat.voiceInput.microphoneRecordingFailed'),
-  },
-})
-const sttSettings = useSttSettings()
-const browserRecognition = useBrowserSpeechRecognition({
-  messages: {
-    unsupported: t('chat.voiceInput.browserSpeechUnsupported'),
-    failed: t('chat.voiceInput.browserSpeechFailed'),
-    failedWithReason: (reason) => t('chat.voiceInput.browserSpeechFailedWithReason', { error: reason }),
-  },
-})
-const activeVoiceCaptureMode = ref<'browser' | 'backend' | 'pcm' | null>(null)
 const configuredTextareaHeight = computed(() =>
   isMobileViewport.value ? null : clampChatInputHeight(settingsStore.display.chat_input_height),
 )
@@ -164,48 +149,8 @@ type SlashCommandOption = {
   opensBundleCreator?: boolean
 }
 
-function normalizeVoiceTranscript(text: string) {
-  return text.replace(/\s+/g, ' ').trim()
-}
-
-function backendTranscribeOptions(): {
-  provider: StoredSttProvider
-  language?: string
-  prompt?: string
-} {
-  if (sttSettings.provider.value === 'custom') {
-    return {
-      provider: 'custom',
-      language: sttSettings.customLanguage.value.trim() || undefined,
-      prompt: sttSettings.customPrompt.value.trim() || undefined,
-    }
-  }
-
-  if (sttSettings.provider.value === 'doubao') {
-    return {
-      provider: 'doubao',
-    }
-  }
-
-  if (sttSettings.provider.value !== 'browser') {
-    return {
-      provider: sttSettings.provider.value,
-    }
-  }
-
-  return {
-    provider: 'openai',
-    language: sttSettings.openaiLanguage.value.trim() || undefined,
-    prompt: sttSettings.openaiPrompt.value.trim() || undefined,
-  }
-}
-
-function browserCaptureLanguage() {
-  return sttSettings.openaiLanguage.value.trim() || sttSettings.customLanguage.value.trim() || ''
-}
-
 function insertVoiceTranscriptIntoInput(text: string) {
-  const normalizedTranscript = normalizeVoiceTranscript(text)
+  const normalizedTranscript = normalizeComposerVoiceTranscript(text)
   if (!normalizedTranscript) return
 
   const el = textareaRef.value
@@ -246,36 +191,11 @@ watch(
   },
 )
 
-const voiceDialogue = useVoiceDialogue({
-  transcribe: async (audio) => {
-    const { provider, language, prompt } = backendTranscribeOptions()
-    return transcribeSpeech({ audio, provider, language, prompt })
-  },
-  sendMessage: async (text) => {
-    insertVoiceTranscriptIntoInput(text)
-  },
-  stopOutputAudio: () => speech.stop(true),
+const voiceInput = useComposerVoiceInput({
+  insertTranscript: insertVoiceTranscriptIntoInput,
 })
-const voiceDialogueTranscript = computed(() => {
-  if (activeVoiceCaptureMode.value !== 'browser' || voiceDialogue.status.value !== 'capturing') {
-    return voiceDialogue.transcript.value
-  }
 
-  return normalizeVoiceTranscript([
-    browserRecognition.transcript.value,
-    browserRecognition.partialTranscript.value,
-  ].filter(Boolean).join(' '))
-})
-const shouldShowBrowserRecognitionError = computed(() =>
-  sttSettings.provider.value === 'browser' || activeVoiceCaptureMode.value === 'browser',
-)
-const voiceDialogueError = computed(() =>
-  voiceDialogue.error.value?.message
-  ?? (shouldShowBrowserRecognitionError.value ? browserRecognition.error.value?.message : null)
-  ?? pcmRecorder.error.value?.message
-  ?? micRecorder.state.value.error?.message
-  ?? null,
-)
+const CODING_AGENT_SLASH_COMMANDS = ['context', 'compact', 'usage', 'status']
 
 const bridgeCommands = computed<SlashCommandOption[]>(() =>
   BRIDGE_SESSION_COMMAND_DEFINITIONS.map(command => ({
@@ -313,6 +233,19 @@ const isBridgeSession = computed(() => {
   if (!session) return chatStore.runtimeMode !== 'global_agent'
   return session.source === 'cli'
 })
+const isCodingAgentSession = computed(() => {
+  const session = chatStore.activeSession
+  return !!session && (
+    session.source === 'coding_agent'
+    || !!session.codingAgentId
+    || session.agent === 'claude'
+    || session.agent === 'codex'
+    || session.agent === 'claude-code'
+    || session.agent === 'pi'
+    || session.agent === 'grok'
+    || session.agent === 'opencode'
+  )
+})
 const isForkCommandSession = computed(() => !!chatStore.activeSession && chatStore.activeSession.source !== 'coding_agent')
 const skillPickerItems = computed(() => {
   const byName = new Map<string, SkillInfo>()
@@ -336,9 +269,12 @@ const filteredBridgeCommands = computed(() => {
   const query = slashQuery.value.trim().toLowerCase()
   const commands = isBridgeSession.value
     ? bridgeCommands.value
-    : isForkCommandSession.value
-      ? bridgeCommands.value.filter(command => command.name === 'fork')
-      : []
+    : isCodingAgentSession.value
+      ? bridgeCommands.value.filter(command => CODING_AGENT_SLASH_COMMANDS.includes(command.name)
+        && !(command.name === 'compact' && (chatStore.activeSession?.codingAgentId === 'opencode' || chatStore.activeSession?.agent === 'opencode')))
+      : isForkCommandSession.value
+        ? bridgeCommands.value.filter(command => command.name === 'fork')
+        : []
   if (!query) return commands
   return commands.filter((command) => {
     const name = command.name.toLowerCase()
@@ -537,6 +473,15 @@ const inputSettingsOptions = computed<DropdownOption[]>(() => [
       'aria-hidden': 'true',
     }, toolTraceVisible.value ? '✓' : ''),
   },
+  {
+    label: t('chat.pushEnabled'),
+    key: 'pushEnabled',
+    disabled: !chatStore.activeSessionId,
+    icon: () => h('span', {
+      class: ['settings-check', { active: Boolean(chatStore.activeSession?.pushEnabled) }],
+      'aria-hidden': 'true',
+    }, chatStore.activeSession?.pushEnabled ? '✓' : ''),
+  },
 ])
 
 function readDraftMap(): DraftMap {
@@ -575,15 +520,17 @@ function saveDraftForActiveSession(value: string) {
 
 // 从 localStorage 读取设置
 onMounted(() => {
-  loadDraftForActiveSession()
+  if (props.initialText) inputText.value = props.initialText
+  else if (props.persistDraft) loadDraftForActiveSession()
   syncViewport()
   window.addEventListener('resize', syncViewport)
   nextTick(() => {
     applyConfiguredTextareaHeight()
+    if (props.initialText) focusComposer()
   })
 })
 
-function handleInputSettingsSelect(key: string | number) {
+async function handleInputSettingsSelect(key: string | number) {
   if (key === 'voiceMode') {
     if (chatStore.activeSessionId) emit('voiceClick')
     return
@@ -591,15 +538,39 @@ function handleInputSettingsSelect(key: string | number) {
 
   if (key === 'toolTrace') {
     toggleToolTraceVisible()
+    return
+  }
+
+  if (key === 'pushEnabled') {
+    const sessionId = chatStore.activeSessionId
+    if (!sessionId) return
+    const nextEnabled = !Boolean(chatStore.activeSession?.pushEnabled)
+    if (nextEnabled) {
+      try {
+        const platforms = await fetchSocialMessagePlatforms()
+        const pushReady = platforms.some(platform => (
+          platform.active && platform.configured && platform.pushReady
+        ))
+        if (!pushReady) {
+          message.warning(t('chat.pushNotConfigured'))
+          return
+        }
+      } catch {
+        message.warning(t('chat.pushNotConfigured'))
+        return
+      }
+    }
+    await chatStore.setSessionPushEnabled(sessionId, nextEnabled)
   }
 }
 
 watch(inputText, (value) => {
-  saveDraftForActiveSession(value)
+  if (props.persistDraft) saveDraftForActiveSession(value)
 })
 
 watch(() => chatStore.activeSession?.id, () => {
-  loadDraftForActiveSession()
+  if (props.persistDraft) loadDraftForActiveSession()
+  else inputText.value = props.initialText
   nextTick(() => {
     applyConfiguredTextareaHeight()
   })
@@ -636,7 +607,7 @@ function scrollCommandIntoView() {
 }
 
 function updateSlashState() {
-  if (!isBridgeSession.value && !isForkCommandSession.value) {
+  if (!isBridgeSession.value && !isCodingAgentSession.value && !isForkCommandSession.value) {
     slashActive.value = false
     return
   }
@@ -897,7 +868,7 @@ function formatTokens(n: number): string {
 
 // --- File attachment helpers ---
 
-function addFile(file: File, context?: string) {
+function addFile(file: File) {
   if (attachments.value.find(a => a.name === file.name)) return
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const url = URL.createObjectURL(file)
@@ -908,18 +879,39 @@ function addFile(file: File, context?: string) {
     size: file.size,
     url,
     file,
-    ...(context?.trim() ? { context: context.trim() } : {}),
   })
+  if (!isVideoFile(file)) return
+
+  let job: Promise<void>
+  job = extractRepresentativeVideoFrames(file)
+    .then((frames) => {
+      if (!attachments.value.some(attachment => attachment.id === id)) return
+      for (const frame of frames) {
+        attachments.value.push({
+          id: `${id}-frame-${attachments.value.length}`,
+          name: frame.name,
+          type: frame.type,
+          size: frame.size,
+          url: URL.createObjectURL(frame),
+          file: frame,
+          videoFrameFor: id,
+        })
+      }
+    })
+    .catch(() => {
+      // Keep the original video attachment. Coding agents can still inspect its local path.
+    })
+    .finally(() => {
+      pendingVideoFrameJobs.delete(job)
+      isPreparingAttachments.value = pendingVideoFrameJobs.size > 0
+    })
+  pendingVideoFrameJobs.add(job)
+  isPreparingAttachments.value = true
 }
 
 function addFiles(files: File[]) {
   for (const file of files) addFile(file)
   if (files.length > 0) textareaRef.value?.focus()
-}
-
-function addBrowserAttachment(file: File, context: string) {
-  addFile(file, context)
-  textareaRef.value?.focus()
 }
 
 function handleAttachClick() {
@@ -973,11 +965,32 @@ function handleDrop(e: DragEvent) {
   addFiles(files)
 }
 
-defineExpose({ addFiles, addBrowserAttachment })
+/**
+ * Put the caret in the composer so the next keystroke lands in the message box.
+ * Refused on a phone, where taking focus raises the on-screen keyboard over the
+ * conversation the user just opened.
+ */
+function focusComposer() {
+  if (isMobileViewport.value) return
+  nextTick(() => textareaRef.value?.focus())
+}
+
+defineExpose({ addFiles, focusComposer })
 
 // --- Send ---
 
-function handleSend() {
+async function handleSend() {
+  if (isPreparingAttachments.value) {
+    if (sendAwaitingAttachments) return
+    sendAwaitingAttachments = true
+    try {
+      while (pendingVideoFrameJobs.size > 0) {
+        await Promise.allSettled([...pendingVideoFrameJobs])
+      }
+    } finally {
+      sendAwaitingAttachments = false
+    }
+  }
   const text = inputText.value.trim()
   if (!text && attachments.value.length === 0) return
   if (isBridgeSession.value && text === '/skill' && attachments.value.length === 0) {
@@ -996,115 +1009,13 @@ function handleSend() {
   chatStore.sendMessage(text, attachments.value.length > 0 ? attachments.value : undefined)
   inputText.value = ''
   saveDraftForActiveSession('')
+  previewAttachment.value = null
   attachments.value = []
   slashActive.value = false
 
   if (textareaRef.value) {
     textareaRef.value.style.height = 'auto'
   }
-}
-
-async function startVoiceCapture() {
-  browserRecognition.clearError()
-  const { captureId } = await voiceDialogue.beginCapture()
-  const useBrowserProvider = sttSettings.provider.value === 'browser'
-  const usePcmCapture = !useBrowserProvider && (isDesktopShell() || isMobileDevice())
-
-  activeVoiceCaptureMode.value = useBrowserProvider
-    ? 'browser'
-    : usePcmCapture ? 'pcm' : 'backend'
-
-  try {
-    if (useBrowserProvider) {
-      await browserRecognition.start({ language: browserCaptureLanguage() })
-      return
-    }
-
-    if (usePcmCapture) {
-      await pcmRecorder.start()
-    } else {
-      await micRecorder.start()
-    }
-  } catch {
-    activeVoiceCaptureMode.value = null
-    voiceDialogue.cancelCapture(captureId)
-  }
-}
-
-async function stopVoiceCapture() {
-  const captureId = voiceDialogue.activeCaptureId.value
-  if (!captureId) return
-
-  if (activeVoiceCaptureMode.value === 'browser') {
-    let transcript = ''
-
-    try {
-      transcript = await browserRecognition.stop()
-    } catch {
-      activeVoiceCaptureMode.value = null
-      voiceDialogue.cancelCapture(captureId)
-      return
-    }
-
-    activeVoiceCaptureMode.value = null
-
-    try {
-      await voiceDialogue.commitTranscript(captureId, transcript)
-    } catch {
-      // Voice dialogue state already tracks send errors.
-    }
-    return
-  }
-
-  const usePcmCapture = activeVoiceCaptureMode.value === 'pcm'
-  const captureStatus = usePcmCapture
-    ? pcmRecorder.status.value
-    : micRecorder.state.value.status
-  if (captureStatus === 'requesting') {
-    if (usePcmCapture) pcmRecorder.cancel()
-    else micRecorder.cancel()
-    activeVoiceCaptureMode.value = null
-    voiceDialogue.cancelCapture(captureId)
-    return
-  }
-
-  let audio: Blob | null
-
-  try {
-    audio = usePcmCapture
-      ? await pcmRecorder.stop()
-      : await micRecorder.stop()
-  } catch {
-    activeVoiceCaptureMode.value = null
-    voiceDialogue.cancelCapture(captureId)
-    return
-  }
-
-  activeVoiceCaptureMode.value = null
-
-  if (!audio || audio.size <= 0) {
-    voiceDialogue.cancelCapture(captureId)
-    return
-  }
-
-  try {
-    await voiceDialogue.transcribeAndSend(captureId, audio)
-  } catch {
-    // Voice dialogue state already tracks transcription/send errors.
-  }
-}
-
-function cancelVoiceCapture() {
-  if (activeVoiceCaptureMode.value === 'browser') {
-    browserRecognition.cancel()
-  } else if (activeVoiceCaptureMode.value === 'pcm') {
-    pcmRecorder.cancel()
-  } else {
-    micRecorder.cancel()
-  }
-
-  activeVoiceCaptureMode.value = null
-  voiceDialogue.cancelCapture()
 }
 
 function handleCompositionStart() {
@@ -1185,11 +1096,16 @@ onUnmounted(() => {
 })
 
 function removeAttachment(id: string) {
-  const idx = attachments.value.findIndex(a => a.id === id)
-  if (idx !== -1) {
-    URL.revokeObjectURL(attachments.value[idx].url)
-    attachments.value.splice(idx, 1)
+  const removedIds = new Set([id])
+  for (const attachment of attachments.value) {
+    if (attachment.videoFrameFor === id) removedIds.add(attachment.id)
   }
+  const removed = attachments.value.filter(attachment => removedIds.has(attachment.id))
+  if (previewAttachment.value && removedIds.has(previewAttachment.value.id)) {
+    previewAttachment.value = null
+  }
+  for (const attachment of removed) URL.revokeObjectURL(attachment.url)
+  attachments.value = attachments.value.filter(attachment => !removedIds.has(attachment.id))
 }
 
 function formatSize(bytes: number): string {
@@ -1201,20 +1117,32 @@ function formatSize(bytes: number): string {
 function isImage(type: string): boolean {
   return type.startsWith('image/')
 }
+
+function openAttachmentPreview(attachment: Attachment) {
+  if (!isImage(attachment.type)) return
+  previewAttachment.value = attachment
+}
 </script>
 
 <template>
   <div class="chat-input-area">
     <!-- Attachment previews -->
-    <div v-if="attachments.length > 0" class="attachment-previews">
+    <div v-if="attachments.some(att => !att.videoFrameFor)" class="attachment-previews">
       <div
-        v-for="att in attachments"
+        v-for="att in attachments.filter(item => !item.videoFrameFor)"
         :key="att.id"
         class="attachment-preview"
         :class="{ image: isImage(att.type), 'has-context': !!att.context }"
       >
         <template v-if="isImage(att.type)">
-          <img :src="att.url" :alt="att.name" class="attachment-thumb" />
+          <button
+            type="button"
+            class="attachment-thumb-button"
+            :aria-label="att.name"
+            @click="openAttachmentPreview(att)"
+          >
+            <img :src="att.url" :alt="att.name" class="attachment-thumb" />
+          </button>
         </template>
         <template v-else>
           <div class="attachment-file">
@@ -1232,6 +1160,12 @@ function isImage(type: string): boolean {
         </button>
       </div>
     </div>
+    <ImagePreviewOverlay
+      v-if="previewAttachment"
+      :src="previewAttachment.url"
+      :alt="previewAttachment.name"
+      @close="previewAttachment = null"
+    />
 
     <div v-if="activeMessageReference" class="message-reference-preview">
       <span class="message-reference-text">{{ messageReferencePreview }}</span>
@@ -1300,6 +1234,7 @@ function isImage(type: string): boolean {
         ref="textareaRef"
         v-model="inputText"
         class="input-textarea"
+        dir="auto"
         :style="textareaHeight ? { height: textareaHeight + 'px' } : {}"
         :placeholder="t('chat.inputPlaceholder')"
         rows="1"
@@ -1324,7 +1259,7 @@ function isImage(type: string): boolean {
           </NTooltip>
 
           <NPopover
-            v-if="!isMoaSession"
+            v-if="!isMoaSession && !isGlobalCodingAgentSession"
             trigger="click"
             placement="top-start"
           >
@@ -1372,6 +1307,9 @@ function isImage(type: string): boolean {
                 <span>{{ reasoningEffortOptions[0].label }}</span>
                 <span>{{ reasoningEffortOptions[reasoningEffortOptions.length - 1].label }}</span>
               </div>
+              <div class="reasoning-effort-slider-hint">
+                {{ t('chat.reasoningEffort.dragHint', { count: reasoningEffortOptions.length }) }}
+              </div>
             </div>
           </NPopover>
 
@@ -1409,6 +1347,7 @@ function isImage(type: string): boolean {
                 quaternary
                 size="tiny"
                 class="input-model-button"
+                :disabled="props.modelDisabled"
                 :title="isMobileViewport ? undefined : props.modelLabel || t('models.selectModel')"
                 :aria-label="props.modelLabel || t('models.selectModel')"
                 @click="handleModelButtonClick"
@@ -1445,13 +1384,13 @@ function isImage(type: string): boolean {
         </div>
         <div class="input-actions">
           <VoiceDialogueControls
-            :status="voiceDialogue.status.value"
-            :transcript="voiceDialogueTranscript"
-            :error="voiceDialogueError"
-            :events="voiceDialogue.events.value"
-            :on-start="startVoiceCapture"
-            :on-stop="stopVoiceCapture"
-            :on-cancel="cancelVoiceCapture"
+            :status="voiceInput.dialogue.status.value"
+            :transcript="voiceInput.transcript.value"
+            :error="voiceInput.error.value"
+            :events="voiceInput.dialogue.events.value"
+            :on-start="voiceInput.start"
+            :on-stop="voiceInput.stop"
+            :on-cancel="voiceInput.cancel"
           />
           <NButton
             size="medium"
@@ -1684,7 +1623,7 @@ function isImage(type: string): boolean {
   align-items: center;
   gap: 5px;
   padding: 0 0 0 2px;
-  margin-left: 0;
+  margin-inline-start: 0;
 
   .switch-label {
     display: flex;
@@ -1702,7 +1641,7 @@ function isImage(type: string): boolean {
 
   :deep(.n-switch),
   :deep(.n-switch__rail) {
-    margin-right: 0;
+    margin-inline-end: 0;
   }
 }
 
@@ -1714,7 +1653,7 @@ function isImage(type: string): boolean {
   width: 24px;
   min-width: 24px;
   height: 22px;
-  margin-left: 0;
+  margin-inline-start: 0;
   padding: 0;
   background: transparent !important;
   opacity: 1;
@@ -1821,6 +1760,13 @@ function isImage(type: string): boolean {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.reasoning-effort-slider-hint {
+  margin-top: 6px;
+  color: $text-muted;
+  font-size: 11px;
+  text-align: center;
 }
 
 .reasoning-effort-slider-heading {
@@ -1991,7 +1937,7 @@ function isImage(type: string): boolean {
 .context-bar {
   width: 60px;
   height: 4px;
-  margin-left: -4px;
+  margin-inline-start: -4px;
   background: rgba(var(--text-muted-rgb), 0.2);
   border-radius: 2px;
   overflow: hidden;
@@ -2124,8 +2070,8 @@ function isImage(type: string): boolean {
   border: 1px solid $border-color;
 
   &.image {
-    width: 64px;
-    height: 64px;
+    width: 112px;
+    height: 72px;
   }
 
   &.image.has-context {
@@ -2135,9 +2081,26 @@ function isImage(type: string): boolean {
 }
 
 .attachment-thumb {
+  display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
+}
+
+.attachment-thumb-button {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background:
+    linear-gradient(45deg, rgba(127, 127, 127, 0.08) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(127, 127, 127, 0.08) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(127, 127, 127, 0.08) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(127, 127, 127, 0.08) 75%);
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  background-size: 12px 12px;
+  cursor: zoom-in;
 }
 
 .attachment-preview.has-context .attachment-thumb {
@@ -2147,6 +2110,10 @@ function isImage(type: string): boolean {
   max-height: 220px;
   object-fit: contain;
   background: #fff;
+}
+
+.attachment-preview.has-context .attachment-thumb-button {
+  height: auto;
 }
 
 .attachment-context {
@@ -2508,7 +2475,7 @@ function isImage(type: string): boolean {
   border-radius: $radius-sm;
   background: $bg-secondary;
   color: $text-primary;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   overflow: hidden;
   outline: none;
@@ -2536,7 +2503,7 @@ function isImage(type: string): boolean {
   border: 0;
   background: transparent;
   color: inherit;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   outline: none;
 }

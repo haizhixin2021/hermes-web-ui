@@ -14,21 +14,31 @@ import {
   type MessageBoxOptions,
   type OpenDialogOptions,
   type IpcMainInvokeEvent,
+  type WebContents,
 } from 'electron'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { startWebUiServer, stopWebUiServer, getToken } from './webui-server'
-import { bundledNode, desktopIcon, desktopMacTrayIcon, desktopRuntimeVersion, desktopWindowsTrayIcon, hermesBinExists, hermesBin, runtimeStorageRoot, webuiDir, webUiHome } from './paths'
+import {
+  getToken,
+  setWebUiRestartRequestHandler,
+  setWebUiUnexpectedExitHandler,
+  startWebUiServer,
+  stopWebUiServer,
+} from './webui-server'
+import { bundledNode, desktopIcon, desktopLinuxTrayIcon, desktopMacTrayIcon, desktopRuntimeVersion, desktopWindowsTrayIcon, runtimeStorageRoot, webuiDir, webUiHome } from './paths'
 import { checkForDesktopUpdates, initAutoUpdater } from './updater'
 import { t } from './desktop-i18n'
 import { resetDesktopDefaultLogin } from './desktop-login-reset'
 import { installHermesStudioCliShim, installHermesStudioMcpShim } from './cli-shim'
 import { parseHermesCliArgs, runBundledHermesCli } from './hermes-cli'
 import { installSelectionContextMenu } from './selection-context-menu'
+import { groupChatAgentLinkPopupResponse } from './group-chat-agent-popup'
+import { isTrustedDesktopAppUrl, normalizeExternalHttpUrl } from './window-open-policy'
 import {
   ensureDesktopRuntime,
   isDesktopRuntimeReady,
   migratePendingRuntimeRoot,
+  repairUpdatedDesktopRuntimeLaunchers,
   writeActiveRuntimeVersion,
   type RuntimeDownloadSource,
   type RuntimeProgress,
@@ -36,6 +46,12 @@ import {
 import { BrowserManager } from './browser/browser-manager'
 import { BrowserBroker } from './browser/browser-broker'
 import type { BrowserBounds } from './browser/browser-types'
+import { migratePendingLegacyWindowsData } from './legacy-windows-data-migration'
+import { createDesktopAppLifecycle } from './app-lifecycle'
+import { configureDesktopIdentity } from './desktop-identity'
+import { migrateWindowsLoginItem } from './login-item-migration'
+
+configureDesktopIdentity(app)
 
 const PORT = Number(process.env.HERMES_DESKTOP_PORT) || 8748
 const START_HIDDEN = process.argv.includes('--hidden')
@@ -50,6 +66,7 @@ const WINDOW_STATE_CHANGE_CHANNEL = 'hermes-desktop:window-state-change'
 const BROWSER_STATE_CHANGE_CHANNEL = 'hermes-desktop:browser-state-change'
 const BROWSER_ANNOTATION_REQUEST_CHANNEL = 'hermes-desktop:browser-annotation-request'
 const DESKTOP_DISABLED_CHROMIUM_FEATURES = ['CompressionDictionaryTransport', 'CompressionDictionaryTransportBackend']
+const FAILURE_RECOVERY_WINDOW_MS = 60_000
 type WindowControlAction = 'minimize' | 'toggle-maximize' | 'close'
 type DesktopWindowBounds = { x: number; y: number; width: number; height: number }
 
@@ -59,7 +76,6 @@ let petWindowLoadPromise: Promise<void> | null = null
 const chatWindows = new Map<string, BrowserWindow>()
 let serverUrl: string | null = null
 let tray: Tray | null = null
-let isQuitting = false
 let appShutdownPromise: Promise<void> | null = null
 let isBootstrapping = false
 let isResettingLogin = false
@@ -67,6 +83,11 @@ let windowFadeTimer: NodeJS.Timeout | null = null
 let browserManager: BrowserManager | null = null
 let browserBroker: BrowserBroker | null = null
 const activeNotifications = new Set<Notification>()
+let unexpectedWebUiExitCount = 0
+let unexpectedWebUiExitWindowStartedAt = 0
+let rendererRecoveryCount = 0
+let rendererRecoveryWindowStartedAt = 0
+const appLifecycle = createDesktopAppLifecycle(app)
 
 // Custom Session paths do not need Chromium's optional compression-dictionary
 // disk cache; disabling it leaves the normal HTTP cache enabled and isolated.
@@ -127,12 +148,15 @@ function showMainWindow() {
 }
 
 function quitApp() {
-  isQuitting = true
-  app.quit()
+  appLifecycle.quit()
+}
+
+function scheduleAppRestart(delayMs = 100): boolean {
+  return appLifecycle.scheduleRestart(delayMs)
 }
 
 async function prepareAppShutdown(): Promise<void> {
-  isQuitting = true
+  appLifecycle.prepareShutdown()
   if (!appShutdownPromise) {
     appShutdownPromise = (async () => {
       cancelWindowFade()
@@ -240,7 +264,7 @@ function ensurePetWindow(): BrowserWindow {
     petWindowLoadPromise = null
   })
   petWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) {
+    if (isTrustedDesktopAppUrl(url, serverUrl)) {
       return { action: 'allow' }
     }
     shell.openExternal(url).catch(() => undefined)
@@ -443,7 +467,7 @@ function createTray() {
     ? desktopMacTrayIcon()
     : process.platform === 'win32'
       ? desktopWindowsTrayIcon()
-      : desktopIcon()
+      : desktopLinuxTrayIcon()
   const sourceIcon = nativeImage.createFromPath(source)
   const icon = process.platform === 'darwin'
     ? sourceIcon
@@ -453,7 +477,7 @@ function createTray() {
         quality: 'best',
       })
   tray = new Tray(icon)
-  tray.setToolTip('Hermes Studio')
+  tray.setToolTip('Ekko Studio')
   tray.on('click', () => {
     showMainWindow()
     updateTrayMenu()
@@ -467,7 +491,7 @@ async function createWindow(): Promise<void> {
     height: 820,
     minWidth: 769,
     minHeight: 600,
-    title: 'Hermes Studio',
+    title: 'Ekko Studio',
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false,
@@ -494,8 +518,27 @@ async function createWindow(): Promise<void> {
     if (!START_HIDDEN) showWindowWithFade(true)
   })
 
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    if (appLifecycle.isQuitting || !mainWindow || mainWindow.isDestroyed()) return
+    console.error(`[desktop] main renderer exited reason=${details.reason} code=${details.exitCode}`)
+    const now = Date.now()
+    if (now - rendererRecoveryWindowStartedAt > FAILURE_RECOVERY_WINDOW_MS) {
+      rendererRecoveryWindowStartedAt = now
+      rendererRecoveryCount = 0
+    }
+    rendererRecoveryCount += 1
+    if (rendererRecoveryCount > 1) {
+      void loadServiceFailurePage(new Error(`Desktop renderer repeatedly exited (${details.reason})`))
+      return
+    }
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed() || appLifecycle.isQuitting) return
+      mainWindow.reload()
+    }, 250).unref?.()
+  })
+
   mainWindow.on('close', (event) => {
-    if (isQuitting) return
+    if (appLifecycle.isQuitting) return
     event.preventDefault()
     cancelWindowFade()
     mainWindow?.hide()
@@ -511,8 +554,10 @@ async function createWindow(): Promise<void> {
   installSelectionContextMenu(mainWindow)
 
   // External links → system browser
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) {
+  mainWindow.webContents.setWindowOpenHandler(({ url, frameName }) => {
+    const agentLinkPopup = groupChatAgentLinkPopupResponse(url, frameName)
+    if (agentLinkPopup) return agentLinkPopup
+    if (isTrustedDesktopAppUrl(url, serverUrl)) {
       return { action: 'allow' }
     }
     shell.openExternal(url).catch(() => undefined)
@@ -559,7 +604,7 @@ async function openChatWindow(sessionIdInput: unknown, profileInput?: unknown): 
     height: 760,
     minWidth: 620,
     minHeight: 480,
-    title: 'Hermes Studio',
+    title: 'Ekko Studio',
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false,
@@ -598,7 +643,9 @@ async function openChatWindow(sessionIdInput: unknown, profileInput?: unknown): 
   })
 
   installSelectionContextMenu(chatWindow)
-  chatWindow.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
+  chatWindow.webContents.setWindowOpenHandler(({ url: targetUrl, frameName }) => {
+    const agentLinkPopup = groupChatAgentLinkPopupResponse(targetUrl, frameName)
+    if (agentLinkPopup) return agentLinkPopup
     if (/^(https?:|mailto:)/i.test(targetUrl)) {
       shell.openExternal(targetUrl).catch(() => undefined)
     }
@@ -682,7 +729,7 @@ function installMicrophonePermissionHandler() {
 function splashHtml(label = t('desktop.startingLocalServices')): string {
   const startingLabel = escapeHtml(label)
   const pageBackground = process.platform === 'win32' ? 'transparent' : '#1a1a1a'
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Hermes Studio</title>
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Ekko Studio</title>
 <style>
   html,body{margin:0;height:100%;background:${pageBackground};color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;-webkit-app-region:drag;}
   .surface{height:100%;background:#1a1a1a}
@@ -699,7 +746,7 @@ function splashHtml(label = t('desktop.startingLocalServices')): string {
   @keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(360%)}}
   h1{font-weight:500;margin:0;font-size:18px}
 </style></head><body><main class="surface"><div class="wrap">
-<h1>Hermes Studio</h1>
+<h1>Ekko Studio</h1>
 <div class="row"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
 <div id="label" class="label">${startingLabel}</div>
 <div class="progress"><div id="bar" class="bar indeterminate"></div></div>
@@ -763,7 +810,7 @@ function runtimeSourceHtml(errorMessage?: string): string {
         <pre>${safeError}</pre>
        </section>`
     : ''
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Hermes Studio</title>
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Ekko Studio</title>
 <style>
   :root{color-scheme:dark}
   *{box-sizing:border-box}
@@ -791,7 +838,7 @@ function runtimeSourceHtml(errorMessage?: string): string {
     button{min-height:78px}
   }
 </style></head><body><main class="surface"><div class="wrap">
-<div class="brand">${logoUrl ? `<img class="mark" src="${logoUrl}" alt="Hermes Studio">` : ''}<h1>Hermes Studio</h1></div>
+<div class="brand">${logoUrl ? `<img class="mark" src="${logoUrl}" alt="Ekko Studio">` : ''}<h1>Ekko Studio</h1></div>
 <p class="label">${escapeHtml(t('desktop.selectRuntimeSource'))}</p>
 ${errorBlock}
 <div class="actions">
@@ -860,43 +907,71 @@ function updateSplash(progress: RuntimeProgress) {
   `).catch(() => undefined)
 }
 
+async function installPackagedCommandShims(): Promise<void> {
+  if (!app.isPackaged) return
+
+  const installs = [
+    installHermesStudioCliShim({
+      nodePath: bundledNode(),
+      runtimeVersion: desktopRuntimeVersion(),
+      webUiScriptPath: join(webuiDir(), 'bin', 'hermes-web-ui.mjs'),
+    }),
+    installHermesStudioMcpShim({
+      nodePath: bundledNode(),
+      scriptPath: join(webuiDir(), 'bin', 'ekko-studio-mcp.mjs'),
+      webUiUrl: `http://127.0.0.1:${PORT}`,
+    }),
+  ]
+  const results = await Promise.allSettled(installs)
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.warn(
+        `[cli-shim] failed to install Ekko Studio command: `
+        + `${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+      )
+      continue
+    }
+    if (result.value.status === 'skipped') {
+      console.warn(`[cli-shim] ${result.value.reason}: ${result.value.shimPath}`)
+    }
+  }
+}
+
 async function bootstrap(source?: RuntimeDownloadSource) {
   if (isBootstrapping) return
   isBootstrapping = true
 
   try {
+    const legacyMigration = await migratePendingLegacyWindowsData()
+    if (legacyMigration.completed) {
+      console.log('[desktop] migrated legacy Windows Hermes data before starting local services')
+    } else if (legacyMigration.retryPending) {
+      console.warn(`[desktop] legacy Windows Hermes data migration will retry on the next launch: ${legacyMigration.error || 'unknown error'}`)
+    }
     await migratePendingRuntimeRoot(updateSplash)
+    repairUpdatedDesktopRuntimeLaunchers()
     const selectedSource = source || envRuntimeDownloadSource()
     const runtimeUrlOverride = !!process.env.HERMES_DESKTOP_RUNTIME_URL?.trim()
     const manifestOverride = !!process.env.HERMES_DESKTOP_RUNTIME_MANIFEST_URL?.trim()
     const forceUpdate = !!process.env.HERMES_DESKTOP_RUNTIME_FORCE_UPDATE
     const runtimeReady = isDesktopRuntimeReady()
     const needsRuntimeWork = !runtimeReady || forceUpdate || runtimeUrlOverride || manifestOverride
+    const explicitRuntimeRequest = !!selectedSource || forceUpdate || runtimeUrlOverride || manifestOverride
 
-    if (needsRuntimeWork) {
-      if (!selectedSource && !runtimeUrlOverride && !manifestOverride) {
-        if (mainWindow) await mainWindow.loadURL(runtimeSourceHtml())
-        isBootstrapping = false
-        return
-      }
+    // Runtime setup is managed in Studio now. A normal desktop launch must
+    // reach the Web UI first so it can detect an existing CLI before offering
+    // the Runtime manager. Preserve explicit automation overrides for builds
+    // and unattended installations.
+    if (needsRuntimeWork && explicitRuntimeRequest) {
       await ensureDesktopRuntime(updateSplash, selectedSource)
     }
     if (isDesktopRuntimeReady()) {
       writeActiveRuntimeVersion()
+      await installPackagedCommandShims()
     }
   } catch (err) {
     console.error('Failed to prepare Hermes runtime:', err)
-    if (mainWindow) {
-      const msg = String(err instanceof Error ? err.message : err)
-      await mainWindow.loadURL(runtimeSourceHtml(`${t('desktop.failedPrepareRuntime')}\n\n${msg}`))
-    }
-    isBootstrapping = false
-    return
-  }
-
-  if (!hermesBinExists()) {
-    console.error(`hermes binary missing at ${hermesBin()}`)
-    console.error('Run: npm run prepare:runtime (to build a local Hermes runtime)')
+    // Keep Studio available so Runtime recovery can happen from Agent Manager.
   }
 
   try {
@@ -908,27 +983,90 @@ async function bootstrap(source?: RuntimeDownloadSource) {
     await loadPetWindowRoute()
   } catch (err) {
     console.error('Failed to start Web UI server:', err)
-    if (mainWindow) {
-      const msg = escapeHtml(String(err instanceof Error ? err.message : err))
-      const pageBackground = process.platform === 'win32' ? 'transparent' : '#1a1a1a'
-      mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(
-        `<html><body style="margin:0;font-family:system-ui;background:${pageBackground};color:#eee">
-         <main style="min-height:100vh;padding:32px;background:#1a1a1a">
-         <h2>${escapeHtml(t('desktop.failedStartServices'))}</h2><pre style="white-space:pre-wrap;color:#f88">${msg}</pre></main>
-         </body></html>`,
-      ))
-    }
+    serverUrl = null
+    await loadServiceFailurePage(err)
   } finally {
     isBootstrapping = false
   }
 }
 
+async function loadServiceFailurePage(error: unknown): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const msg = escapeHtml(String(error instanceof Error ? error.message : error))
+  const pageBackground = process.platform === 'win32' ? 'transparent' : '#1a1a1a'
+  const html = `<html><body style="margin:0;font-family:system-ui;background:${pageBackground};color:#eee">
+    <main style="min-height:100vh;padding:32px;background:#1a1a1a;box-sizing:border-box">
+      <h2>${escapeHtml(t('desktop.failedStartServices'))}</h2>
+      <pre style="white-space:pre-wrap;color:#f88">${msg}</pre>
+      <button id="retry" style="padding:8px 14px;cursor:pointer">Retry</button>
+      <script>
+        document.getElementById('retry').addEventListener('click', async function () {
+          this.disabled = true
+          try { await window.hermesDesktop.retryBootstrap() } finally { this.disabled = false }
+        })
+      </script>
+    </main>
+  </body></html>`
+  await mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html)).catch(loadError => {
+    console.error('[desktop] failed to display Web UI failure page:', loadError)
+  })
+}
+
+async function recoverUnexpectedWebUiExit(details: { code: number | null; signal: NodeJS.Signals | null }): Promise<void> {
+  if (appLifecycle.isQuitting) return
+  serverUrl = null
+  updateTrayMenu()
+
+  const now = Date.now()
+  if (now - unexpectedWebUiExitWindowStartedAt > FAILURE_RECOVERY_WINDOW_MS) {
+    unexpectedWebUiExitWindowStartedAt = now
+    unexpectedWebUiExitCount = 0
+  }
+  unexpectedWebUiExitCount += 1
+  const error = new Error(`Web UI server exited unexpectedly code=${details.code} signal=${details.signal}`)
+  if (unexpectedWebUiExitCount > 1 || isBootstrapping) {
+    await loadServiceFailurePage(error)
+    return
+  }
+
+  console.warn('[desktop] restarting Web UI once after an unexpected exit')
+  await new Promise(resolveDelay => setTimeout(resolveDelay, 500))
+  await bootstrap()
+  if (!serverUrl) await loadServiceFailurePage(error)
+}
+
 ipcMain.handle('hermes-desktop:get-token', () => getToken())
+ipcMain.handle('hermes-desktop:restart-app', event => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('Desktop restart can only be requested from the main window')
+  }
+  return scheduleAppRestart()
+})
 ipcMain.handle('hermes-desktop:open-chat-window', (event, sessionId?: unknown, profile?: unknown) => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
     throw new Error('Chat windows can only be opened from the main window')
   }
   return openChatWindow(sessionId, profile)
+})
+
+function isTrustedDesktopWindowSender(sender: WebContents): boolean {
+  const windows = [mainWindow, petWindow, ...chatWindows.values()]
+  return windows.some(window => window && !window.isDestroyed() && window.webContents === sender)
+}
+
+ipcMain.handle('hermes-desktop:open-external-url', async (event, url?: unknown) => {
+  if (!isTrustedDesktopWindowSender(event.sender)) {
+    throw new Error('External URLs can only be opened from a Hermes desktop window')
+  }
+  const externalUrl = normalizeExternalHttpUrl(url)
+  if (!externalUrl) return false
+
+  try {
+    await shell.openExternal(externalUrl)
+    return true
+  } catch {
+    return false
+  }
 })
 
 function browserForEvent(event: IpcMainInvokeEvent): BrowserManager {
@@ -1027,11 +1165,12 @@ ipcMain.handle('hermes-desktop:browser-annotate', (event, tabId?: unknown, mode?
 ipcMain.handle('hermes-desktop:browser-cancel-annotation', (event, tabId?: unknown) => browserForEvent(event).cancelAnnotation(String(tabId || '')))
 ipcMain.handle('hermes-desktop:browser-update-annotation-note', (event, tabId?: unknown, marker?: unknown, note?: unknown) => {
   const value = Number(marker)
-  if (!Number.isInteger(value) || value < 1 || value > 100) throw new Error('Invalid browser annotation marker')
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error('Invalid browser annotation marker')
   return browserForEvent(event).updateAnnotationNote(String(tabId || ''), value, String(note || '').slice(0, 500))
 })
 ipcMain.handle('hermes-desktop:browser-capture-annotations', (event, tabId?: unknown) => browserForEvent(event).captureAnnotations(String(tabId || '')))
 ipcMain.handle('hermes-desktop:browser-clear-annotations', (event, tabId?: unknown) => browserForEvent(event).clearAnnotations(String(tabId || '')))
+ipcMain.handle('hermes-desktop:browser-remove-annotation', (event, tabId?: unknown, marker?: unknown) => browserForEvent(event).removeAnnotation(String(tabId || ''), Number(marker)))
 ipcMain.handle('hermes-desktop:select-runtime-directory', async (_event, defaultPath?: unknown) => {
   const options: OpenDialogOptions = {
     properties: ['openDirectory'],
@@ -1087,7 +1226,12 @@ function resolveNotificationIcon(icon: unknown): string {
   return candidates.find(candidate => existsSync(candidate)) || desktopIcon()
 }
 
-ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: unknown; body?: unknown; icon?: unknown; tag?: unknown }) => {
+function safeNotificationClickUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  return value.startsWith('/hermes/') && !value.includes('..') && !value.includes('\\') ? value : null
+}
+
+ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: unknown; body?: unknown; icon?: unknown; tag?: unknown; clickUrl?: unknown }) => {
   const supported = Notification.isSupported()
   if (!supported) {
     console.warn('[desktop-notification] Electron notifications are not supported on this system')
@@ -1096,9 +1240,10 @@ ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: 
 
   const title = typeof payload?.title === 'string' && payload.title.trim()
     ? payload.title.trim()
-    : 'Hermes Studio'
+    : 'Ekko Studio'
   const body = typeof payload?.body === 'string' ? payload.body.trim().slice(0, 240) : ''
   const icon = resolveNotificationIcon(payload?.icon)
+  const clickUrl = safeNotificationClickUrl(payload?.clickUrl)
   const notification = new Notification({
     title,
     body,
@@ -1111,6 +1256,15 @@ ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: 
   }
   notification.on('click', () => {
     releaseNotification()
+    if (clickUrl && mainWindow && !mainWindow.isDestroyed()) {
+      const target = webUiHashUrl(clickUrl)
+      if (target) {
+        void mainWindow.loadURL(target)
+          .catch(error => console.warn('[desktop-notification] failed to open notification target', error))
+          .finally(showMainWindow)
+      } else showMainWindow()
+      return
+    }
     showMainWindow()
   })
   notification.on('close', releaseNotification)
@@ -1132,9 +1286,16 @@ ipcMain.handle('hermes-desktop:retry-bootstrap', async (_event, source?: Runtime
 })
 
 function runDesktopApp() {
+  setWebUiRestartRequestHandler(() => {
+    // Leave enough time for the authenticated relay HTTP request to flush its 202 response.
+    scheduleAppRestart(250)
+  })
+  setWebUiUnexpectedExitHandler(details => {
+    void recoverUnexpectedWebUiExit(details)
+  })
   const gotLock = app.requestSingleInstanceLock(QUIT_EXISTING ? { quit: true } : undefined)
   if (!gotLock) {
-    app.quit()
+    quitApp()
     return
   }
 
@@ -1157,31 +1318,12 @@ function runDesktopApp() {
     // visual clutter. macOS keeps a menu (system requirement) but Electron's
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
-    installMicrophonePermissionHandler()
-    if (app.isPackaged) {
-      installHermesStudioCliShim({
-        nodePath: bundledNode(),
-        runtimeVersion: desktopRuntimeVersion(),
-        webUiScriptPath: join(webuiDir(), 'bin', 'hermes-web-ui.mjs'),
-      }).then(result => {
-        if (result.status === 'skipped') {
-          console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
-        }
-      }).catch(err => {
-        console.warn(`[cli-shim] failed to install hermes-studio command: ${err instanceof Error ? err.message : String(err)}`)
-      })
-      installHermesStudioMcpShim({
-        nodePath: bundledNode(),
-        scriptPath: join(webuiDir(), 'bin', 'hermes-studio-mcp.mjs'),
-        webUiUrl: `http://127.0.0.1:${PORT}`,
-      }).then(result => {
-        if (result.status === 'skipped') {
-          console.warn(`[cli-shim] ${result.reason}: ${result.shimPath}`)
-        }
-      }).catch(err => {
-        console.warn(`[cli-shim] failed to install hermes-studio-mcp command: ${err instanceof Error ? err.message : String(err)}`)
-      })
+    try {
+      migrateWindowsLoginItem(app, APP_USER_MODEL_ID)
+    } catch (error) {
+      console.warn('[desktop] failed to migrate the Windows login item:', error)
     }
+    installMicrophonePermissionHandler()
     createTray()
     await createWindow()
     await initializeDesktopBrowser().catch(error => {
@@ -1196,14 +1338,18 @@ function runDesktopApp() {
         showMainWindow()
       }
     })
+  }).catch(error => {
+    console.error('[desktop] failed during Electron startup:', error)
+    dialog.showErrorBox('Ekko Studio', String(error instanceof Error ? error.message : error))
+    quitApp()
   })
 
   app.on('window-all-closed', () => {
-    if (isQuitting && process.platform !== 'darwin') app.quit()
+    if (appLifecycle.isQuitting && process.platform !== 'darwin') app.quit()
   })
 
   app.on('before-quit', async (e) => {
-    if (!isQuitting && process.platform !== 'darwin') {
+    if (!appLifecycle.isQuitting && process.platform !== 'darwin') {
       e.preventDefault()
       mainWindow?.hide()
       updateTrayMenu()
@@ -1213,7 +1359,7 @@ function runDesktopApp() {
     try {
       await prepareAppShutdown()
     } finally {
-      app.exit(0)
+      appLifecycle.finalizeExit(0)
     }
   })
 }

@@ -7,8 +7,11 @@
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+#include <U8g2lib.h>
 #include <math.h>
 #include <memory>
+#include <new>
+#include <vector>
 #include "driver/i2s.h"
 #include "esp_system.h"
 #include "esp_rom_sys.h"
@@ -18,7 +21,7 @@ namespace {
 #define HERMES_MCU_FIRMWARE_VERSION "v2"
 #endif
 #ifndef HERMES_MCU_FIRMWARE_MANIFEST_PATH
-#define HERMES_MCU_FIRMWARE_MANIFEST_PATH "/api/hermes/mcu/firmware/v2/manifest"
+#define HERMES_MCU_FIRMWARE_MANIFEST_PATH "/api/studio/mcu/firmware/v2/manifest"
 #endif
 #ifndef HERMES_PIN_BATTERY_ADC
 #define HERMES_PIN_BATTERY_ADC 2
@@ -60,7 +63,7 @@ namespace {
 #define HERMES_MAX_OUTPUT_VOLUME_PERCENT 100
 #endif
 
-constexpr char kApName[] = "HStudio-WIFI";
+constexpr char kApName[] = "Ekko Studio-WIFI";
 constexpr char kMcuFirmwareVersion[] = HERMES_MCU_FIRMWARE_VERSION;
 constexpr char kMcuFirmwareManifestPath[] = HERMES_MCU_FIRMWARE_MANIFEST_PATH;
 constexpr uint32_t kConnectTimeoutMs = 18000;
@@ -72,11 +75,11 @@ const IPAddress kApIp(192, 168, 4, 1);
 const IPAddress kApGateway(192, 168, 4, 1);
 const IPAddress kApSubnet(255, 255, 255, 0);
 constexpr char kMissingSttPromptPcmUrl[] =
-    "/api/hermes/mcu/audio/missing-stt-24k.s16le.pcm";
+    "/api/studio/mcu/audio/missing-stt-24k.s16le.pcm";
 constexpr char kNoDevicePromptPcmUrl[] =
-    "/api/hermes/mcu/audio/no-device-24k.s16le.pcm";
+    "/api/studio/mcu/audio/no-device-24k.s16le.pcm";
 constexpr char kTokenInvalidPromptPcmUrl[] =
-    "/api/hermes/mcu/audio/token-invalid-24k.s16le.pcm";
+    "/api/studio/mcu/audio/token-invalid-24k.s16le.pcm";
 constexpr int kPinI2cSda = HERMES_PIN_I2C_SDA;
 constexpr int kPinI2cScl = HERMES_PIN_I2C_SCL;
 constexpr int kPinI2sDout = HERMES_PIN_I2S_DOUT;
@@ -93,6 +96,11 @@ constexpr uint8_t kDefaultOledAddr = 0x3C;
 constexpr uint8_t kAltOledAddr = 0x3D;
 constexpr int kOledWidth = 128;
 constexpr int kOledHeight = 64;
+constexpr size_t kOledBufferBytes = (kOledWidth * kOledHeight) / 8;
+constexpr int kMcuSubtitleMaxWidth = 124;
+constexpr uint8_t kMcuSubtitleLinesPerPage = 3;
+constexpr uint32_t kOledI2cClockHz = 400000;
+constexpr uint32_t kCodecI2cClockHz = 100000;
 constexpr uint32_t kOledRefreshIntervalMs = 160;
 constexpr uint32_t kOledSuccessReturnDelayMs = 2500;
 constexpr uint32_t kOledErrorReturnDelayMs = 6000;
@@ -109,7 +117,8 @@ constexpr int kMaxManualDevices = 8;
 constexpr uint32_t kMcuLoginTimeoutMs = 8000;
 constexpr uint32_t kMcuRemoteTlsHandshakeTimeoutSec = 5;
 constexpr uint32_t kMcuSocketReconnectMs = 3000;
-const char kRemoteDeviceLookupUrl[] = "https://api.hermes-studio.ai";
+constexpr uint32_t kMcuSocketReconnectMaxMs = 30000;
+const char kRemoteDeviceLookupUrl[] = "https://api.ekkostudio.xyz";
 constexpr int kMaxProfiles = 8;
 constexpr int kMaxMcuAudioQueue = 4;
 constexpr uint32_t kMcuInteractionIdleDelayMs = 3500;
@@ -144,11 +153,25 @@ constexpr uint32_t kVoiceVadRmsStart = 190;
 constexpr uint32_t kVoiceVadPeakStart = 480;
 constexpr uint32_t kVoiceVadActiveThreshold = 260;
 constexpr uint32_t kVoiceVadMinActiveSamples = 16;
+constexpr uint32_t kListeningSilenceStopMs = 1000;
+constexpr uint32_t kListeningMaxRecordMs = 30000;
+constexpr uint32_t kListeningRetriggerDelayMs = 1200;
+constexpr uint32_t kListeningAfterCompletionDelayMs = 1000;
+// Keep enough free heap for the remote TLS/WebSocket transport while listening.
+constexpr size_t kListeningPreRollFrames = 4096;
+constexpr uint32_t kListeningVadRmsStart = 420;
+constexpr uint32_t kListeningVadPeakStart = 1200;
+constexpr uint32_t kListeningVadActiveThreshold = 520;
+constexpr uint32_t kListeningVadMinActiveSamples = 24;
+constexpr uint32_t kListeningVadMinCandidateMs = 450;
+constexpr uint8_t kListeningVadMinSpeechWindows = 36;
+constexpr uint8_t kListeningVadMaxQuietWindows = 63;
 constexpr int kVoiceInputGainPermille = 1800;
 constexpr int kAudioSampleRate = 24000;
 constexpr int kVoiceInputSampleRate = 16000;
 constexpr int kMcuAudioDefaultSampleRate = 24000;
-constexpr size_t kVoiceStreamChunkFrames = 4096;
+// Keep the reusable ADPCM chunk small enough to avoid fragmented-heap failures.
+constexpr size_t kVoiceStreamChunkFrames = 1024;
 constexpr size_t kVoiceStreamAdpcmMaxBytes = kMcuAdpcmHeaderBytes + ((kVoiceStreamChunkFrames + 1) / 2);
 constexpr size_t kVoiceRecordMaxFrames = (kVoiceInputSampleRate * kVoiceRecordMs) / 1000UL;
 constexpr size_t kVoiceRecordBufferBytes = 44 + kVoiceRecordMaxFrames * sizeof(int16_t);
@@ -167,6 +190,7 @@ WiFiClientSecure mcuWsSecureClient;
 WiFiClient *mcuWsClient = &mcuWsPlainClient;
 WiFiClient mcuAudioPlainClient;
 WiFiClientSecure mcuAudioSecureClient;
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oledTextRenderer(U8G2_R0, U8X8_PIN_NONE);
 uint8_t mcuAdpcmInputBuffer[kMcuAdpcmReadChunkBytes];
 int16_t mcuAdpcmStereoBuffer[kMcuAdpcmOutputFrames * 2];
 bool wifiReady = false;
@@ -190,12 +214,16 @@ bool bootClickPending = false;
 bool bootSecondClickStarted = false;
 bool bootInputArmed = false;
 bool idlePowerSaveActive = false;
+bool listeningModeEnabled = false;
+bool hermesAgentSelected = false;
 uint32_t lastOledAtMs = 0;
 uint32_t oledStatusReturnAtMs = 0;
 uint32_t restartAtMs = 0;
 uint32_t lastLanDiscoveryAtMs = 0;
 uint32_t lastMcuLoginAtMs = 0;
 uint32_t lastMcuSocketConnectAtMs = 0;
+uint32_t nextMcuSocketReconnectAtMs = 0;
+uint32_t mcuSocketReconnectDelayMs = kMcuSocketReconnectMs;
 uint32_t lastBootButtonAtMs = 0;
 uint32_t bootPressedAtMs = 0;
 uint32_t bootClickPendingAtMs = 0;
@@ -221,7 +249,13 @@ String mcuAuthToken;
 String mcuSocketRelayUrl;
 String mcuSocketTargetKey;
 String mcuRemoteDiscoveryToken;
+String pendingMcuReauthReason;
+String pendingMcuReauthMachineId;
+String pendingMcuReauthInteractionId;
+String pendingMcuReauthPromptUrl;
 bool mcuSocketReconnectBlocked = false;
+bool pendingMcuReauth = false;
+bool pendingMcuReauthAuthInvalid = false;
 String mcuInteractionId;
 String mcuInteractionStatus = "idle";
 String mcuInteractionText;
@@ -230,7 +264,10 @@ String mcuToolPreview;
 String mcuToolStatus;
 String lastAudioDetail = "not started";
 uint32_t lastAudioAtMs = 0;
-uint8_t oledBuffer[(kOledWidth * kOledHeight) / 8] = {};
+uint8_t *const oledBuffer = oledTextRenderer.getBufferPtr();
+std::vector<String> mcuSubtitleLines;
+uint16_t mcuSubtitleLineCount = 0;
+uint16_t mcuSubtitleRenderedPage = UINT16_MAX;
 int scannedNetworkCount = 0;
 String scannedSsids[kMaxScannedNetworks];
 int32_t scannedRssi[kMaxScannedNetworks] = {};
@@ -246,6 +283,7 @@ bool voiceRecordHeardSpeech = false;
 uint32_t mcuInteractionUpdatedAtMs = 0;
 uint32_t mcuAudioStartedAtMs = 0;
 uint32_t mcuAudioDurationMs = 0;
+uint32_t mcuAudioPlaybackProgressMs = 0;
 uint32_t nextMcuOtaCheckAtMs = kMcuOtaFirstCheckMs;
 uint32_t voiceRecordRms = 0;
 uint32_t voiceRecordPeak = 0;
@@ -277,18 +315,29 @@ McuAudioSegment mcuAudioQueue[kMaxMcuAudioQueue];
 int mcuAudioHead = 0;
 int mcuAudioCount = 0;
 McuAudioSegment mcuCurrentAudio;
+VoiceStreamChunk voiceStreamScratch;
 
 void markMcuInteraction(const String &interactionId, const String &status, const String &text);
 void triggerBootVoiceTurn();
 bool broadcastMcuInterrupt(const String &interactionId, const String &reason);
+void broadcastMcuStatus();
 void clearMcuAudioQueue();
 void finishMcuAudio(bool interrupted);
 void clearMcuSessionByButton();
 void disconnectMcuSocketClient();
 void connectMcuSocketClient();
 void mcuSocketLoop();
+void closeMcuSocketTransport(const __FlashStringHelper *reason);
+void scheduleMcuSocketReconnect();
+void resetMcuSocketReconnect();
+void tickMcuSocketReconnect();
+void queueMcuReauth(bool authInvalid, const String &reason, const String &machineId = "",
+                    const String &interactionId = "", const String &promptUrl = "");
+void tickMcuReauth();
 void noteMcuActivity();
 void tickIdlePowerSave();
+void tickListeningMode();
+void resetListeningMonitor();
 bool waitForMcuSocketReady(uint32_t timeoutMs);
 void enqueueNoDevicePrompt(const String &interactionId);
 void enqueueTokenInvalidPromptAndClearActive(const String &interactionId, const String &url = "");
@@ -475,7 +524,7 @@ bool oledData(const uint8_t *data, size_t len) {
 }
 
 void oledClearBuffer() {
-  memset(oledBuffer, 0, sizeof(oledBuffer));
+  memset(oledBuffer, 0, kOledBufferBytes);
 }
 
 void oledSetPixel(int x, int y, bool on = true) {
@@ -604,6 +653,100 @@ void oledDrawScrollingText(int y, String text, uint8_t scale = 1) {
   oledDrawText(width + gap - offset, y, text, scale);
 }
 
+size_t nextUtf8CharacterEnd(const String &text, size_t start) {
+  if (start >= text.length()) return text.length();
+  uint8_t lead = static_cast<uint8_t>(text[start]);
+  size_t bytes = 1;
+  if ((lead & 0xE0) == 0xC0) {
+    bytes = 2;
+  } else if ((lead & 0xF0) == 0xE0) {
+    bytes = 3;
+  } else if ((lead & 0xF8) == 0xF0) {
+    bytes = 4;
+  }
+  return min(start + bytes, text.length());
+}
+
+void clearMcuSubtitle() {
+  mcuSubtitleLines.clear();
+  mcuSubtitleLineCount = 0;
+  mcuSubtitleRenderedPage = UINT16_MAX;
+}
+
+void configureMcuSubtitleFont() {
+  oledTextRenderer.setFont(u8g2_font_wqy12_t_gb2312);
+  oledTextRenderer.setFontMode(1);
+  oledTextRenderer.setDrawColor(1);
+  oledTextRenderer.setFontPosTop();
+}
+
+void prepareMcuSubtitle(String text) {
+  clearMcuSubtitle();
+  text.replace("\r", " ");
+  text.replace("\n", " ");
+  text.trim();
+  if (text.length() == 0) return;
+
+  configureMcuSubtitleFont();
+  size_t offset = 0;
+  while (offset < text.length()) {
+    while (offset < text.length() && text[offset] == ' ') ++offset;
+    if (offset >= text.length()) break;
+
+    String line;
+    while (offset < text.length()) {
+      size_t end = nextUtf8CharacterEnd(text, offset);
+      String candidate = line + text.substring(offset, end);
+      if (line.length() > 0 &&
+          oledTextRenderer.getUTF8Width(candidate.c_str()) > kMcuSubtitleMaxWidth) {
+        break;
+      }
+      line = candidate;
+      offset = end;
+    }
+    line.trim();
+    if (line.length() > 0) {
+      mcuSubtitleLines.push_back(line);
+      if (mcuSubtitleLineCount < UINT16_MAX) ++mcuSubtitleLineCount;
+    }
+  }
+}
+
+uint16_t currentMcuSubtitlePage() {
+  if (mcuSubtitleLineCount == 0) return 0;
+  uint16_t pageCount =
+      (mcuSubtitleLineCount + kMcuSubtitleLinesPerPage - 1) / kMcuSubtitleLinesPerPage;
+  uint16_t page = 0;
+  if (pageCount > 1 && mcuAudioDurationMs > 0) {
+    uint32_t elapsed = millis() - mcuAudioStartedAtMs;
+    uint32_t progress = min(min(elapsed, mcuAudioPlaybackProgressMs), mcuAudioDurationMs);
+    page = min(static_cast<uint16_t>(
+                   (static_cast<uint64_t>(progress) * pageCount) / mcuAudioDurationMs),
+               static_cast<uint16_t>(pageCount - 1));
+  }
+  return page;
+}
+
+void drawMcuSubtitle() {
+  if (mcuSubtitleLineCount == 0) return;
+  configureMcuSubtitleFont();
+
+  uint16_t page = currentMcuSubtitlePage();
+  uint16_t firstLine = page * kMcuSubtitleLinesPerPage;
+  uint16_t remainingLines = mcuSubtitleLineCount - firstLine;
+  uint8_t visibleLines = remainingLines > kMcuSubtitleLinesPerPage
+      ? kMcuSubtitleLinesPerPage
+      : static_cast<uint8_t>(remainingLines);
+  int startY = visibleLines == 1 ? 29 : 21;
+  int lineSpacing = visibleLines == 3 ? 13 : 15;
+  for (uint8_t row = 0; row < visibleLines; ++row) {
+    const String &line = mcuSubtitleLines[firstLine + row];
+    int width = oledTextRenderer.getUTF8Width(line.c_str());
+    int x = max(2, (kOledWidth - width) / 2);
+    oledTextRenderer.drawUTF8(x, startY + row * lineSpacing, line.c_str());
+  }
+}
+
 uint8_t wifiBars() {
   if (!wifiReady || WiFi.status() != WL_CONNECTED) return 0;
   int rssi = WiFi.RSSI();
@@ -676,41 +819,50 @@ String interactionStatusLabel() {
 void drawInteractionFrame() {
   drawTopStatusBar();
 
+  bool showSubtitle = mcuAudioPlaying && mcuSubtitleLineCount > 0;
   String title = interactionStatusLabel();
-  oledDrawCenteredText(17, fitOledText(title, 12), 2);
+  if (showSubtitle) {
+    drawMcuSubtitle();
+  } else {
+    oledDrawCenteredText(17, fitOledText(title, 12), 2);
 
-  String detail = mcuInteractionText;
-  if (mcuInteractionStatus == F("tool")) {
-    detail = mcuToolName;
-    if (mcuToolStatus.length() > 0) {
-      detail += F(" ");
-      detail += mcuToolStatus;
+    String detail = mcuInteractionText;
+    if (mcuInteractionStatus == F("tool")) {
+      detail = mcuToolName;
+      if (mcuToolStatus.length() > 0) {
+        detail += F(" ");
+        detail += mcuToolStatus;
+      }
+    }
+    if (detail.length() > 20 || mcuInteractionStatus == F("failed")) {
+      oledDrawScrollingText(39, detail, 1);
+    } else {
+      oledDrawCenteredText(39, fitOledText(detail, 20), 1);
     }
   }
-  if (detail.length() > 20 || mcuInteractionStatus == F("failed")) {
-    oledDrawScrollingText(39, detail, 1);
-  } else {
-    oledDrawCenteredText(39, fitOledText(detail, 20), 1);
-  }
 
-  if (mcuAudioPlaying && mcuAudioDurationMs > 0) {
-    uint32_t elapsed = millis() - mcuAudioStartedAtMs;
-    uint8_t progress = clampUiValue((elapsed * 100UL) / mcuAudioDurationMs, 100);
-    oledDrawFrame(20, 52, 88, 4);
-    uint8_t filled = static_cast<uint8_t>((progress * 84) / 100);
-    if (filled > 0) oledDrawBox(22, 53, filled, 2);
-  } else {
+  if (!mcuAudioPlaying) {
     String queue = String(F("QUEUE ")) + mcuAudioCount;
     oledDrawCenteredText(55, queue, 1);
   }
 }
 
-bool oledFlush() {
-  for (uint8_t page = 0; page < 8; ++page) {
-    if (!oledCommand(0xB0 + page) || !oledCommand(0x00) || !oledCommand(0x10)) return false;
-    if (!oledData(oledBuffer + page * kOledWidth, kOledWidth)) return false;
+bool oledFlushPages(uint8_t firstPage, uint8_t lastPage) {
+  bool ok = true;
+  Wire.setClock(kOledI2cClockHz);
+  for (uint8_t page = firstPage; page <= lastPage; ++page) {
+    if (!oledCommand(0xB0 + page) || !oledCommand(0x00) || !oledCommand(0x10) ||
+        !oledData(oledBuffer + page * kOledWidth, kOledWidth)) {
+      ok = false;
+      break;
+    }
   }
-  return true;
+  Wire.setClock(kCodecI2cClockHz);
+  return ok;
+}
+
+bool oledFlush() {
+  return oledFlushPages(0, 7);
 }
 
 void drawOledFrame() {
@@ -744,6 +896,16 @@ void drawOledFrame() {
   oledDrawScrollingText(57, status, 1);
 }
 
+void refreshMcuSubtitlePage() {
+  if (!oledReady || idlePowerSaveActive || !mcuAudioPlaying || mcuSubtitleLineCount == 0) return;
+  uint16_t page = currentMcuSubtitlePage();
+  if (page == mcuSubtitleRenderedPage) return;
+  oledClearBuffer();
+  drawOledFrame();
+  oledReady = oledFlushPages(2, 7);
+  if (oledReady) mcuSubtitleRenderedPage = page;
+}
+
 void refreshOled(bool force = false) {
   if (!oledReady || idlePowerSaveActive) return;
   uint32_t now = millis();
@@ -764,8 +926,9 @@ void setOledStatus(OledMode mode, const String &title, const String &hint, uint8
   oledHint = nextHint;
   oledProgress = progress > 100 ? 100 : progress;
   oledStatusReturnAtMs = 0;
-  bool isLanIpStatus = nextTitle == F("IP");
-  if (!isLanIpStatus && wifiReady && WiFi.status() == WL_CONNECTED &&
+  bool isHomeStatus = nextTitle == F("IP") ||
+                      (listeningModeEnabled && nextTitle == F("LISTEN") && nextHint.startsWith(F("AUTO ")));
+  if (!isHomeStatus && wifiReady && WiFi.status() == WL_CONNECTED &&
       (mode == OledMode::Ready || mode == OledMode::Error)) {
     uint32_t delayMs = mode == OledMode::Error ? kOledErrorReturnDelayMs : kOledSuccessReturnDelayMs;
     oledStatusReturnAtMs = millis() + delayMs;
@@ -776,7 +939,11 @@ void setOledStatus(OledMode mode, const String &title, const String &hint, uint8
 
 void showLanIpOnOled() {
   if (!wifiReady || WiFi.status() != WL_CONNECTED) return;
-  setOledStatus(OledMode::Ready, F("IP"), WiFi.localIP().toString(), 0);
+  if (listeningModeEnabled) {
+    setOledStatus(OledMode::Ready, F("LISTEN"), String(F("AUTO ")) + WiFi.localIP().toString(), 0);
+  } else {
+    setOledStatus(OledMode::Ready, F("IP"), WiFi.localIP().toString(), 0);
+  }
 }
 
 void tickOledStatusReturn() {
@@ -791,7 +958,7 @@ void tickOledStatusReturn() {
 
 void initOledDisplay() {
   Wire.begin(kPinI2cSda, kPinI2cScl);
-  Wire.setClock(100000);
+  Wire.setClock(kCodecI2cClockHz);
   delay(40);
   if (i2cProbe(kDefaultOledAddr)) {
     oledAddress = kDefaultOledAddr;
@@ -960,7 +1127,25 @@ void loadAudioPreferences() {
   idlePowerSaveMinutes = clampUiValue(
       static_cast<uint32_t>(prefs.getUChar("idle_min", kDefaultIdlePowerSaveMinutes)),
       kMaxIdlePowerSaveMinutes);
+  listeningModeEnabled = prefs.getBool("listen_mode", false);
+  hermesAgentSelected = prefs.getBool("agent_hermes", false);
   prefs.end();
+}
+
+String mcuAgentRuntimeValue() {
+  return hermesAgentSelected ? String(F("hermes")) : String(F("ekko"));
+}
+
+String mcuAgentRuntimeLabel() {
+  return hermesAgentSelected ? String(F("Hermes")) : String(F("Ekko"));
+}
+
+void saveMcuAgentRuntime(bool useHermes) {
+  hermesAgentSelected = useHermes;
+  prefs.begin("mcu", false);
+  prefs.putBool("agent_hermes", hermesAgentSelected);
+  prefs.end();
+  noteMcuActivity();
 }
 
 void saveOutputVolume(uint8_t volume) {
@@ -976,6 +1161,16 @@ void saveIdlePowerSaveMinutes(uint8_t minutes) {
   prefs.putUChar("idle_min", idlePowerSaveMinutes);
   prefs.end();
   noteMcuActivity();
+}
+
+void saveListeningMode(bool enabled) {
+  listeningModeEnabled = enabled;
+  prefs.begin("mcu", false);
+  prefs.putBool("listen_mode", listeningModeEnabled);
+  prefs.end();
+  resetListeningMonitor();
+  noteMcuActivity();
+  showLanIpOnOled();
 }
 
 String currentIp() {
@@ -1046,7 +1241,11 @@ String compactDetail(String value) {
   value.replace("\r", " ");
   value.replace("\n", " ");
   value.trim();
-  if (value.length() > 180) value = value.substring(0, 180);
+  if (value.length() > 180) {
+    size_t end = 180;
+    while (end > 0 && (static_cast<uint8_t>(value[end]) & 0xC0) == 0x80) --end;
+    value = value.substring(0, end);
+  }
   return value;
 }
 
@@ -1553,6 +1752,16 @@ enum class VoiceInputChannel : uint8_t {
   Mixed,
 };
 
+bool listeningMonitorReady = false;
+uint8_t listeningSpeechWindows = 0;
+uint8_t listeningQuietWindows = 0;
+uint32_t listeningCandidateStartedAtMs = 0;
+uint32_t listeningLastTriggeredAtMs = 0;
+size_t listeningPreRollWrite = 0;
+size_t listeningPreRollCount = 0;
+int16_t listeningPreRoll[kListeningPreRollFrames] = {};
+VoiceInputChannel listeningInputChannel = VoiceInputChannel::Undecided;
+
 const char *voiceInputChannelName(VoiceInputChannel channel) {
   switch (channel) {
     case VoiceInputChannel::Left:
@@ -1612,6 +1821,16 @@ void shapePcmBuffer(uint8_t *buffer, size_t length) {
     buffer[i] = static_cast<uint8_t>(shaped & 0xFF);
     buffer[i + 1] = static_cast<uint8_t>((static_cast<uint16_t>(shaped) >> 8) & 0xFF);
   }
+}
+
+void resetListeningMonitor() {
+  listeningMonitorReady = false;
+  listeningSpeechWindows = 0;
+  listeningQuietWindows = 0;
+  listeningCandidateStartedAtMs = 0;
+  listeningPreRollWrite = 0;
+  listeningPreRollCount = 0;
+  listeningInputChannel = VoiceInputChannel::Undecided;
 }
 
 bool shouldInterruptAudioForVoice() {
@@ -2122,6 +2341,8 @@ void cleanupMcuPreferences() {
   uint8_t idleMinutes = clampUiValue(
       static_cast<uint32_t>(prefs.getUChar("idle_min", kDefaultIdlePowerSaveMinutes)),
       kMaxIdlePowerSaveMinutes);
+  bool listenMode = prefs.getBool("listen_mode", false);
+  bool agentHermes = prefs.getBool("agent_hermes", false);
   String activeKey = prefs.getString("active_key", "");
   String activeAddr = prefs.getString("active_addr", "");
   String activeUrl = prefs.getString("active_url", "");
@@ -2157,6 +2378,8 @@ void cleanupMcuPreferences() {
   if (deviceCode.length() > 0) prefs.putString("device_code", deviceCode);
   prefs.putUChar("volume", volume);
   prefs.putUChar("idle_min", idleMinutes);
+  prefs.putBool("listen_mode", listenMode);
+  prefs.putBool("agent_hermes", agentHermes);
   if (activeKey.length() > 0) prefs.putString("active_key", activeKey);
   if (activeAddr.length() > 0) prefs.putString("active_addr", activeAddr);
   if (activeUrl.length() > 0) prefs.putString("active_url", activeUrl);
@@ -2341,14 +2564,12 @@ void queueRelayUrl(String urls[], int *count, const String &url) {
 }
 
 void fetchRemoteDevicesFromRelay() {
-  String endpoint = String(kRemoteDeviceLookupUrl) + F("/global-agent/device/") + mcuDeviceCode();
-  bool restoreRelaySocket = mcuSocketRelayUrl.length() > 0 && (wsReady || mcuSocketConnected);
-  if (restoreRelaySocket) {
-    Serial.printf("Remote discovery releasing Socket.IO heap=%lu\n", static_cast<unsigned long>(ESP.getFreeHeap()));
-    disconnectMcuSocketClient();
-    delay(20);
-    yield();
+  if (mcuSocketRelayUrl.length() > 0 && (wsReady || mcuSocketConnected)) {
+    Serial.println(F("Remote discovery using active Socket.IO machine cache"));
+    return;
   }
+
+  String endpoint = String(kRemoteDeviceLookupUrl) + F("/global-agent/device/") + mcuDeviceCode();
 
   int code = -1;
   String body;
@@ -2375,16 +2596,52 @@ void fetchRemoteDevicesFromRelay() {
   } else {
     rememberRemoteMachineList(body);
   }
-
-  if (restoreRelaySocket && activeDeviceUrl.length() > 0 && mcuAuthToken.length() > 0) {
-    Serial.printf("Remote discovery reconnecting Socket.IO heap=%lu\n", static_cast<unsigned long>(ESP.getFreeHeap()));
-    connectMcuSocketClient();
-  }
 }
 
 void refreshRemoteDevices() {
   if (!wifiReady || WiFi.status() != WL_CONNECTED) return;
   fetchRemoteDevicesFromRelay();
+}
+
+bool restorePersistedActiveRemoteDevice() {
+  if (mcuSocketRelayUrl.length() == 0 || activeDeviceKey.length() == 0 ||
+      activeDeviceUrl.length() == 0 || lanDeviceCount >= kMaxLanDevices) {
+    return false;
+  }
+  for (int i = 0; i < lanDeviceCount; ++i) {
+    if (isActiveLanDevice(lanDevices[i])) return true;
+  }
+
+  int portSeparator = activeDeviceKey.lastIndexOf('|');
+  int kindSeparator = portSeparator > 0 ? activeDeviceKey.lastIndexOf('|', portSeparator - 1) : -1;
+  if (kindSeparator <= 0 || portSeparator <= kindSeparator + 1) return false;
+  int portValue = activeDeviceKey.substring(portSeparator + 1).toInt();
+  if (portValue <= 0 || portValue > 65535) return false;
+
+  prefs.begin("mcu", true);
+  String activeAddress = prefs.getString("active_addr", "");
+  prefs.end();
+  int addressSeparator = activeAddress.indexOf('|');
+
+  LanDevice device;
+  device.id = activeDeviceKey.substring(0, kindSeparator);
+  device.name = device.id;
+  device.ip = addressSeparator > 0 ? activeAddress.substring(0, addressSeparator) : "";
+  device.httpPort = static_cast<uint16_t>(portValue);
+  device.endpointKind = activeDeviceKey.substring(kindSeparator + 1, portSeparator);
+  device.url = activeDeviceUrl;
+  device.relayUrl = normalizedRelayBaseUrl(mcuSocketRelayUrl);
+  device.displayUrl = device.relayUrl;
+  device.responseMs = 0;
+  device.lastSeenMs = millis();
+  device.remoteSource = true;
+  device.remoteLogin = true;
+  device.loggedIn = selectedProfile.length() > 0;
+  device.profile = selectedProfile;
+  lanDevices[lanDeviceCount++] = device;
+  Serial.printf("Restored active remote machine cache id=%s url=%s\n",
+                device.id.c_str(), device.displayUrl.c_str());
+  return true;
 }
 
 IPAddress lanBroadcastIp() {
@@ -2466,6 +2723,7 @@ void refreshDeviceDiscovery() {
       lanDevices[lanDeviceCount++] = activeSnapshot;
     }
   }
+  restorePersistedActiveRemoteDevice();
 }
 
 bool ssidAlreadyScanned(const String &ssid) {
@@ -2544,7 +2802,7 @@ void sendWifiPage() {
   }
 
   String html = pageStart(F("连接 Wi-Fi"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>连接局域网 Wi-Fi</h1>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>连接局域网 Wi-Fi</h1>");
   if (wifiReady) {
     html += F("<p class='lead ok'>当前已联网：");
     html += escapeHtml(WiFi.SSID());
@@ -2601,7 +2859,7 @@ void sendWifiPage() {
 
 void sendStatusPage() {
   String html = pageStart(F("设备已联网"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>设备</h1><p class='lead'>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>设备</h1><p class='lead'>");
   html += escapeHtml(WiFi.SSID());
   html += F(" · IP ");
   html += WiFi.localIP().toString();
@@ -2622,8 +2880,9 @@ void sendStatusPage() {
   }
   appendInfoRow(html, F("音频硬件"), String(es8311Ready && i2sReady ? F("就绪") : F("未就绪")) + F(" · ") + lastAudioDetail);
   appendInfoRow(html, F("音量"), String(outputVolumePercent) + F("%"));
+  appendInfoRow(html, F("语音模式"), listeningModeEnabled ? F("自动监听") : F("按住说话"));
+  appendInfoRow(html, F("Agent"), mcuAgentRuntimeLabel());
   appendInfoRow(html, F("自动待机"), idlePowerSaveMinutes == 0 ? String(F("关闭")) : String(idlePowerSaveMinutes) + F(" 分钟"));
-  appendInfoRow(html, F("电量"), F("未启用"));
   if (selectedProfile.length() > 0) {
     appendInfoRow(html, F("最近 Profile"), selectedProfile);
   }
@@ -2637,6 +2896,20 @@ void sendStatusPage() {
 
   html += F("</section>");
 
+  html += F("<section class='card'><h2>Agent</h2><form method='post' action='/device/agent'>");
+  html += F("<div class='choice-grid'><label class='choice'><input type='radio' name='runtime' value='ekko'");
+  if (!hermesAgentSelected) html += F(" checked");
+  html += F("><span class='choice-card'><span class='choice-dot'></span><span class='choice-title'>Ekko</span>"
+            "<span class='choice-copy'>使用 Ekko Agent Runtime，支持工具调用和后台任务。</span>"
+            "<span class='choice-meta'>EKKO AGENT</span></span></label>");
+  html += F("<label class='choice'><input type='radio' name='runtime' value='hermes'");
+  if (hermesAgentSelected) html += F(" checked");
+  html += F("><span class='choice-card'><span class='choice-dot'></span><span class='choice-title'>Hermes</span>"
+            "<span class='choice-copy'>使用 Hermes Agent Bridge，保留原有 MCU Agent 体验。</span>"
+            "<span class='choice-meta'>HERMES AGENT</span></span></label></div>");
+  html += F("<div class='btn-row'><button class='btn primary' type='submit'>保存 Agent</button></div>");
+  html += F("<p class='hint'>选择将在下一次语音交互生效；Ekko 与 Hermes 使用互不共享的独立会话。</p></form></section>");
+
   html += F("<section class='card'><h2>音频</h2>");
   html += F("<form method='post' action='/device/audio'><div class='field'><span class='label'>播放音量 <output id='volume-output'>");
   html += outputVolumePercent;
@@ -2647,6 +2920,20 @@ void sendStatusPage() {
   html += F("' oninput=\"document.getElementById('volume-output').textContent=this.value+'%'\"></div>");
   html += F("<div class='btn-row'><button class='btn primary' type='submit'>保存音量</button></div>");
   html += F("<p class='hint'>只影响 MCU 播放输出，不影响麦克风录音。</p></form></section>");
+
+  html += F("<section class='card'><h2>语音模式</h2><form method='post' action='/device/voice-mode'>");
+  html += F("<div class='choice-grid'><label class='choice'><input type='radio' name='mode' value='push'");
+  if (!listeningModeEnabled) html += F(" checked");
+  html += F("><span class='choice-card'><span class='choice-dot'></span><span class='choice-title'>按住说话</span>"
+            "<span class='choice-copy'>保持现有交互：长按录音，松开后提交。</span>"
+            "<span class='choice-meta'>PUSH TO TALK</span></span></label>");
+  html += F("<label class='choice'><input type='radio' name='mode' value='listen'");
+  if (listeningModeEnabled) html += F(" checked");
+  html += F("><span class='choice-card'><span class='choice-dot'></span><span class='choice-title'>自动监听</span>"
+            "<span class='choice-copy'>空闲时仅在设备本地检测人声，检测到说话后才上传，静音后自动提交。</span>"
+            "<span class='choice-meta'>LOCAL VAD</span></span></label></div>");
+  html += F("<div class='btn-row'><button class='btn primary' type='submit'>保存语音模式</button></div>");
+  html += F("<p class='hint'>运行、工具调用和语音播放期间不会监听；单击停止、双击清空和长按说话保持不变。</p></form></section>");
 
   html += F("<section class='card'><h2>省电</h2>");
   html += F("<form method='post' action='/device/power-save'><div class='field'><span class='label'>无交互后自动待机 <output id='idle-output'>");
@@ -2747,7 +3034,7 @@ String otaNextCheckText() {
 
 void sendOtaPage(const String &notice = "") {
   String html = pageStart(F("OTA"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件在线升级</p>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件在线升级</p>");
   html += F("<nav class='tabs'><a class='tab' href='/device'>设备</a><a class='tab active' href='/ota'>OTA</a></nav>");
   if (notice.length() > 0) {
     html += F("<p class='hint'>");
@@ -2773,7 +3060,7 @@ void sendOtaPage(const String &notice = "") {
 
 void sendOtaUpdatingPage() {
   String html = pageStart(F("OTA"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件正在更新</p>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件正在更新</p>");
   html += F("<p class='hint'>固件正在下载并写入，请勿关闭单片机或断开电源。设备会自动重启，页面检测到恢复后会弹窗提示完成。</p>");
   html += F("<div class='info-grid'>");
   appendInfoRow(html, F("固件版本"), String(kMcuFirmwareVersion));
@@ -2856,6 +3143,30 @@ void handleDevicePowerSave() {
   server.send(302, F("text/plain"), F(""));
 }
 
+void handleDeviceVoiceMode() {
+  String mode = server.arg(F("mode"));
+  mode.trim();
+  if (mode != F("push") && mode != F("listen")) {
+    server.send(400, F("text/plain; charset=utf-8"), F("无效的语音模式"));
+    return;
+  }
+  saveListeningMode(mode == F("listen"));
+  server.sendHeader(F("Location"), F("/device"), true);
+  server.send(302, F("text/plain"), F(""));
+}
+
+void handleDeviceAgent() {
+  String runtime = server.arg(F("runtime"));
+  runtime.trim();
+  if (runtime != F("ekko") && runtime != F("hermes")) {
+    server.send(400, F("text/plain; charset=utf-8"), F("无效的 Agent"));
+    return;
+  }
+  saveMcuAgentRuntime(runtime == F("hermes"));
+  server.sendHeader(F("Location"), F("/device"), true);
+  server.send(302, F("text/plain"), F(""));
+}
+
 void addManualDevice() {
   String url = server.arg(F("url"));
   String error;
@@ -2925,7 +3236,7 @@ bool runMcuLogin(LanDevice &device, const String &account, const String &passwor
 
   http.addHeader(F("Content-Type"), F("application/json"));
   http.addHeader(F("X-Hermes-Device-Id"), deviceId());
-  http.addHeader(F("X-Hermes-Device-Name"), F("HStudio ESP32-C3"));
+  http.addHeader(F("X-Hermes-Device-Name"), F("Ekko Studio ESP32-C3"));
   int code = http.POST(mcuLoginPayload(account, password, useRemoteLogin ? device.id : String(""), useRemoteLogin));
   String response = http.getString();
   http.end();
@@ -3027,23 +3338,74 @@ bool reauthActiveDevice(const String &reason = "", const String &machineId = "")
   Serial.printf("Reauth active MCU device reason=%s machine=%s active=%s\n",
                 reason.c_str(), machineId.c_str(), activeDeviceUrl.c_str());
   setOledStatus(OledMode::Think, F("LOGIN"), F("REAUTH"), 35);
-  refreshDeviceDiscovery();
 
+  int activeIndex = -1;
   for (int i = 0; i < lanDeviceCount; ++i) {
-    if (!isActiveLanDevice(lanDevices[i])) continue;
-    if (machineId.length() > 0 && lanDevices[i].id != machineId) {
-      Serial.printf("Skip reauth for non-active machine event=%s active=%s\n",
-                    machineId.c_str(), lanDevices[i].id.c_str());
-      if (wasBlocked) persistRelayReplaced(true);
-      return false;
+    if (isActiveLanDevice(lanDevices[i])) {
+      activeIndex = i;
+      break;
     }
-    bool ok = autoLoginDevice(lanDevices[i]);
-    if (!ok && wasBlocked) persistRelayReplaced(true);
-    return ok;
+  }
+  if (activeIndex < 0) {
+    refreshDeviceDiscovery();
+    for (int i = 0; i < lanDeviceCount; ++i) {
+      if (isActiveLanDevice(lanDevices[i])) {
+        activeIndex = i;
+        break;
+      }
+    }
   }
 
-  if (wasBlocked) persistRelayReplaced(true);
-  return false;
+  if (activeIndex < 0) {
+    if (wasBlocked) persistRelayReplaced(true);
+    return false;
+  }
+  if (machineId.length() > 0 && lanDevices[activeIndex].id != machineId) {
+    Serial.printf("Skip reauth for non-active machine event=%s active=%s\n",
+                  machineId.c_str(), lanDevices[activeIndex].id.c_str());
+    if (wasBlocked) persistRelayReplaced(true);
+    return false;
+  }
+  bool ok = autoLoginDevice(lanDevices[activeIndex]);
+  if (!ok && wasBlocked) persistRelayReplaced(true);
+  return ok;
+}
+
+void queueMcuReauth(bool authInvalid, const String &reason, const String &machineId,
+                    const String &interactionId, const String &promptUrl) {
+  if (pendingMcuReauth && pendingMcuReauthAuthInvalid && !authInvalid) return;
+  pendingMcuReauth = true;
+  pendingMcuReauthAuthInvalid = authInvalid;
+  pendingMcuReauthReason = reason;
+  pendingMcuReauthMachineId = machineId;
+  pendingMcuReauthInteractionId = interactionId;
+  pendingMcuReauthPromptUrl = promptUrl;
+}
+
+void tickMcuReauth() {
+  if (!pendingMcuReauth) return;
+  bool authInvalid = pendingMcuReauthAuthInvalid;
+  String reason = pendingMcuReauthReason;
+  String machineId = pendingMcuReauthMachineId;
+  String interactionId = pendingMcuReauthInteractionId;
+  String promptUrl = pendingMcuReauthPromptUrl;
+  pendingMcuReauth = false;
+  pendingMcuReauthAuthInvalid = false;
+  pendingMcuReauthReason = "";
+  pendingMcuReauthMachineId = "";
+  pendingMcuReauthInteractionId = "";
+  pendingMcuReauthPromptUrl = "";
+
+  if (reauthActiveDevice(reason, machineId)) {
+    broadcastMcuStatus();
+    return;
+  }
+  if (authInvalid) {
+    enqueueTokenInvalidPromptAndClearActive(interactionId, promptUrl);
+    return;
+  }
+  lastAudioDetail = F("远程重登失败");
+  setOledStatus(OledMode::Error, F("LOGIN"), F("REAUTH FAIL"), 0);
 }
 
 void autoLoginSavedDevice() {
@@ -3227,6 +3589,8 @@ String mcuStatusJson() {
   json += escapeJson(activeDeviceKey);
   json += F("\",\"profile\":\"");
   json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
   json += F("\",\"text\":\"");
   json += escapeJson(mcuInteractionText);
   json += F("\",\"tool\":\"");
@@ -3346,6 +3710,25 @@ uint32_t mcuAudioDurationFor(const McuAudioSegment &segment) {
   return min(max(estimated, kMcuAudioDefaultDurationMs), kMcuAudioMaxDurationMs);
 }
 
+void setMcuAudioTimelineFromFrames(uint32_t frames, uint32_t sampleRate) {
+  if (frames == 0 || sampleRate == 0) return;
+  mcuAudioDurationMs = static_cast<uint32_t>(
+      (static_cast<uint64_t>(frames) * 1000ULL + sampleRate - 1) / sampleRate);
+  mcuAudioPlaybackProgressMs = 0;
+  mcuAudioStartedAtMs = millis();
+  oledDirty = true;
+}
+
+void updateMcuAudioPlaybackProgress(uint32_t stereoBytes, uint32_t sampleRate) {
+  if (sampleRate == 0) return;
+  uint32_t frames = stereoBytes / (2 * sizeof(int16_t));
+  mcuAudioPlaybackProgressMs = static_cast<uint32_t>(
+      (static_cast<uint64_t>(frames) * 1000ULL) / sampleRate);
+  if (mcuAudioDurationMs > 0) {
+    mcuAudioPlaybackProgressMs = min(mcuAudioPlaybackProgressMs, mcuAudioDurationMs);
+  }
+}
+
 size_t mcuAudioPrebufferTargetBytes(int contentLength, uint32_t sampleRate, uint8_t channels, size_t frameBytes) {
   if (sampleRate == 0 || channels == 0 || frameBytes == 0) return 0;
   size_t target = static_cast<size_t>((static_cast<uint64_t>(sampleRate) * channels * sizeof(int16_t) *
@@ -3371,7 +3754,7 @@ bool prebufferPcmStream(WiFiClient *stream, int *remaining, size_t frameBytes, u
   size_t target = mcuAudioPrebufferTargetBytes(*remaining, sampleRate, channels, frameBytes);
   if (target == 0) return true;
 
-  uint8_t *buffer = new uint8_t[target];
+  uint8_t *buffer = new (std::nothrow) uint8_t[target];
   if (!buffer) return true;
 
   uint32_t startedAt = millis();
@@ -3429,6 +3812,9 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
   size_t prebufferLength = 0;
   size_t prebufferOffset = 0;
   prebufferPcmStream(stream, &remaining, kAudioFrameBytes, 2, sampleRate, &prebuffer, &prebufferLength);
+  if (contentLength > 0) {
+    setMcuAudioTimelineFromFrames(contentLength / kAudioFrameBytes, sampleRate);
+  }
 
   while (prebufferOffset < prebufferLength || remaining != 0) {
     if (shouldInterruptAudioForVoice()) {
@@ -3458,6 +3844,7 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
           return false;
         }
         delay(10);
+        refreshMcuSubtitlePage();
         yield();
         continue;
       }
@@ -3491,9 +3878,11 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
       return false;
     }
     playedBytes += written;
+    updateMcuAudioPlaybackProgress(playedBytes, sampleRate);
 
     pendingBytes = bufferedBytes - alignedBytes;
     if (pendingBytes > 0) memmove(buffer, buffer + alignedBytes, pendingBytes);
+    refreshMcuSubtitlePage();
     yield();
   }
 
@@ -3511,6 +3900,7 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
       return false;
     }
     playedBytes += written;
+    updateMcuAudioPlaybackProgress(playedBytes, sampleRate);
   }
 
   releaseMcuAudioPrebuffer(&prebuffer);
@@ -3551,6 +3941,9 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
   size_t prebufferLength = 0;
   size_t prebufferOffset = 0;
   prebufferPcmStream(stream, &remaining, kMonoFrameBytes, 1, sampleRate, &prebuffer, &prebufferLength);
+  if (contentLength > 0) {
+    setMcuAudioTimelineFromFrames(contentLength / kMonoFrameBytes, sampleRate);
+  }
 
   while (prebufferOffset < prebufferLength || remaining != 0) {
     if (shouldInterruptAudioForVoice()) {
@@ -3580,6 +3973,7 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
           return false;
         }
         delay(10);
+        refreshMcuSubtitlePage();
         yield();
         continue;
       }
@@ -3624,9 +4018,11 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
       return false;
     }
     playedBytes += written;
+    updateMcuAudioPlaybackProgress(playedBytes, sampleRate);
 
     pendingBytes = bufferedBytes - alignedBytes;
     if (pendingBytes > 0) memmove(input, input + alignedBytes, pendingBytes);
+    refreshMcuSubtitlePage();
     yield();
   }
 
@@ -3648,6 +4044,7 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
       return false;
     }
     playedBytes += written;
+    updateMcuAudioPlaybackProgress(playedBytes, sampleRate);
   }
 
   releaseMcuAudioPrebuffer(&prebuffer);
@@ -3782,7 +4179,7 @@ size_t encodeVoiceAdpcmChunk(const int16_t *samples,
   return encodedBytes;
 }
 
-bool flushAdpcmStereo(int16_t *stereo, size_t *frames, uint32_t *playedBytes) {
+bool flushAdpcmStereo(int16_t *stereo, size_t *frames, uint32_t *playedBytes, uint32_t sampleRate) {
   if (!stereo || !frames || !playedBytes || *frames == 0) return true;
   size_t bytesToWrite = *frames * 2 * sizeof(int16_t);
   size_t written = 0;
@@ -3793,19 +4190,22 @@ bool flushAdpcmStereo(int16_t *stereo, size_t *frames, uint32_t *playedBytes) {
     return false;
   }
   *playedBytes += written;
+  updateMcuAudioPlaybackProgress(*playedBytes, sampleRate);
   *frames = 0;
   mcuSocketLoop();
+  refreshMcuSubtitlePage();
   yield();
   return true;
 }
 
-bool pushAdpcmSample(int16_t sample, int16_t *stereo, size_t *frames, uint32_t *playedBytes) {
+bool pushAdpcmSample(int16_t sample, int16_t *stereo, size_t *frames, uint32_t *playedBytes,
+                     uint32_t sampleRate) {
   int16_t shaped = shapeOutputSample(sample);
   stereo[*frames * 2] = shaped;
   stereo[*frames * 2 + 1] = shaped;
   *frames += 1;
   if (*frames >= kMcuAdpcmOutputFrames) {
-    return flushAdpcmStereo(stereo, frames, playedBytes);
+    return flushAdpcmStereo(stereo, frames, playedBytes, sampleRate);
   }
   return true;
 }
@@ -3828,6 +4228,7 @@ bool readExactAudioBytes(WiFiClient *stream, uint8_t *buffer, size_t length, int
       }
       delay(10);
       mcuSocketLoop();
+      refreshMcuSubtitlePage();
       yield();
       continue;
     }
@@ -3868,6 +4269,9 @@ bool playAdpcmStream(WiFiClient *stream, int contentLength, uint32_t fallbackSam
   uint32_t sampleRate = readLe32(header + 8);
   if (sampleRate == 0) sampleRate = fallbackSampleRate > 0 ? fallbackSampleRate : kMcuAudioDefaultSampleRate;
   uint32_t sampleCount = readLe32(header + 12);
+  if (sampleCount > 0) {
+    setMcuAudioTimelineFromFrames(sampleCount, sampleRate);
+  }
   int predictor = static_cast<int16_t>(readLe16(header + 16));
   int index = header[18];
   if (index < 0) index = 0;
@@ -3891,7 +4295,7 @@ bool playAdpcmStream(WiFiClient *stream, int contentLength, uint32_t fallbackSam
   uint32_t idleStarted = millis();
 
   if (sampleCount > 0) {
-    if (!pushAdpcmSample(static_cast<int16_t>(predictor), stereo, &frames, &playedBytes)) {
+    if (!pushAdpcmSample(static_cast<int16_t>(predictor), stereo, &frames, &playedBytes, sampleRate)) {
       audioBusy = false;
       return false;
     }
@@ -3937,7 +4341,7 @@ bool playAdpcmStream(WiFiClient *stream, int contentLength, uint32_t fallbackSam
         if (sampleCount > 0 && decodedSamples >= sampleCount) break;
         uint8_t nibble = half == 0 ? (byte & 0x0f) : (byte >> 4);
         int16_t sample = decodeImaAdpcmNibble(nibble, &predictor, &index);
-        if (!pushAdpcmSample(sample, stereo, &frames, &playedBytes)) {
+        if (!pushAdpcmSample(sample, stereo, &frames, &playedBytes, sampleRate)) {
           audioBusy = false;
           return false;
         }
@@ -3947,7 +4351,7 @@ bool playAdpcmStream(WiFiClient *stream, int contentLength, uint32_t fallbackSam
     yield();
   }
 
-  if (!flushAdpcmStereo(stereo, &frames, &playedBytes)) {
+  if (!flushAdpcmStereo(stereo, &frames, &playedBytes, sampleRate)) {
     audioBusy = false;
     return false;
   }
@@ -4113,9 +4517,11 @@ void clearMcuAudioQueue() {
   mcuAudioHead = 0;
   mcuAudioCount = 0;
   mcuCurrentAudio = McuAudioSegment();
+  clearMcuSubtitle();
   mcuAudioPlaying = false;
   mcuAudioStartedAtMs = 0;
   mcuAudioDurationMs = 0;
+  mcuAudioPlaybackProgressMs = 0;
 }
 
 bool broadcastMcuInterrupt(const String &interactionId, const String &reason) {
@@ -4126,6 +4532,8 @@ bool broadcastMcuInterrupt(const String &interactionId, const String &reason) {
   json += escapeJson(interactionId.length() > 0 ? interactionId : mcuInteractionId);
   json += F("\",\"profile\":\"");
   json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
   json += F("\",\"reason\":\"");
   json += escapeJson(reason);
   json += F("\"}");
@@ -4140,6 +4548,8 @@ bool broadcastMcuSessionClear(const String &interactionId) {
   json += escapeJson(interactionId);
   json += F("\",\"profile\":\"");
   json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
   json += F("\"}");
   return sendMcuSocketJson(json);
 }
@@ -4172,12 +4582,12 @@ void touchMcuInteraction(const String &interactionId) {
   oledDirty = true;
 }
 
-void markMcuAudioSpeaking(const String &interactionId) {
+void markMcuAudioSpeaking(const String &interactionId, const String &text) {
   if (shouldPreserveMcuToolStatus(interactionId)) {
     touchMcuInteraction(interactionId);
     return;
   }
-  markMcuInteraction(interactionId, F("speaking"), F(""));
+  markMcuInteraction(interactionId, F("speaking"), text);
 }
 
 void finishMcuAudio(bool interrupted) {
@@ -4194,9 +4604,11 @@ void finishMcuAudio(bool interrupted) {
   sendMcuSocketJson(json);
 
   mcuCurrentAudio = McuAudioSegment();
+  clearMcuSubtitle();
   mcuAudioPlaying = false;
   mcuAudioStartedAtMs = 0;
   mcuAudioDurationMs = 0;
+  mcuAudioPlaybackProgressMs = 0;
   oledDirty = true;
 }
 
@@ -4210,7 +4622,11 @@ void startNextMcuAudio() {
   mcuAudioPlaying = true;
   mcuAudioStartedAtMs = millis();
   mcuAudioDurationMs = mcuAudioDurationFor(mcuCurrentAudio);
-  markMcuAudioSpeaking(mcuCurrentAudio.interactionId);
+  mcuAudioPlaybackProgressMs = 0;
+  prepareMcuSubtitle(mcuCurrentAudio.text);
+  markMcuAudioSpeaking(mcuCurrentAudio.interactionId, mcuCurrentAudio.text);
+  refreshOled(true);
+  mcuSubtitleRenderedPage = currentMcuSubtitlePage();
 
   String json;
   json.reserve(260);
@@ -4266,7 +4682,6 @@ bool enqueueMcuAudio(const McuAudioSegment &segment) {
   int tail = (mcuAudioHead + mcuAudioCount) % kMaxMcuAudioQueue;
   mcuAudioQueue[tail] = segment;
   ++mcuAudioCount;
-  markMcuAudioSpeaking(segment.interactionId);
   startNextMcuAudio();
   return true;
 }
@@ -4276,6 +4691,20 @@ void handleMcuInteractionStatus(uint8_t clientId, const String &message) {
   String status = jsonStringValue(message, F("status"));
   String text = jsonStringValue(message, F("text"));
   if (status.length() == 0) status = F("thinking");
+  bool sameInteraction = interactionId.length() > 0 && interactionId == mcuInteractionId;
+  bool currentTerminal = mcuInteractionStatus == F("failed") ||
+                         mcuInteractionStatus == F("completed") ||
+                         mcuInteractionStatus == F("aborted");
+  bool incomingTerminal = status == F("failed") ||
+                          status == F("completed") ||
+                          status == F("aborted");
+  if (sameInteraction && currentTerminal && !incomingTerminal) {
+    Serial.printf("Ignoring stale interaction status id=%s current=%s incoming=%s\n",
+                  interactionId.c_str(), mcuInteractionStatus.c_str(), status.c_str());
+    sendWsJson(clientId, String(F("{\"type\":\"interaction.status.ack\",\"ok\":true,\"status\":\"")) +
+                           escapeJson(mcuInteractionStatus) + F("\"}"));
+    return;
+  }
   if (status == F("speaking") && shouldPreserveMcuToolStatus(interactionId)) {
     touchMcuInteraction(interactionId);
   } else {
@@ -4390,7 +4819,7 @@ void handleMcuAudioEnqueue(uint8_t clientId, const String &message) {
   if (segment.interactionId.length() == 0) segment.interactionId = mcuInteractionId;
   segment.segmentId = jsonStringValue(message, F("segmentId"));
   if (segment.segmentId.length() == 0) segment.segmentId = String(F("seg-")) + millis();
-  segment.text = compactDetail(jsonStringValue(message, F("text")));
+  segment.text = jsonStringValue(message, F("text"));
   segment.url = jsonStringValue(message, F("url"));
   segment.mimeType = jsonStringValue(message, F("mimeType"));
   int channels = jsonIntValue(message, F("channels"));
@@ -4445,10 +4874,7 @@ void handleMcuWebSocketText(uint8_t clientId, const String &message) {
   if (type == F("mcu.reauth.required")) {
     String machineId = jsonStringValue(message, F("machineId"));
     String reason = jsonStringValue(message, F("reason"));
-    if (!reauthActiveDevice(reason.length() > 0 ? reason : String(F("remote")), machineId)) {
-      lastAudioDetail = F("远程重登失败");
-      setOledStatus(OledMode::Error, F("LOGIN"), F("REAUTH FAIL"), 0);
-    }
+    queueMcuReauth(false, reason.length() > 0 ? reason : String(F("remote")), machineId);
     return;
   }
   if (type == F("mcu.remote.disconnected")) {
@@ -4464,18 +4890,14 @@ void handleMcuWebSocketText(uint8_t clientId, const String &message) {
     } else {
       setOledStatus(OledMode::Error, F("REMOTE"), F("OFFLINE"), 0);
     }
-    Serial.printf("Remote MCU target disconnected machine=%s\n", machineId.c_str());
-    clearActiveDeviceState();
+    Serial.printf("Remote MCU target disconnected machine=%s; preserving login for reconnect\n",
+                  machineId.c_str());
     return;
   }
   if (type == F("auth.invalid")) {
     String interactionId = jsonStringValue(message, F("interactionId"));
     String url = jsonStringValue(message, F("url"));
-    if (reauthActiveDevice(F("auth.invalid"))) {
-      broadcastMcuStatus();
-      return;
-    }
-    enqueueTokenInvalidPromptAndClearActive(interactionId, url);
+    queueMcuReauth(true, F("auth.invalid"), "", interactionId, url);
     return;
   }
   if (type == F("audio.enqueue")) {
@@ -4572,7 +4994,7 @@ String activeVoiceTurnEndpoint() {
   endpoint.trim();
   while (endpoint.endsWith("/")) endpoint.remove(endpoint.length() - 1);
   if (endpoint.length() == 0) return "";
-  endpoint += F("/api/hermes/mcu/voice-turn");
+  endpoint += F("/api/studio/mcu/voice-turn");
   return endpoint;
 }
 
@@ -4762,6 +5184,11 @@ bool broadcastMcuVoiceWav(const String &interactionId, const uint8_t *wav, size_
   json += escapeJson(interactionId);
   json += F("\",\"mimeType\":\"audio/wav\",\"bytes\":");
   json += wavLen;
+  json += F(",\"profile\":\"");
+  json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
+  json += F("\"");
   json += F(",\"rms\":");
   json += voiceRecordRms;
   json += F(",\"peak\":");
@@ -4787,6 +5214,8 @@ bool broadcastMcuVoiceStreamStart(const String &interactionId) {
   json += kVoiceInputSampleRate;
   json += F(",\"channels\":1,\"bitsPerSample\":16,\"profile\":\"");
   json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
   json += F("\"}");
   return sendMcuSocketJson(json);
 }
@@ -4861,7 +5290,12 @@ bool broadcastMcuVoiceStreamChunk(const String &interactionId, const uint8_t *da
   return sent;
 }
 
-bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
+bool recordAndBroadcastMcuVoiceStream(const String &interactionId,
+                                      bool automatic = false,
+                                      const int16_t *initialRing = nullptr,
+                                      size_t initialRingCapacity = 0,
+                                      size_t initialRingCount = 0,
+                                      size_t initialRingWrite = 0) {
   if (audioBusy) {
     lastAudioDetail = F("audio busy before record");
     setOledStatus(OledMode::Think, F("BUSY"), F("AUDIO"), 50);
@@ -4872,6 +5306,8 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
     setOledStatus(OledMode::Error, F("AUDIO"), F("INPUT OFF"), 0);
     return false;
   }
+  VoiceStreamChunk *pcmChunk = &voiceStreamScratch;
+  memset(pcmChunk, 0, sizeof(VoiceStreamChunk));
   if (!broadcastMcuVoiceStreamStart(interactionId)) {
     lastAudioDetail = F("voice stream start failed");
     return false;
@@ -4880,9 +5316,11 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
   audioBusy = true;
   setPowerAmp(false);
   es8311UpdateBits(0x31, 0x60, 0x60);
-  setI2sSampleRate(kVoiceInputSampleRate);
-  i2s_zero_dma_buffer(kI2sPort);
-  setOledStatus(OledMode::Think, F("LISTEN"), F("SAY NOW"), 0);
+  if (!automatic) {
+    setI2sSampleRate(kVoiceInputSampleRate);
+    i2s_zero_dma_buffer(kI2sPort);
+  }
+  setOledStatus(OledMode::Think, F("LISTEN"), automatic ? F("AUTO REC") : F("SAY NOW"), 0);
 
   constexpr size_t kReadBytes = 512;
   uint8_t readBuffer[kReadBytes];
@@ -4900,15 +5338,6 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
   auto abortVoiceStream = [&](const String &reason) {
     broadcastMcuVoiceStreamAbort(interactionId, reason, queuedBytes);
   };
-  VoiceStreamChunk *pcmChunk = static_cast<VoiceStreamChunk *>(malloc(sizeof(VoiceStreamChunk)));
-  if (!pcmChunk) {
-    audioBusy = false;
-    lastAudioDetail = String(F("voice stream chunk alloc failed heap=")) + String(ESP.getFreeHeap());
-    abortVoiceStream(F("chunk_alloc"));
-    setOledStatus(OledMode::Error, F("VOICE"), F("MEMORY"), 0);
-    return false;
-  }
-  memset(pcmChunk, 0, sizeof(VoiceStreamChunk));
   const char *stopReason = "max";
   Serial.printf("Voice stream direct mode chunkFrames=%u heap=%lu\n",
                 static_cast<unsigned>(kVoiceStreamChunkFrames),
@@ -4917,9 +5346,12 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
   voiceRecordRms = 0;
   voiceRecordPeak = 0;
   voiceRecordActiveSamples = 0;
-  const uint32_t maxFrames = (kVoiceInputSampleRate * kVoiceStreamRecordMs) / 1000UL;
+  const uint32_t maxRecordMs = automatic ? kListeningMaxRecordMs : kVoiceStreamRecordMs;
+  const uint32_t maxFrames = (kVoiceInputSampleRate * maxRecordMs) / 1000UL;
   const uint32_t startedAt = millis();
   uint32_t releaseStartedAt = 0;
+  uint32_t automaticLastSpeechAt = startedAt;
+  bool automaticHeardSpeech = automatic && initialRing && initialRingCapacity > 0 && initialRingCount > 0;
   uint32_t lastRecordOledAtMs = startedAt;
   uint8_t lastRecordProgress = 0;
 
@@ -4942,6 +5374,27 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
     return true;
   };
 
+  if (automaticHeardSpeech) {
+    size_t seedCount = min(initialRingCount, initialRingCapacity);
+    size_t seedIndex = (initialRingWrite + initialRingCapacity - seedCount) % initialRingCapacity;
+    for (size_t i = 0; i < seedCount && framesDone < maxFrames; ++i) {
+      int16_t mono = initialRing[seedIndex];
+      seedIndex = (seedIndex + 1) % initialRingCapacity;
+      uint16_t monoMag = sampleMagnitude(mono);
+      if (monoMag > monoPeak) monoPeak = monoMag;
+      monoSquares += static_cast<uint64_t>(monoMag) * static_cast<uint64_t>(monoMag);
+      if (monoMag >= kVoiceVadActiveThreshold) ++activeSamples;
+      pcmChunk->samples[pcmChunkFrames++] = mono;
+      ++framesDone;
+      if (pcmChunkFrames >= kVoiceStreamChunkFrames && !queueVoiceChunk()) {
+        audioBusy = false;
+        lastAudioDetail = F("voice stream seed send failed");
+        abortVoiceStream(F("seed_send"));
+        return false;
+      }
+    }
+  }
+
   while (framesDone < maxFrames) {
     uint32_t loopNow = millis();
     if (loopNow - startedAt > kVoiceRecordHardTimeoutMs) {
@@ -4950,7 +5403,7 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
                         F(", empty=") + String(emptyReads);
       break;
     }
-    if (framesDone > 0 && loopNow - startedAt > kVoiceRecordMinMs) {
+    if (!automatic && framesDone > 0 && loopNow - startedAt > kVoiceRecordMinMs) {
       if (digitalRead(kPinBoot) != LOW) {
         if (releaseStartedAt == 0) releaseStartedAt = loopNow;
         if (loopNow - releaseStartedAt >= kVoiceStreamReleaseDebounceMs) {
@@ -4965,7 +5418,6 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
     esp_err_t err = i2s_read(kI2sPort, readBuffer, sizeof(readBuffer), &bytesRead, pdMS_TO_TICKS(40));
     if (err != ESP_OK) {
       audioBusy = false;
-      free(pcmChunk);
       lastAudioDetail = String(F("I2S stream read failed err=")) + String(static_cast<int>(err));
       setOledStatus(OledMode::Error, F("I2S"), F("READ FAIL"), 0);
       abortVoiceStream(F("i2s_read"));
@@ -4981,6 +5433,10 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
     int16_t *samples = reinterpret_cast<int16_t *>(readBuffer);
     size_t count = bytesRead / sizeof(int16_t);
     updateVoiceInputChannel(inputChannel, samples, count);
+    uint16_t blockPeak = 0;
+    uint64_t blockSquares = 0;
+    uint32_t blockActiveSamples = 0;
+    uint32_t blockFrames = 0;
     for (size_t i = 0; i + 1 < count && framesDone < maxFrames; i += 2) {
       int16_t left = samples[i];
       int16_t right = samples[i + 1];
@@ -4991,6 +5447,10 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
 
       int16_t mono = voiceInputMonoSample(left, right, inputChannel);
       uint16_t monoMag = sampleMagnitude(mono);
+      if (monoMag > blockPeak) blockPeak = monoMag;
+      blockSquares += static_cast<uint64_t>(monoMag) * static_cast<uint64_t>(monoMag);
+      if (monoMag >= kListeningVadActiveThreshold) ++blockActiveSamples;
+      ++blockFrames;
       if (monoMag > monoPeak) monoPeak = monoMag;
       monoSquares += static_cast<uint64_t>(monoMag) * static_cast<uint64_t>(monoMag);
       if (monoMag >= kVoiceVadActiveThreshold) ++activeSamples;
@@ -4999,10 +5459,26 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
 
       if (pcmChunkFrames >= kVoiceStreamChunkFrames && !queueVoiceChunk()) {
         audioBusy = false;
-        free(pcmChunk);
         lastAudioDetail = F("voice stream chunk send failed");
         abortVoiceStream(F("chunk_send"));
         return false;
+      }
+    }
+
+    if (automatic && blockFrames > 0) {
+      uint32_t blockRms = static_cast<uint32_t>(
+          sqrt(static_cast<double>(blockSquares) / static_cast<double>(blockFrames)));
+      bool blockHasSpeech = blockRms >= kListeningVadRmsStart &&
+                            blockPeak >= kListeningVadPeakStart &&
+                            blockActiveSamples >= min<uint32_t>(kListeningVadMinActiveSamples, blockFrames);
+      if (blockHasSpeech) {
+        automaticHeardSpeech = true;
+        automaticLastSpeechAt = millis();
+      } else if (automaticHeardSpeech &&
+                 millis() - startedAt >= kVoiceRecordMinMs &&
+                 millis() - automaticLastSpeechAt >= kListeningSilenceStopMs) {
+        stopReason = "silence";
+        break;
       }
     }
 
@@ -5018,14 +5494,12 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
 
   if (!queueVoiceChunk()) {
     audioBusy = false;
-    free(pcmChunk);
     lastAudioDetail = F("voice stream final send failed");
     abortVoiceStream(F("final_send"));
     return false;
   }
 
   audioBusy = false;
-  free(pcmChunk);
   if (queuedBytes == 0) {
     lastAudioDetail = String(F("voice stream empty, i2s empty reads=")) + String(emptyReads);
     abortVoiceStream(F("empty"));
@@ -5036,9 +5510,10 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
   voiceRecordPeak = monoPeak;
   voiceRecordRms = framesDone > 0 ? static_cast<uint32_t>(sqrt(static_cast<double>(monoSquares) / framesDone)) : 0;
   voiceRecordActiveSamples = activeSamples;
-  voiceRecordHeardSpeech = voiceRecordRms >= kVoiceVadRmsStart &&
+  voiceRecordHeardSpeech = automaticHeardSpeech ||
+                           (voiceRecordRms >= kVoiceVadRmsStart &&
                             voiceRecordPeak >= kVoiceVadPeakStart &&
-                            voiceRecordActiveSamples >= kVoiceVadMinActiveSamples;
+                            voiceRecordActiveSamples >= kVoiceVadMinActiveSamples);
   lastAudioDetail = String(F("voice adpcm bytes=")) + String(queuedBytes) +
                     F(", pcm bytes=") + String(framesDone * sizeof(int16_t)) +
                     F(", frames=") + String(framesDone) +
@@ -5093,9 +5568,9 @@ void handleVoiceTurnResponse(const String &interactionId, const String &response
     McuAudioSegment segment;
     segment.interactionId = interactionId;
     segment.segmentId = String(F("voice-")) + millis();
-    segment.text = compactDetail(jsonStringValue(response, F("text")));
+    segment.text = jsonStringValue(response, F("text"));
     if (segment.text.length() == 0 && audioPayload.length() > 0) {
-      segment.text = compactDetail(jsonStringValue(audioPayload, F("text")));
+      segment.text = jsonStringValue(audioPayload, F("text"));
     }
     if (segment.text.length() == 0) segment.text = F("语音提示");
     segment.url = audioUrl;
@@ -5181,6 +5656,142 @@ void triggerBootVoiceTurn() {
 
   markMcuInteraction(interactionId, F("transcribing"), F(""));
   broadcastMcuStatus();
+}
+
+void triggerListeningVoiceTurn(size_t preRollCount, size_t preRollWrite) {
+  bool interactionBlocksListening =
+      mcuInteractionActive &&
+      (mcuInteractionStatus != F("completed") ||
+       millis() - mcuInteractionUpdatedAtMs < kListeningAfterCompletionDelayMs);
+  if (!listeningModeEnabled ||
+      !wifiReady || WiFi.status() != WL_CONNECTED ||
+      mcuAuthToken.length() == 0 || activeDeviceUrl.length() == 0 || selectedProfile.length() == 0 ||
+      interactionBlocksListening || mcuAudioPlaying || mcuAudioCount > 0 || audioBusy) {
+    return;
+  }
+
+  String interactionId = String(F("mcu-listen-")) + millis();
+  if (!waitForMcuSocketReady(2000)) {
+    lastAudioDetail = F("auto listen socket unavailable");
+    return;
+  }
+
+  markMcuInteraction(interactionId, F("listening"), F("AUTO"));
+  broadcastMcuStatus();
+  if (!recordAndBroadcastMcuVoiceStream(interactionId,
+                                        true,
+                                        listeningPreRoll,
+                                        kListeningPreRollFrames,
+                                        preRollCount,
+                                        preRollWrite)) {
+    Serial.printf("Auto listen record failed detail=%s heap=%lu\n",
+                  lastAudioDetail.c_str(), static_cast<unsigned long>(ESP.getFreeHeap()));
+    markMcuInteraction(interactionId, F("failed"),
+                       lastAudioDetail.length() > 0 ? lastAudioDetail : String(F("record failed")));
+    broadcastMcuStatus();
+    return;
+  }
+
+  markMcuInteraction(interactionId, F("transcribing"), F(""));
+  broadcastMcuStatus();
+}
+
+void tickListeningMode() {
+  bool interactionBlocksListening =
+      mcuInteractionActive &&
+      (mcuInteractionStatus != F("completed") ||
+       millis() - mcuInteractionUpdatedAtMs < kListeningAfterCompletionDelayMs);
+  bool readyForListening = listeningModeEnabled &&
+                           bootInputArmed &&
+                           digitalRead(kPinBoot) != LOW &&
+                           wifiReady && WiFi.status() == WL_CONNECTED &&
+                           !setupApMode && !restartPending &&
+                           activeDeviceUrl.length() > 0 &&
+                           mcuAuthToken.length() > 0 &&
+                           selectedProfile.length() > 0 &&
+                           mcuSocketNamespaceReady &&
+                           !interactionBlocksListening &&
+                           !mcuAudioPlaying &&
+                           mcuAudioCount == 0 &&
+                           !audioBusy;
+  if (!readyForListening) {
+    resetListeningMonitor();
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - listeningLastTriggeredAtMs < kListeningRetriggerDelayMs) return;
+
+  if (!listeningMonitorReady) {
+    setPowerAmp(false);
+    es8311UpdateBits(0x31, 0x60, 0x60);
+    if (!setI2sSampleRate(kVoiceInputSampleRate)) {
+      resetListeningMonitor();
+      return;
+    }
+    i2s_zero_dma_buffer(kI2sPort);
+    listeningMonitorReady = true;
+    listeningSpeechWindows = 0;
+    listeningQuietWindows = 0;
+    listeningCandidateStartedAtMs = 0;
+    listeningInputChannel = VoiceInputChannel::Undecided;
+  }
+
+  constexpr size_t kReadBytes = 512;
+  uint8_t readBuffer[kReadBytes];
+  size_t bytesRead = 0;
+  esp_err_t err = i2s_read(kI2sPort, readBuffer, sizeof(readBuffer), &bytesRead, 0);
+  if (err != ESP_OK || bytesRead == 0) return;
+
+  int16_t *samples = reinterpret_cast<int16_t *>(readBuffer);
+  size_t sampleCount = bytesRead / sizeof(int16_t);
+  updateVoiceInputChannel(listeningInputChannel, samples, sampleCount);
+  uint16_t peak = 0;
+  uint64_t squares = 0;
+  uint32_t activeSamples = 0;
+  uint32_t frames = 0;
+  for (size_t i = 0; i + 1 < sampleCount; i += 2) {
+    int16_t mono = voiceInputMonoSample(samples[i], samples[i + 1], listeningInputChannel);
+    uint16_t magnitude = sampleMagnitude(mono);
+    if (magnitude > peak) peak = magnitude;
+    squares += static_cast<uint64_t>(magnitude) * static_cast<uint64_t>(magnitude);
+    if (magnitude >= kListeningVadActiveThreshold) ++activeSamples;
+    ++frames;
+    listeningPreRoll[listeningPreRollWrite] = mono;
+    listeningPreRollWrite = (listeningPreRollWrite + 1) % kListeningPreRollFrames;
+    if (listeningPreRollCount < kListeningPreRollFrames) ++listeningPreRollCount;
+  }
+  if (frames == 0) return;
+
+  uint32_t rms = static_cast<uint32_t>(sqrt(static_cast<double>(squares) / static_cast<double>(frames)));
+  bool speechWindow = rms >= kListeningVadRmsStart &&
+                      peak >= kListeningVadPeakStart &&
+                      activeSamples >= min<uint32_t>(kListeningVadMinActiveSamples, frames);
+  if (speechWindow) {
+    if (listeningCandidateStartedAtMs == 0) listeningCandidateStartedAtMs = now;
+    listeningQuietWindows = 0;
+    if (listeningSpeechWindows < UINT8_MAX) ++listeningSpeechWindows;
+  } else if (listeningCandidateStartedAtMs != 0) {
+    if (listeningQuietWindows < kListeningVadMaxQuietWindows) ++listeningQuietWindows;
+    if (listeningQuietWindows >= kListeningVadMaxQuietWindows) {
+      listeningSpeechWindows = 0;
+      listeningQuietWindows = 0;
+      listeningCandidateStartedAtMs = 0;
+      listeningInputChannel = VoiceInputChannel::Undecided;
+    }
+  }
+
+  if (listeningCandidateStartedAtMs == 0 ||
+      now - listeningCandidateStartedAtMs < kListeningVadMinCandidateMs ||
+      listeningSpeechWindows < kListeningVadMinSpeechWindows) {
+    return;
+  }
+  size_t preRollCount = listeningPreRollCount;
+  size_t preRollWrite = listeningPreRollWrite;
+  listeningLastTriggeredAtMs = now;
+  noteMcuActivity();
+  resetListeningMonitor();
+  triggerListeningVoiceTurn(preRollCount, preRollWrite);
 }
 
 void triggerBootRecordPlaybackTest() {
@@ -5303,6 +5914,8 @@ String mcuSocketAuthJson() {
   json += escapeJson(deviceId());
   json += F("\",\"profile\":\"");
   json += escapeJson(selectedProfile);
+  json += F("\",\"agentRuntime\":\"");
+  json += mcuAgentRuntimeValue();
   json += F("\"}");
   return json;
 }
@@ -5317,6 +5930,7 @@ void sendMcuReady() {
   String json = String(F("{\"type\":\"mcu.ready\",\"id\":\"")) + escapeJson(deviceId()) +
                 F("\",\"active_device\":\"") + escapeJson(activeDeviceKey) +
                 F("\",\"profile\":\"") + escapeJson(selectedProfile) +
+                F("\",\"agentRuntime\":\"") + mcuAgentRuntimeValue() +
                 F("\",\"capabilities\":{\"display\":true,\"audio_queue\":true,\"audio_playback\":true,\"pcm_stream\":false}}");
   sendMcuSocketEvent(F("mcu.ready"), json);
   broadcastMcuStatus();
@@ -5389,6 +6003,7 @@ void handleSocketIoText(const String &message) {
   }
   if (message.startsWith(F("40/global-agent"))) {
     mcuSocketNamespaceReady = true;
+    resetMcuSocketReconnect();
     Serial.println(F("Socket.IO namespace /global-agent connected"));
     sendMcuReady();
     return;
@@ -5396,6 +6011,7 @@ void handleSocketIoText(const String &message) {
   if (message.startsWith(F("44/global-agent"))) {
     mcuSocketNamespaceReady = false;
     Serial.printf("Socket.IO namespace error: %s\n", message.c_str());
+    closeMcuSocketTransport(F("namespace error"));
     return;
   }
   if (message.startsWith(F("42"))) {
@@ -5438,6 +6054,24 @@ bool readMcuWsBytes(uint8_t *buffer, size_t length, uint32_t timeoutMs = 100) {
   return read == length;
 }
 
+void resetMcuSocketReconnect() {
+  nextMcuSocketReconnectAtMs = 0;
+  mcuSocketReconnectDelayMs = kMcuSocketReconnectMs;
+}
+
+void scheduleMcuSocketReconnect() {
+  if (!wifiReady || WiFi.status() != WL_CONNECTED ||
+      activeDeviceUrl.length() == 0 || mcuAuthToken.length() == 0 ||
+      mcuSocketReconnectBlocked) {
+    nextMcuSocketReconnectAtMs = 0;
+    return;
+  }
+  uint32_t delayMs = max<uint32_t>(mcuSocketReconnectDelayMs, kMcuSocketReconnectMs);
+  nextMcuSocketReconnectAtMs = millis() + delayMs;
+  mcuSocketReconnectDelayMs = min<uint32_t>(delayMs * 2, kMcuSocketReconnectMaxMs);
+  Serial.printf("Socket.IO reconnect scheduled in %lu ms\n", static_cast<unsigned long>(delayMs));
+}
+
 void closeMcuSocketTransport(const __FlashStringHelper *reason) {
   if (mcuWsClient->connected()) mcuWsClient->stop();
   wsReady = false;
@@ -5449,6 +6083,7 @@ void closeMcuSocketTransport(const __FlashStringHelper *reason) {
     Serial.print(reason);
   }
   Serial.println();
+  scheduleMcuSocketReconnect();
 }
 
 void mcuSocketLoop() {
@@ -5480,8 +6115,14 @@ void mcuSocketLoop() {
     }
     uint8_t mask[4] = {0, 0, 0, 0};
     if (masked && !readMcuWsBytes(mask, 4)) return;
-    std::unique_ptr<uint8_t[]> payload(new uint8_t[static_cast<size_t>(length) + 1]);
-    if (!payload || !readMcuWsBytes(payload.get(), static_cast<size_t>(length), 500)) return;
+    std::unique_ptr<uint8_t[]> payload(new (std::nothrow) uint8_t[static_cast<size_t>(length) + 1]);
+    if (!payload) {
+      Serial.printf("Socket.IO frame allocation failed len=%u heap=%lu\n",
+                    static_cast<unsigned>(length), static_cast<unsigned long>(ESP.getFreeHeap()));
+      closeMcuSocketTransport(F("frame allocation failed"));
+      return;
+    }
+    if (!readMcuWsBytes(payload.get(), static_cast<size_t>(length), 500)) return;
     for (size_t i = 0; masked && i < static_cast<size_t>(length); ++i) payload[i] ^= mask[i & 3];
     payload[static_cast<size_t>(length)] = 0;
 
@@ -5506,6 +6147,23 @@ void disconnectMcuSocketClient() {
   mcuSocketConnected = false;
   mcuSocketNamespaceReady = false;
   mcuSocketTargetKey = "";
+}
+
+void tickMcuSocketReconnect() {
+  if (wsReady || mcuSocketConnected || mcuSocketNamespaceReady) return;
+  if (!wifiReady || WiFi.status() != WL_CONNECTED ||
+      activeDeviceUrl.length() == 0 || mcuAuthToken.length() == 0 ||
+      mcuSocketReconnectBlocked) {
+    nextMcuSocketReconnectAtMs = 0;
+    return;
+  }
+  if (nextMcuSocketReconnectAtMs == 0) {
+    scheduleMcuSocketReconnect();
+    return;
+  }
+  if (static_cast<int32_t>(millis() - nextMcuSocketReconnectAtMs) < 0) return;
+  nextMcuSocketReconnectAtMs = 0;
+  connectMcuSocketClient();
 }
 
 String activeMcuSocketUrl() {
@@ -5534,9 +6192,11 @@ bool mcuSocketMatchesActiveTarget() {
 void connectMcuSocketClient() {
   if (!wifiReady || WiFi.status() != WL_CONNECTED || activeDeviceUrl.length() == 0 || mcuAuthToken.length() == 0) {
     disconnectMcuSocketClient();
+    resetMcuSocketReconnect();
     return;
   }
   if (mcuSocketReconnectBlocked && mcuSocketRelayUrl.length() > 0) {
+    nextMcuSocketReconnectAtMs = 0;
     Serial.println(F("Socket.IO reconnect blocked after relay replacement"));
     return;
   }
@@ -5548,6 +6208,7 @@ void connectMcuSocketClient() {
   String socketUrl = activeMcuSocketUrl();
   if (!parseAudioUrl(socketUrl, &scheme, &host, &port, &path)) {
     disconnectMcuSocketClient();
+    scheduleMcuSocketReconnect();
     return;
   }
 
@@ -5557,6 +6218,7 @@ void connectMcuSocketClient() {
 
   if (scheme != F("http") && scheme != F("https")) {
     Serial.printf("Socket.IO client unsupported scheme=%s\n", scheme.c_str());
+    scheduleMcuSocketReconnect();
     return;
   }
 
@@ -5569,6 +6231,7 @@ void connectMcuSocketClient() {
   mcuWsClient->setTimeout(5);
   if (!mcuWsClient->connect(host.c_str(), port, 5000)) {
     Serial.printf("Socket.IO tcp connect failed host=%s port=%u\n", host.c_str(), port);
+    scheduleMcuSocketReconnect();
     return;
   }
   mcuWsClient->setNoDelay(true);
@@ -5585,7 +6248,7 @@ void connectMcuSocketClient() {
   request += port;
   request += F("\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ");
   request += key;
-  request += F("\r\nUser-Agent: HStudio-ESP32C3\r\n\r\n");
+  request += F("\r\nUser-Agent: Ekko Studio-ESP32C3\r\n\r\n");
   mcuWsClient->print(request);
 
   String statusLine = mcuWsClient->readStringUntil('\n');
@@ -5593,6 +6256,7 @@ void connectMcuSocketClient() {
   if (!statusLine.startsWith(F("HTTP/1.1 101")) && !statusLine.startsWith(F("HTTP/1.0 101"))) {
     Serial.printf("Socket.IO websocket upgrade failed: %s\n", statusLine.c_str());
     mcuWsClient->stop();
+    scheduleMcuSocketReconnect();
     return;
   }
   uint32_t headerStartedAt = millis();
@@ -5606,6 +6270,7 @@ void connectMcuSocketClient() {
   mcuSocketNamespaceReady = false;
   mcuSocketTargetKey = targetKey;
   lastMcuSocketConnectAtMs = millis();
+  nextMcuSocketReconnectAtMs = 0;
   Serial.printf("Socket.IO client connecting host=%s port=%u profile=%s relay=%d\n",
                 host.c_str(), port, selectedProfile.c_str(), mcuSocketRelayUrl.length() > 0 ? 1 : 0);
   mcuSocketLoop();
@@ -5614,7 +6279,7 @@ void connectMcuSocketClient() {
 void sendConnectSuccessPage(const String &ssid, const IPAddress &ip) {
   String target = deviceUrl(ip);
   String html = pageStart(F("Wi-Fi 已连接"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>Wi-Fi 已连接</h1>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>Wi-Fi 已连接</h1>");
   html += F("<p class='lead ok'>");
   html += escapeHtml(ssid);
   html += F(" · IP ");
@@ -5634,7 +6299,7 @@ void sendConnectSuccessPage(const String &ssid, const IPAddress &ip) {
 
 void sendConnectFailedPage(const String &ssid) {
   String html = pageStart(F("Wi-Fi 连接失败"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>Wi-Fi 连接失败</h1>");
+  html += F("<section class='panel'><p class='meta'>Ekko Studio ESP32-C3</p><h1>Wi-Fi 连接失败</h1>");
   html += F("<p class='lead bad'>没有连上 ");
   html += escapeHtml(ssid);
   html += F("。请检查 SSID 和密码后重试。</p>");
@@ -5706,7 +6371,7 @@ void startSetupAp(bool refreshScan);
 void clearWifi() {
   setOledStatus(OledMode::Think, F("WIFI"), F("SETUP"), 40);
   server.send(200, F("text/html; charset=utf-8"),
-              F("<!doctype html><meta charset='utf-8'><p>设备正在进入配网模式，请连接 HStudio-WIFI 热点。</p>"));
+              F("<!doctype html><meta charset='utf-8'><p>设备正在进入配网模式，请连接 Ekko Studio-WIFI 热点。</p>"));
   delay(300);
   startSetupAp(true);
 }
@@ -5808,6 +6473,8 @@ void handleHealth() {
   json += idlePowerSaveActive ? F("true") : F("false");
   json += F(",\"power_save_minutes\":");
   json += idlePowerSaveMinutes;
+  json += F(",\"listening_mode\":");
+  json += listeningModeEnabled ? F("true") : F("false");
   json += F("},\"audio\":{\"i2s_ready\":");
   json += i2sReady ? F("true") : F("false");
   json += F(",\"es8311_ready\":");
@@ -5891,6 +6558,8 @@ void setupRoutes() {
   server.on(F("/device"), HTTP_GET, scanAndSendStatusPage);
   server.on(F("/device/scan"), HTTP_GET, scanAndSendStatusPage);
   server.on(F("/device/audio"), HTTP_POST, handleDeviceAudio);
+  server.on(F("/device/agent"), HTTP_POST, handleDeviceAgent);
+  server.on(F("/device/voice-mode"), HTTP_POST, handleDeviceVoiceMode);
   server.on(F("/device/power-save"), HTTP_POST, handleDevicePowerSave);
   server.on(F("/device/manual"), HTTP_POST, addManualDevice);
   server.on(F("/device/login"), HTTP_GET, sendMcuLoginPage);
@@ -5916,12 +6585,12 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println();
-  Serial.println(F("HStudio WiFi setup firmware boot"));
+  Serial.println(F("Ekko Studio WiFi setup firmware boot"));
   Serial.printf("Reset reason=%d free_heap=%lu min_free_heap=%lu\n",
                 static_cast<int>(esp_reset_reason()),
                 static_cast<unsigned long>(ESP.getFreeHeap()),
                 static_cast<unsigned long>(ESP.getMinFreeHeap()));
-  esp_rom_printf("HStudio WiFi setup firmware boot\n");
+  esp_rom_printf("Ekko Studio WiFi setup firmware boot\n");
   pinMode(kPinBatteryAdc, INPUT);
   analogSetPinAttenuation(kPinBatteryAdc, ADC_11db);
   updateBatteryReading(true);
@@ -5959,9 +6628,12 @@ void loop() {
 
   server.handleClient();
   if (wsReady) mcuSocketLoop();
+  tickMcuReauth();
+  tickMcuSocketReconnect();
   tickMcuInteraction();
   tickOledStatusReturn();
   handleBootButton();
+  tickListeningMode();
   tickIdlePowerSave();
   refreshOled();
   if (kAutoOtaEnabled && static_cast<int32_t>(millis() - nextMcuOtaCheckAtMs) >= 0) {

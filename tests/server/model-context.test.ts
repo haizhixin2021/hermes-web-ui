@@ -32,14 +32,14 @@ async function loadModelContext() {
     homedir: () => homeDir,
   }))
   // Mock getDb to return null to avoid "database is locked" errors in parallel tests
-  vi.doMock('../../packages/server/src/db/index', async () => {
-    const actual = await vi.importActual<typeof import('../../packages/server/src/db/index')>('../../packages/server/src/db/index')
+  vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', async () => {
+    const actual = await vi.importActual<typeof import('../../packages/server/src/modules/studio/infrastructure/database/index')>('../../packages/server/src/modules/studio/infrastructure/database/index')
     return {
       ...actual,
       getDb: () => null,
     }
   })
-  return import('../../packages/server/src/services/hermes/model-context')
+  return import('../../packages/server/src/modules/hermes/services/models/context')
 }
 
 describe('getModelContextLength', () => {
@@ -72,6 +72,14 @@ describe('getModelContextLength', () => {
     const { getModelContextLength } = await loadModelContext()
 
     expect(getModelContextLength()).toBe(256_000)
+  })
+
+  it('uses a caller-provided fallback only when no model context is configured', async () => {
+    writeConfig(`model:\n  default: grok-4.6\n  provider: custom:grok\n`)
+
+    const { getModelContextLength } = await loadModelContext()
+
+    expect(getModelContextLength({ provider: 'custom:grok', model: 'grok-4.6', fallbackContextLength: 128_000 })).toBe(128_000)
   })
 
   it('does not scan other providers when the configured provider exists without that model', async () => {

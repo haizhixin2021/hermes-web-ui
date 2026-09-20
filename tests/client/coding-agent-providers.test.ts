@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+  isKeylessModelProvider,
   canScopedCodingAgentUseProvider,
   isAuthModelProvider,
   usesServerManagedProviderAuth,
 } from '../../packages/client/src/utils/codingAgentProviders'
 
 describe('coding agent provider visibility', () => {
-  it.each(['nous', 'openai-codex', 'copilot', 'xai-oauth', 'qwen-oauth', 'claude-oauth'])(
-    'exposes %s to scoped Ekko Agent sessions',
+  it.each(['nous', 'openai-codex', 'copilot', 'xai-oauth', 'qwen-oauth', 'claude-oauth', 'minimax-oauth'])(
+    'exposes %s to scoped Ekko sessions',
     (provider) => {
       expect(isAuthModelProvider(provider)).toBe(true)
       expect(canScopedCodingAgentUseProvider('ekko-agent', provider)).toBe(true)
@@ -24,4 +25,12 @@ describe('coding agent provider visibility', () => {
       expect(canScopedCodingAgentUseProvider(agentId, 'deepseek')).toBe(true)
     },
   )
+})
+
+
+it('requires no key only for the native OpenCode Free provider', () => {
+  expect(isKeylessModelProvider('opencode-free')).toBe(true)
+  for (const provider of ['opencode-zen', 'custom:opencode-free', 'openai-api', undefined]) {
+    expect(isKeylessModelProvider(provider)).toBe(false)
+  }
 })

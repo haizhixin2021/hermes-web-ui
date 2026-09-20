@@ -28,7 +28,7 @@ vi.mock('fs', () => ({
   readFileSync: mockReadFileSync,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/profiles/profile', () => ({
   getActiveEnvPath: () => '/fake/home/.hermes/.env',
   getActiveAuthPath: () => '/fake/home/.hermes/auth.json',
   getActiveProfileName: () => 'default',
@@ -36,37 +36,42 @@ vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
   listProfileNamesFromDisk: mockListProfileNamesFromDisk,
 }))
 
-vi.mock('../../packages/server/src/db/hermes/users-store', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/users', () => ({
   listUserProfiles: mockListUserProfiles,
 }))
 
-vi.mock('../../packages/server/src/services/config-helpers', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => ({
   readConfigYaml: mockReadConfigYaml,
   readConfigYamlForProfile: mockReadConfigYamlForProfile,
   writeConfigYaml: vi.fn(),
-  fetchProviderModels: mockFetchProviderModels,
   buildModelGroups: mockBuildModelGroups,
   PROVIDER_ENV_MAP: {
     'fun-codex': { api_key_env: '', base_url_env: '' },
     deepseek: { api_key_env: 'DEEPSEEK_API_KEY', base_url_env: 'DEEPSEEK_BASE_URL' },
     lmstudio: { api_key_env: 'LM_API_KEY', base_url_env: 'LM_BASE_URL' },
     'xai-oauth': { api_key_env: '', base_url_env: '' },
+    'minimax-oauth': { api_key_env: '', base_url_env: '' },
     openrouter: {},
     copilot: { api_key_env: 'GITHUB_TOKEN', base_url_env: '' },
   },
 }))
 
-vi.mock('../../packages/server/src/shared/providers', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/provider-catalog', () => ({
+  fetchProviderModels: mockFetchProviderModels,
+}))
+
+vi.mock('../../packages/server/src/modules/studio/contracts/providers', () => ({
   buildProviderModelMap: () => ({
     deepseek: ['deepseek-chat', 'deepseek-reasoner'],
     'xai-oauth': ['grok-4.3', 'grok-4.20-0309-reasoning'],
+    'minimax-oauth': ['MiniMax-M3', 'MiniMax-M2.7'],
     openrouter: ['openrouter/auto'],
   }),
   PROVIDER_PRESETS: [
     {
       value: 'fun-codex',
-      label: 'Codex-apikey.fun',
-      base_url: 'https://api.apikey.fun/v1',
+      label: 'Codex-apikey.fan',
+      base_url: 'https://api.apikey.fan/v1',
       models: ['gpt-5.5', 'gpt-5.4'],
       builtin: true,
     },
@@ -99,6 +104,14 @@ vi.mock('../../packages/server/src/shared/providers', () => ({
       builtin: true,
     },
     {
+      value: 'minimax-oauth',
+      label: 'MiniMax Coding Plan (OAuth)',
+      base_url: 'https://api.minimax.io/anthropic',
+      api_mode: 'anthropic_messages',
+      models: ['MiniMax-M3', 'MiniMax-M2.7'],
+      builtin: true,
+    },
+    {
       value: 'copilot',
       label: 'GitHub Copilot',
       base_url: 'https://api.githubcopilot.com',
@@ -108,19 +121,19 @@ vi.mock('../../packages/server/src/shared/providers', () => ({
   ],
 }))
 
-vi.mock('../../packages/server/src/services/hermes/copilot-models', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/providers/copilot-models', () => ({
   getCopilotModelsDetailed: mockGetCopilotModelsDetailed,
   resolveCopilotOAuthToken: vi.fn(async () => ''),
 }))
 
-vi.mock('../../packages/server/src/services/app-config', () => ({
+vi.mock('../../packages/server/src/modules/studio/public/app-config', () => ({
   readAppConfig: mockReadAppConfig,
   writeAppConfig: mockWriteAppConfig,
   providerDisplayLabel: (appConfig: any, profile: string, providerId: string, fallback: string) =>
     appConfig?.providerLabels?.[profile]?.[providerId]?.trim?.() || fallback,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/model-catalog-cache', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/providers/model-catalog-cache', () => ({
   readProviderModelCatalogCache: mockReadProviderModelCatalogCache,
   resolveProviderCatalogModels: mockResolveProviderCatalogModels,
   resolveProviderCatalogEntry: vi.fn(() => undefined),
@@ -128,19 +141,16 @@ vi.mock('../../packages/server/src/services/hermes/model-catalog-cache', () => (
   writeProviderModelCatalogEntry: mockWriteProviderModelCatalogEntry,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/provider-model-refresh', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/providers/provider-model-refresh', () => ({
   providerModelRefreshCapabilities: () => ({ refreshable: true }),
 }))
 
-vi.mock('../../packages/server/src/db', () => ({
-  getDb: vi.fn(),
+vi.mock('../../packages/server/src/modules/studio/public/provider-context', () => ({
+  readModelContextRecord: vi.fn(),
+  upsertModelContextRecord: vi.fn(),
 }))
 
-vi.mock('../../packages/server/src/db/hermes/schemas', () => ({
-  MODEL_CONTEXT_TABLE: 'model_context',
-}))
-
-import * as ctrl from '../../packages/server/src/controllers/hermes/models'
+import * as ctrl from '../../packages/server/src/modules/hermes/controllers/models'
 
 function makeCtx(body: Record<string, unknown> = {}): any {
   return { params: {}, query: {}, request: { body }, body: undefined, status: 200 }
@@ -584,6 +594,58 @@ describe('models controller — model visibility', () => {
         models: ['grok-4.3', 'grok-4.20-0309-reasoning'],
       }),
     ]))
+  })
+
+  it.each([
+    ['global', 'https://api.minimax.io/anthropic'],
+    ['China', 'https://api.minimaxi.com/anthropic'],
+  ])('uses the authorized MiniMax %s region URL to read the refreshed model cache', async (_region, baseUrl) => {
+    mockReadFile.mockResolvedValue('')
+    mockReadConfigYamlForProfile.mockResolvedValue({
+      model: { default: 'MiniMax-M3', provider: 'minimax-oauth' },
+    })
+    mockExistsSync.mockReturnValue(true)
+    mockReadFileSync.mockReturnValue(JSON.stringify({
+      providers: {
+        'minimax-oauth': {
+          access_token: 'minimax-token',
+          inference_base_url: baseUrl,
+        },
+      },
+    }))
+    mockReadProviderModelCatalogCache.mockResolvedValue({
+      version: 1,
+      updated_at: '2026-08-03T09:38:34.855Z',
+      providers: {
+        [modelCatalogKey('minimax-oauth', baseUrl)]: {
+          provider: 'minimax-oauth',
+          label: 'MiniMax Coding Plan (OAuth)',
+          base_url: baseUrl,
+          models: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.5'],
+          source: 'live',
+          updated_at: '2026-08-03T09:38:34.855Z',
+        },
+      },
+    })
+
+    const ctx = makeCtx()
+    ctx.query = { profile: 'default' }
+    await ctrl.getAvailable(ctx)
+
+    expect(ctx.body.groups).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        provider: 'minimax-oauth',
+        base_url: baseUrl,
+        models: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.5'],
+      }),
+    ]))
+    expect(mockResolveProviderCatalogModels).toHaveBeenCalledWith(
+      expect.anything(),
+      'minimax-oauth',
+      baseUrl,
+      expect.any(Array),
+      expect.objectContaining({ profile: 'default' }),
+    )
   })
 
   it('marks allProviders with base URL env support for editable preset URLs', async () => {

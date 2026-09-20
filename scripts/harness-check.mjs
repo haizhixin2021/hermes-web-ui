@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
 import path from 'node:path'
+import { checkServerModuleBoundaries } from './server-module-boundaries.mjs'
+import { hasManagedMcpNodeMode } from './managed-mcp-harness.mjs'
+import { checkDshModuleBoundaries } from './dsh-module-harness.mjs'
 
 const root = process.cwd()
 const failures = []
+failures.push(...await checkDshModuleBoundaries(root))
 
 function fail(message) {
   failures.push(message)
@@ -27,77 +30,6 @@ function requireDir(relativePath) {
   }
 }
 
-function gitLines(args) {
-  try {
-    return execFileSync('git', args, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(Boolean)
-  } catch {
-    return []
-  }
-}
-
-function changedFilesFromGit() {
-  const files = new Set()
-
-  for (const file of gitLines(['diff', '--name-only'])) files.add(file)
-  for (const file of gitLines(['diff', '--name-only', '--cached'])) files.add(file)
-  for (const file of gitLines(['ls-files', '--others', '--exclude-standard'])) files.add(file)
-
-  const baseRef = process.env.GITHUB_BASE_REF
-  if (baseRef) {
-    const baseCandidates = [`origin/${baseRef}`, baseRef]
-    let foundPrBase = false
-    for (const base of baseCandidates) {
-      const diff = gitLines(['diff', '--name-only', `${base}...HEAD`])
-      if (diff.length > 0) {
-        foundPrBase = true
-        for (const file of diff) files.add(file)
-        break
-      }
-    }
-    if (process.env.GITHUB_ACTIONS === 'true' && !foundPrBase && files.size === 0) {
-      fail(`Unable to inspect PR diff against ${baseRef}; build checkout must fetch full history`)
-    }
-  } else {
-    const upstream = gitLines(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])[0]
-    if (upstream) {
-      for (const file of gitLines(['diff', '--name-only', `${upstream}...HEAD`])) files.add(file)
-    }
-  }
-
-  return [...files].sort()
-}
-
-function isChatSessionChainFile(file) {
-  return file === 'packages/client/src/api/hermes/chat.ts'
-    || file === 'packages/client/src/api/hermes/group-chat.ts'
-    || file === 'packages/client/src/api/hermes/sessions.ts'
-    || file === 'packages/client/src/stores/hermes/group-chat.ts'
-    || file === 'packages/client/src/stores/hermes/chat.ts'
-    || file === 'packages/server/src/controllers/hermes/sessions.ts'
-    || file === 'packages/server/src/db/hermes/session-store.ts'
-    || file === 'packages/server/src/routes/hermes/group-chat.ts'
-    || file.startsWith('packages/client/src/components/hermes/group-chat/')
-    || file.startsWith('packages/client/src/components/hermes/chat/')
-    || file.startsWith('packages/server/src/lib/context-compressor/')
-    || file.startsWith('packages/server/src/services/hermes/context-engine/')
-    || file.startsWith('packages/server/src/services/hermes/group-chat/')
-    || file.startsWith('packages/server/src/services/hermes/run-chat/')
-    || file.startsWith('packages/server/src/services/hermes/agent-bridge/')
-}
-
-function isChatChainChangeFragment(file) {
-  return file.startsWith('docs/chat-chain-changes/')
-    && file.endsWith('.md')
-    && path.basename(file) !== 'README.md'
-}
-
 for (const file of [
   'AGENTS.md',
   'ARCHITECTURE.md',
@@ -106,7 +38,7 @@ for (const file of [
   'docs/harness/validation.md',
   'docs/harness/worktree-runbook.md',
   'docs/harness/pr-review.md',
-  'docs/chat-chain-changes/README.md',
+  'docs/harness/server-module-boundaries.md',
 ]) {
   requireFile(file)
 }
@@ -120,7 +52,6 @@ for (const dir of [
   'tests/server',
   'tests/e2e',
   '.github/workflows',
-  'docs/chat-chain-changes',
 ]) {
   requireDir(dir)
 }
@@ -189,57 +120,18 @@ const buildWorkflow = await readText('.github/workflows/build.yml')
 if (!buildWorkflow.includes('npm run harness:check')) {
   fail('Build workflow must run npm run harness:check')
 }
-if (!buildWorkflow.includes('fetch-depth: 0')) {
-  fail('Build workflow checkout must use fetch-depth: 0 so harness:check can inspect PR diffs')
+
+for (const failure of await checkServerModuleBoundaries(root)) {
+  fail(failure)
 }
 
-const chatSessionsDoc = await readText('docs/cli-chat-sessions.md')
-for (const phrase of [
-  '最后重建时间',
-  '维护要求',
-  '最近链路变更记录',
-  'docs/chat-chain-changes/',
-  '每个 PR 一个变更片段',
-  'packages/server/src/services/hermes/agent-bridge/',
-  'packages/server/src/services/hermes/group-chat/',
-  'packages/server/src/lib/context-compressor/',
-  '任何改动都算 Chat 链路改动',
+for (const [file, factory] of [
+  ['packages/server/src/modules/hermes/services/mcp/studio-autoinject.ts', 'managedConfig'],
+  ['packages/server/src/modules/ekko/services/mcp.ts', 'managedMcpServerConfig'],
+  ['packages/server/src/modules/coding-agents/services/index.ts', 'hermesMcpServerConfig'],
 ]) {
-  if (!chatSessionsDoc.includes(phrase)) {
-    fail(`docs/cli-chat-sessions.md must document chat chain maintenance rule: ${phrase}`)
-  }
-}
-
-const changedFiles = changedFilesFromGit()
-const changedChatChainFiles = changedFiles.filter(
-  file => !isChatChainChangeFragment(file)
-    && file !== 'docs/chat-chain-changes/README.md'
-    && file !== 'docs/cli-chat-sessions.md'
-    && isChatSessionChainFile(file),
-)
-const changedChatChainFragments = changedFiles.filter(isChatChainChangeFragment)
-if (changedChatChainFiles.length > 0 && changedChatChainFragments.length === 0) {
-  fail(
-    [
-      'Chat session chain changed without adding a docs/chat-chain-changes/*.md fragment.',
-      'Add one fragment with date, PR/commit, touched feature, and behavior impact.',
-      `Changed chain files: ${changedChatChainFiles.join(', ')}`,
-    ].join(' '),
-  )
-}
-for (const file of changedChatChainFragments) {
-  if (!existsSync(path.join(root, file))) {
-    fail(`Chat chain change fragment was removed instead of added/updated: ${file}`)
-    continue
-  }
-  const fragment = await readText(file)
-  for (const marker of ['date:', 'feature:', 'impact:']) {
-    if (!fragment.includes(marker)) {
-      fail(`Chat chain change fragment ${file} must include frontmatter field: ${marker}`)
-    }
-  }
-  if (!fragment.includes('pr:') && !fragment.includes('commit:')) {
-    fail(`Chat chain change fragment ${file} must include either pr: or commit:`)
+  if (!hasManagedMcpNodeMode(await readText(file), factory)) {
+    fail(`${file}: ${factory} must inject ELECTRON_RUN_AS_NODE: '1' into every managed MCP env; Electron fallback must not launch the desktop GUI`)
   }
 }
 
@@ -253,8 +145,12 @@ const electronBuilderConfig = await readText('packages/desktop/electron-builder.
 const desktopMacEntitlements = await readText('packages/desktop/build/entitlements.mac.plist')
 const desktopMacInheritedEntitlements = await readText('packages/desktop/build/entitlements.mac.inherit.plist')
 const desktopPackageJson = await readText('packages/desktop/package.json')
+const desktopNodeRuntimeConfig = await readText('packages/desktop/scripts/node-runtime-config.mjs')
+const desktopFetchNode = await readText('packages/desktop/scripts/fetch-node.mjs')
+const desktopFetchPython = await readText('packages/desktop/scripts/fetch-python.mjs')
+const desktopFetchHermes = await readText('packages/desktop/scripts/fetch-hermes.mjs')
 const desktopInstallHermes = await readText('packages/desktop/scripts/install-hermes.mjs')
-const desktopHermesPatches = await readText('packages/desktop/scripts/apply-hermes-patches.mjs')
+const desktopPackageRuntime = await readText('packages/desktop/scripts/package-runtime.mjs')
 const desktopWebuiServer = await readText('packages/desktop/src/main/webui-server.ts')
 const desktopMain = await readText('packages/desktop/src/main/index.ts')
 const desktopUpdater = await readText('packages/desktop/src/main/updater.ts')
@@ -381,12 +277,28 @@ for (const phrase of [
 for (const phrase of [
   '"fetch:node"',
   '"fetch:git"',
+  '"fetch:hermes"',
   '"prepare:runtime"',
   '"package:runtime"',
   '"runtime:asset-name"',
 ]) {
   if (!desktopPackageJson.includes(phrase)) {
     fail(`packages/desktop/package.json must support runtime package publishing: ${phrase}`)
+  }
+}
+
+if (!desktopNodeRuntimeConfig.includes("DEFAULT_DESKTOP_NODE_VERSION = '22.22.0'")) {
+  fail('desktop runtime Node.js must stay pinned to the Hermes-compatible 22.22.0 release')
+}
+if (!desktopNodeRuntimeConfig.includes('HERMES_DESKTOP_NODE_VERSION')) {
+  fail('desktop runtime Node.js pin must keep an explicit environment override')
+}
+if (!desktopFetchNode.includes('desktopNodeVersion()')) {
+  fail('fetch-node.mjs must resolve the pinned desktop runtime Node.js version')
+}
+for (const inheritedVersion of ['process.env.NODE_VERSION', 'process.versions.node']) {
+  if (desktopFetchNode.includes(inheritedVersion)) {
+    fail(`fetch-node.mjs must not inherit the build runner Node.js version: ${inheritedVersion}`)
   }
 }
 
@@ -415,7 +327,9 @@ for (const phrase of [
   'AGENT_BROWSER_EXECUTABLE_PATH',
   'PLAYWRIGHT_BROWSERS_PATH',
   'ms-playwright',
-  'removeBrokenDashboardAuthPlugin',
+  '--no-config',
+  '--require-hashes',
+  'editable_mode=compat',
 ]) {
   if (!desktopInstallHermes.includes(phrase)) {
     fail(`install-hermes.mjs must bundle Hermes browser runtime support: ${phrase}`)
@@ -423,17 +337,44 @@ for (const phrase of [
 }
 
 for (const phrase of [
-  'from pathlib import Path',
-  'browser stdout decode fallback is incomplete',
-  'def _hermes_read_browser_output',
-  'dingtalk AI Card webhook patches are incomplete',
-  "plugins', 'platforms', 'dingtalk', 'adapter.py",
-  "gateway', 'platforms', 'dingtalk.py",
-  'sitecustomize hidden subprocess patch marker exists',
-  'python compile check',
+  "git', ['fetch', '--depth', '1', 'origin', source.ref]",
+  "git', ['rev-parse', 'FETCH_HEAD^{commit}']",
+  "git', ['checkout', '-B', 'main', fetchedCommit]",
+  'Hermes source commit mismatch',
+  "git', ['status', '--porcelain']",
+  "resolve(SOURCE_DIR, '.git', 'info', 'exclude')",
+  "'/base/'",
 ]) {
-  if (!desktopHermesPatches.includes(phrase)) {
-    fail(`apply-hermes-patches.mjs must keep browser stdout fallback complete: ${phrase}`)
+  if (!desktopFetchHermes.includes(phrase)) {
+    fail(`fetch-hermes.mjs must retain a clean, updateable source checkout: ${phrase}`)
+  }
+}
+
+if (desktopPackageJson.includes('"patch:hermes"')) {
+  fail('packages/desktop/package.json must not mutate the retained Hermes source checkout')
+}
+
+for (const phrase of [
+  "resolve(OUT_DIR, '.python-base-staging')",
+  "'--relocatable'",
+  'configWithPythonHome',
+  'bundledBaseHomePath',
+  "resolve(OUT_DIR, 'base')",
+]) {
+  if (!desktopFetchPython.includes(phrase)) {
+    fail(`fetch-python.mjs must build a relocatable Windows PEP 405 venv: ${phrase}`)
+  }
+}
+
+for (const phrase of [
+  'schema: 2',
+  "installMethod: 'git'",
+  "cpSync(PY_DIR, join(stage, 'python')",
+  'Relocated Hermes version mismatch',
+  "git', ['status', '--porcelain']",
+]) {
+  if (!desktopPackageRuntime.includes(phrase)) {
+    fail(`package-runtime.mjs must publish and relocate-check the Hermes Git source: ${phrase}`)
   }
 }
 
@@ -471,7 +412,7 @@ for (const phrase of [
   'Stop-Process -Id',
 ]) {
   if (!desktopInstallerScript.includes(phrase)) {
-    fail(`desktop installer must close stale Hermes Studio processes by installed executable path: ${phrase}`)
+    fail(`desktop installer must close stale Ekko Studio processes by installed executable path: ${phrase}`)
   }
 }
 
@@ -493,6 +434,8 @@ for (const phrase of [
   'HERMES_DESKTOP_RUNTIME_URL',
   'HERMES_DESKTOP_RUNTIME_BASE_URL',
   'runtime-manifest.json',
+  'updateable Hermes source files',
+  'repairMovedHermesRuntime',
 ]) {
   if (!desktopRuntimeManager.includes(phrase)) {
     fail(`desktop runtime manager must support downloadable runtime packages: ${phrase}`)

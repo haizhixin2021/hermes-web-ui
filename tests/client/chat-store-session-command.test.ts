@@ -6,7 +6,8 @@ const chatApi = vi.hoisted(() => ({
   startRunViaSocket: vi.fn(),
   registerSessionHandlers: vi.fn(),
   unregisterSessionHandlers: vi.fn(),
-  getChatRunSocket: vi.fn(() => ({ emit: vi.fn() })),
+  socketEmit: vi.fn(),
+  getChatRunSocket: vi.fn(() => ({ emit: chatApi.socketEmit })),
   resumeSession: vi.fn((sessionId: string, onResumed: (data: any) => void) => {
     onResumed({ session_id: sessionId, messages: [], isWorking: false, events: [], queueLength: 0 })
     return {} as any
@@ -17,7 +18,7 @@ const chatApi = vi.hoisted(() => ({
   sessionWorkspaceUpdatedHandlers: [] as Array<(event: any) => void>,
 }))
 
-vi.mock('@/api/hermes/chat', () => ({
+vi.mock('@/api/studio/chat', () => ({
   startRunViaSocket: chatApi.startRunViaSocket,
   resumeSession: chatApi.resumeSession,
   registerSessionHandlers: chatApi.registerSessionHandlers,
@@ -41,6 +42,7 @@ vi.mock('@/api/hermes/chat', () => ({
     chatApi.sessionWorkspaceUpdatedHandlers.push(handler)
     return vi.fn()
   }),
+  onSessionSettingsUpdated: vi.fn(() => vi.fn()),
 }))
 
 vi.mock('@/api/client', () => ({
@@ -48,7 +50,7 @@ vi.mock('@/api/client', () => ({
   hasApiKey: () => false,
 }))
 
-vi.mock('@/api/hermes/sessions', () => ({
+vi.mock('@/api/studio/sessions', () => ({
   archiveSession: vi.fn(),
   deleteSession: vi.fn(),
   fetchSession: vi.fn(),
@@ -58,7 +60,7 @@ vi.mock('@/api/hermes/sessions', () => ({
   setSessionModel: vi.fn(),
 }))
 
-vi.mock('@/api/hermes/download', () => ({
+vi.mock('@/api/studio/download', () => ({
   getDownloadUrl: (_path: string, name: string) => `/download/${name}`,
 }))
 
@@ -120,6 +122,94 @@ describe('chat store session.command fanout', () => {
         commandAction: 'resume',
       }),
     ])
+  })
+
+  it('requests insertion for a queued message and mirrors boundary or immediate server state', () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.source = 'cli'
+    session.agent = 'hermes'
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    chatApi.sessionCommandHandlers[0]({
+      event: 'session.command',
+      session_id: 'session-1',
+      command: 'goal',
+      action: 'resume',
+      started: true,
+      terminal: false,
+    })
+    const handlers = chatApi.registerSessionHandlers.mock.calls.at(-1)?.[1]
+    handlers.onRunQueued({
+      event: 'run.queued',
+      session_id: 'session-1',
+      queue_length: 1,
+      queued_messages: [
+        { id: 'queue-follow-up', role: 'user', content: 'follow up', timestamp: 2, queued: true },
+      ],
+    })
+
+    store.insertQueuedMessage('session-1', 'queue-follow-up')
+    expect(chatApi.socketEmit).toHaveBeenCalledWith('insert_queued_run', {
+      session_id: 'session-1',
+      queue_id: 'queue-follow-up',
+    })
+
+    handlers.onQueueInsertionUpdated({
+      event: 'run.queue_insertion.updated',
+      session_id: 'session-1',
+      generation: 'generation-1',
+      run_id: 'run-1',
+      queue_id: 'queue-follow-up',
+      runtime: 'hermes',
+      phase: 'waiting_for_tool_batch',
+      guarantee: 'strict',
+      requested_at: 123,
+    })
+    expect(store.queueInsertionStates.get('session-1')).toEqual({
+      generation: 'generation-1',
+      runId: 'run-1',
+      queueId: 'queue-follow-up',
+      runtime: 'hermes',
+      phase: 'waiting_for_tool_batch',
+      guarantee: 'strict',
+      requestedAt: 123,
+    })
+
+    handlers.onQueueInsertionUpdated({
+      event: 'run.queue_insertion.updated',
+      session_id: 'session-1',
+      generation: 'generation-1',
+      run_id: 'run-1',
+      queue_id: 'queue-follow-up',
+      runtime: 'codex',
+      phase: 'stopping_current_turn',
+      guarantee: 'immediate',
+      requested_at: 124,
+    })
+    expect(store.queueInsertionStates.get('session-1')).toEqual({
+      generation: 'generation-1',
+      runId: 'run-1',
+      queueId: 'queue-follow-up',
+      runtime: 'codex',
+      phase: 'stopping_current_turn',
+      guarantee: 'immediate',
+      requestedAt: 124,
+    })
+
+    handlers.onQueueInsertionUpdated({
+      event: 'run.queue_insertion.updated',
+      session_id: 'session-1',
+      generation: 'generation-1',
+      queue_id: 'queue-follow-up',
+      runtime: 'codex',
+      phase: 'starting_queued_message',
+      guarantee: 'immediate',
+      requested_at: 123,
+    })
+    expect(store.queueInsertionStates.get('session-1')).toBeUndefined()
   })
 
   it('does not clear the transcript for goal done commands', () => {
@@ -379,6 +469,43 @@ describe('chat store session.command fanout', () => {
     ])
   })
 
+  it('adds an explicitly non-queued peer user message after another window starts the run', () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.source = 'coding_agent'
+    session.agent = 'codex'
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+
+    chatApi.sessionCommandHandlers.forEach(handler => handler({
+      event: 'session.command',
+      session_id: 'session-1',
+      action: 'resume',
+      started: true,
+      terminal: false,
+    }))
+    chatApi.peerUserMessageHandlers.forEach(handler => handler({
+      event: 'run.peer_user_message',
+      session_id: 'session-1',
+      message: {
+        id: 'phone-message-1',
+        role: 'user',
+        content: 'Message from phone',
+        timestamp: 2,
+        queued: false,
+      },
+    }))
+
+    expect(store.queuedUserMessages.get('session-1')).toBeUndefined()
+    expect(store.messages).toContainEqual(expect.objectContaining({
+      id: 'phone-message-1',
+      role: 'user',
+      content: 'Message from phone',
+      queued: false,
+    }))
+  })
+
   it('moves an existing peer command queue entry into the transcript when the command starts', () => {
     const store = useChatStore()
     const session = makeSession()
@@ -425,6 +552,35 @@ describe('chat store session.command fanout', () => {
     ])
   })
 
+  it('applies empty history snapshots and restores plans without persisted message bodies', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    session.messages = [{ id: 'stale', role: 'user', content: 'Old cached message', timestamp: 1 }]
+    store.sessions = [session]
+    const plan = {
+      session_id: session.id, run_id: 'run-1', plan_id: 'run-1', revision: 1,
+      execution_state: 'running', created_at: 2, updated_at: 2,
+      plan: [{ id: 'a', step: 'Verify', status: 'pending' }],
+    }
+    chatApi.resumeSession.mockImplementationOnce((sessionId: string, onResumed: (data: any) => void) => {
+      onResumed({ session_id: sessionId, messages: [], taskPlans: [plan], messageTotal: 0, isWorking: false })
+      return {} as any
+    })
+
+    await store.switchSession(session.id)
+    expect(store.activeSession?.messages).toEqual([
+      expect.objectContaining({ taskPlan: plan }),
+    ])
+    expect(store.activeSession?.loadedMessageCount).toBe(0)
+
+    chatApi.resumeSession.mockImplementationOnce((sessionId: string, onResumed: (data: any) => void) => {
+      onResumed({ session_id: sessionId, messages: [], taskPlans: [], messageTotal: 0, isWorking: false })
+      return {} as any
+    })
+    await store.switchSession(session.id)
+    expect(store.activeSession?.messages).toEqual([])
+  })
+
   it('adds and switches to a branched child session from session.command branch events', async () => {
     const store = useChatStore()
     const session = makeSession()
@@ -432,20 +588,22 @@ describe('chat store session.command fanout', () => {
     store.activeSessionId = 'session-1'
     store.activeSession = session
 
-    chatApi.resumeSession.mockImplementationOnce((sessionId: string, onResumed: (data: any) => void) => {
+    chatApi.resumeSession.mockImplementation((sessionId: string, onResumed: (data: any) => void) => {
       onResumed({
         session_id: sessionId,
-        messages: [
+        messages: sessionId === 'branch-1' ? [
           { id: 1, role: 'user', content: 'Previous question', timestamp: 1 },
           { id: 2, role: 'assistant', content: 'Previous answer', timestamp: 2 },
+        ] : [
+          { id: 3, role: 'command', content: 'Branched session "Side path" from session-1.', timestamp: 3 },
         ],
         parentSessionId: 'session-1',
         forkPointMessageId: '2',
         parentTitle: 'session',
         parentLastMessage: 'Previous answer',
         parentLastMessageRole: 'assistant',
-        messageLoadedCount: 2,
-        messageTotal: 2,
+        messageLoadedCount: sessionId === 'branch-1' ? 2 : 1,
+        messageTotal: sessionId === 'branch-1' ? 2 : 1,
         hasMoreBefore: false,
         isWorking: false,
         events: [],
@@ -502,12 +660,17 @@ describe('chat store session.command fanout', () => {
     expect(store.activeSessionId).toBe('branch-1')
     expect(chatApi.resumeSession).toHaveBeenCalledWith('branch-1', expect.any(Function), 'default', 'chat-run')
 
+    expect(store.sessions.find((item: Session) => item.id === 'session-1')?.messages.at(-1)).toMatchObject({
+      role: 'command',
+      commandAction: 'branch',
+      content: 'Branched session "Side path" from session-1.',
+    })
+
     await store.switchSession('session-1')
     expect(store.activeSessionId).toBe('session-1')
     expect(store.activeSession?.id).toBe('session-1')
     expect(store.sessions.find((item: Session) => item.id === 'session-1')?.messages.at(-1)).toMatchObject({
       role: 'command',
-      commandAction: 'branch',
       content: 'Branched session "Side path" from session-1.',
     })
 

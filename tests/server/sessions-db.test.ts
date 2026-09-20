@@ -21,7 +21,7 @@ vi.doMock('node:sqlite', () => ({
   DatabaseSync: databaseSyncMock,
 }))
 
-vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
+vi.mock('../../packages/server/src/modules/hermes/services/profiles/profile', () => ({
   getActiveProfileDir: getActiveProfileDirMock,
 }))
 
@@ -41,8 +41,8 @@ describe('session DB summaries', () => {
     getActiveProfileDirMock.mockReturnValue('/tmp/hermes-profile')
   })
 
-  it('queries sqlite for lightweight session summaries', async () => {
-    allMock.mockReturnValue([
+  it('queries sqlite for session summaries through the session index', async () => {
+    indexAllMock.mockReturnValue([
       {
         id: 's1',
         source: 'cli',
@@ -68,12 +68,12 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.listSessionSummaries(undefined, 50)
 
     expect(databaseSyncMock).toHaveBeenCalledWith('/tmp/hermes-profile/state.db', { open: true, readOnly: true })
     expect(prepareMock).toHaveBeenCalledWith(expect.stringContaining("s.source != 'tool'"))
-    expect(allMock).toHaveBeenCalledWith(200)
+    expect(indexAllMock).toHaveBeenCalledWith()
     expect(closeMock).toHaveBeenCalled()
     expect(rows).toEqual([
       {
@@ -102,8 +102,8 @@ describe('session DB summaries', () => {
     ])
   })
 
-  it('adds source filter and falls back last_active to started_at', async () => {
-    allMock.mockReturnValue([
+  it('filters indexed summaries by source and falls back last_active to started_at', async () => {
+    indexAllMock.mockReturnValue([
       {
         id: 's2',
         source: 'telegram',
@@ -129,11 +129,11 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.listSessionSummaries('telegram', 2)
 
     expect(prepareMock).toHaveBeenCalledWith(expect.stringContaining("s.source != 'tool'"))
-    expect(allMock).toHaveBeenCalledWith('telegram', 8)
+    expect(indexAllMock).toHaveBeenCalledWith()
     expect(rows[0].last_active).toBe(1710000100)
     expect(rows[0].source).toBe('telegram')
     expect(rows[0].title).toBe('preview text')
@@ -223,7 +223,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('docker', undefined, 10)
 
     expect(prepareMock).toHaveBeenCalledWith(expect.stringContaining('messages_fts MATCH'))
@@ -270,7 +270,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('.', undefined, 10)
 
     expect(contentAllMock).not.toHaveBeenCalled()
@@ -310,7 +310,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('node.js', undefined, 10)
 
     expect(contentAllMock).toHaveBeenCalled()
@@ -377,7 +377,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('node.js*', undefined, 10)
 
     expect(titleAllMock).toHaveBeenCalledWith('%node.js%', 200)
@@ -446,7 +446,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('"node.js"*', undefined, 10)
 
     expect(titleAllMock).toHaveBeenCalledWith('%node.js%', 200)
@@ -488,7 +488,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('naïve.js', undefined, 10)
 
     expect(contentAllMock).toHaveBeenCalledWith('"naïve.js"', 200)
@@ -528,7 +528,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('100%', undefined, 10)
 
     expect(titleAllMock).toHaveBeenCalledWith('%100\\%%', 200)
@@ -568,7 +568,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('记忆断裂', undefined, 10)
 
     expect(contentAllMock).not.toHaveBeenCalled()
@@ -638,7 +638,7 @@ describe('session DB summaries', () => {
       },
     ])
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
     const rows = await mod.searchSessionSummaries('记忆断裂', undefined, 10)
 
     expect(likeAllMock).toHaveBeenCalledWith('记忆断裂', '%记忆断裂%', 200)
@@ -654,7 +654,7 @@ describe('session DB summaries', () => {
       throw new Error('database malformed')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('docker', undefined, 10)
     expect(rows).toEqual([])
@@ -667,7 +667,7 @@ describe('session DB summaries', () => {
       throw new Error('no such table: messages_fts')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('123', undefined, 10)
     expect(rows).toEqual([])
@@ -680,7 +680,7 @@ describe('session DB summaries', () => {
       throw new Error('no such table: messages_fts')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('123', 'telegram', 10)
     expect(rows).toEqual([])
@@ -719,7 +719,7 @@ describe('session DB summaries', () => {
       throw new Error('no such table: messages_fts')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('123', undefined, 10)
     expect(rows).toHaveLength(1)
@@ -733,7 +733,7 @@ describe('session DB summaries', () => {
       throw new Error('no such table: messages_fts')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('docker', undefined, 10)
     expect(rows).toEqual([])
@@ -745,7 +745,7 @@ describe('session DB summaries', () => {
       throw new Error('database malformed')
     })
 
-    const mod = await import('../../packages/server/src/db/hermes/sessions-db')
+    const mod = await import('../../packages/server/src/modules/hermes/services/history/sessions-db')
 
     const rows = await mod.searchSessionSummaries('123', undefined, 10)
     expect(rows).toEqual([])

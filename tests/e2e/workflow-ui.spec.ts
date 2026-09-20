@@ -1,8 +1,21 @@
 import { readFile } from 'fs/promises'
-import { expect, test } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { authenticate, mockChatSocket, mockHermesApi, TEST_ACCESS_KEY, TEST_MODEL_GROUP } from './fixtures'
 
+async function selectWorkflowScheduleFrequency(page: Page, modal: Locator, frequency: string) {
+  await modal.getByTestId('workflow-schedule-frequency').click()
+  await page.getByText(frequency, { exact: true }).last().click()
+}
+
+async function selectWorkflowScheduleField(page: Page, modal: Locator, testId: string, value: string) {
+  await modal.getByTestId(testId).click()
+  await page.getByText(value, { exact: true }).last().click()
+}
+
 test('workflow Run sends the selected total time budget', async ({ page }) => {
+  const renderErrors: string[] = []
+  page.on('console', message => { if (message.type() === 'error' && message.text().includes('uncaught Vue error')) renderErrors.push(message.text()) })
+  page.on('pageerror', error => renderErrors.push(error.message))
   await authenticate(page, TEST_ACCESS_KEY, 'research')
   const api = await mockHermesApi(page, {
     workflows: [{
@@ -30,17 +43,18 @@ test('workflow Run sends the selected total time budget', async ({ page }) => {
   await modal.getByRole('button', { name: 'Confirm' }).click()
 
   await expect.poll(() => api.requests.filter(request => (
-    request.method === 'POST' && request.pathname === '/api/hermes/workflows/wf-budget/run'
+    request.method === 'POST' && request.pathname === '/api/studio/workflows/wf-budget/run'
   )).length).toBe(1)
   const runRequest = api.requests.find(request => (
-    request.method === 'POST' && request.pathname === '/api/hermes/workflows/wf-budget/run'
+    request.method === 'POST' && request.pathname === '/api/studio/workflows/wf-budget/run'
   ))!
   expect(JSON.parse(runRequest.postData || '{}')).toEqual({ timeout_ms: 750_000 })
   await expect(modal).toBeHidden()
+  expect(renderErrors).toEqual([])
   expect(api.unexpectedRequests).toEqual([])
 })
 
-test('workflow Coding Agent nodes hide auth providers and reset auth selections', async ({ page }) => {
+for (const agent of ['Codex', 'DeepSeek Harness']) test(`workflow ${agent} nodes hide auth providers and reset auth selections`, async ({ page }) => {
   await authenticate(page, TEST_ACCESS_KEY, 'research')
   const authGroup = {
     provider: 'openai-codex',
@@ -73,13 +87,32 @@ test('workflow Coding Agent nodes hide auth providers and reset auth selections'
   await expect(node.locator('.model-trigger')).toContainText('gpt-5-codex')
 
   await node.locator('.n-select').first().click()
-  await page.getByText('Codex', { exact: true }).last().click()
+  await page.getByText(agent, { exact: true }).last().click()
   await expect(node.locator('.model-trigger')).toContainText('test-model')
 
   await node.locator('.model-trigger').click()
   const modelDialog = page.getByRole('dialog')
   await expect(modelDialog.getByText('Test Provider', { exact: true })).toBeVisible()
   await expect(modelDialog.getByText('OpenAI Codex Subscription', { exact: true })).toHaveCount(0)
+  if (agent === 'DeepSeek Harness') {
+    await page.keyboard.press('Escape')
+    const preset = node.getByTestId('dsh-session-preset')
+    await expect(preset).toContainText('Standard mode (Default)')
+    await preset.locator('.n-base-selection').click()
+    await page.getByText('Minimal mode', { exact: true }).last().click()
+    await page.locator('.header-actions').getByRole('button', { name: 'Save', exact: true }).click()
+    await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-auth-provider').length).toBeGreaterThan(0)
+    const saved = api.requests.findLast(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-auth-provider')!
+    expect(JSON.parse(saved.postData || '{}').nodes[0].data).toMatchObject({ agent: 'dsh', agentPreset: 'minimal', provider: 'test-provider', model: 'test-model' })
+  }
+  if (agent === 'DeepSeek Harness') {
+    const saved = api.requests.findLast(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-auth-provider')!
+    const workflow = { id: 'wf-auth-provider', name: 'Provider policy', profile: 'research', created_at: 1, updated_at: 2, ...JSON.parse(saved.postData || '{}') }
+    await page.route('**/api/studio/workflows', route => route.fulfill({ json: { workflows: [workflow] } }))
+    await page.reload()
+    await expect(page.getByTestId('dsh-session-preset')).toContainText('Minimal mode')
+    await page.screenshot({ path: '/tmp/dsh-workflow-mode.png', animations: 'disabled' })
+  }
   expect(api.unexpectedRequests).toEqual([])
 })
 
@@ -143,10 +176,10 @@ test('workflow canvas exposes orchestration editing and portability controls', a
   const fileChooser = await chooser
   await fileChooser.setFiles({ name: 'import.workflow.json', mimeType: 'application/json', buffer: Buffer.from('{}') })
   await expect(page.getByTestId('workflow-import-summary')).toHaveText('Imported flow · 1 nodes · 0 links')
-  expect(api.requests.filter(request => request.pathname === '/api/hermes/workflows/import/confirm')).toHaveLength(0)
+  expect(api.requests.filter(request => request.pathname === '/api/studio/workflows/import/confirm')).toHaveLength(0)
   await page.getByTestId('workflow-import-confirm').click()
   await expect(page.locator('.header-workflow-title')).toHaveText('Imported flow')
-  expect(api.requests.filter(request => request.pathname === '/api/hermes/workflows/import/confirm')).toHaveLength(1)
+  expect(api.requests.filter(request => request.pathname === '/api/studio/workflows/import/confirm')).toHaveLength(1)
   const cancelChooserPromise = page.waitForEvent('filechooser')
   await page.getByRole('button', { name: 'Import Workflow' }).click()
   const cancelChooser = await cancelChooserPromise
@@ -154,8 +187,8 @@ test('workflow canvas exposes orchestration editing and portability controls', a
   await expect(page.getByTestId('workflow-import-summary')).toBeVisible()
   await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click()
   await expect(page.getByTestId('workflow-import-summary')).toHaveCount(0)
-  expect(api.requests.filter(request => request.pathname === '/api/hermes/workflows/import/cancel')).toHaveLength(1)
-  expect(api.requests.filter(request => request.pathname === '/api/hermes/workflows/import/confirm')).toHaveLength(1)
+  expect(api.requests.filter(request => request.pathname === '/api/studio/workflows/import/cancel')).toHaveLength(1)
+  expect(api.requests.filter(request => request.pathname === '/api/studio/workflows/import/confirm')).toHaveLength(1)
   await page.locator('.workflow-list-item').filter({ hasText: 'Loop workflow' }).click()
   await expect(page.locator('.header-workflow-title')).toHaveText('Loop workflow')
   const runItem = page.locator('.workflow-run-item')
@@ -301,10 +334,10 @@ test('workflow canvas exposes orchestration editing and portability controls', a
   await expect(edgeLabel).toContainText('route_token')
   await expect(edgeLabel).toContainText('Equals')
   await expect(edgeLabel).toContainText('HSR_RELEASED_OK')
-  const workflowPatchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-1').length
+  const workflowPatchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-1').length
   await page.locator('.header-actions').getByRole('button', { name: 'Save', exact: true }).click()
-  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-1').length).toBe(workflowPatchCount + 1)
-  const workflowPatchRequest = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-1').at(-1)!
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-1').length).toBe(workflowPatchCount + 1)
+  const workflowPatchRequest = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-1').at(-1)!
   const workflowPatch = JSON.parse(workflowPatchRequest.postData || '{}')
   expect(workflowPatch.edges[0].data.orchestration.condition).toEqual({
     path: 'outputJson.route_token', operator: 'equals', value: 'HSR_RELEASED_OK',
@@ -550,10 +583,10 @@ test('workflow nodes connect from every side and create an automatic self loop',
   await page.getByText('Review', { exact: true }).last().click()
   await editor.getByRole('button', { name: 'Save', exact: true }).click()
 
-  const patchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-self-loop').length
+  const patchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-self-loop').length
   await page.locator('.header-actions').getByRole('button', { name: 'Save', exact: true }).click()
-  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-self-loop').length).toBe(patchCount + 1)
-  const saved = JSON.parse(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-self-loop').at(-1)!.postData || '{}')
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-self-loop').length).toBe(patchCount + 1)
+  const saved = JSON.parse(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-self-loop').at(-1)!.postData || '{}')
   expect(saved.edges).toEqual([expect.objectContaining({
     id: 'review-review', source: 'review', target: 'review',
     sourceHandle: 'output', targetHandle: 'top', type: 'workflow-self-loop',
@@ -565,6 +598,7 @@ test('workflow nodes connect from every side and create an automatic self loop',
 })
 
 test('workflow edge editor never exposes technical node ids when node titles are blank', async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 })
   await authenticate(page, TEST_ACCESS_KEY, 'research')
   const technicalNodeId = '11111111-1111-4111-8111-111111111111'
   const edgeId = 'blank-title-loop'
@@ -600,7 +634,7 @@ test('workflow edge editor never exposes technical node ids when node titles are
     }],
     edge_evaluations: [], loop_epochs: [],
   }], sessions: [session] })
-  await page.route(`**/api/hermes/sessions/${sessionId}**`, route => route.fulfill({
+  await page.route(`**/api/studio/sessions/${sessionId}**`, route => route.fulfill({
     status: 200, contentType: 'application/json', body: JSON.stringify({ session }),
   }))
   await mockChatSocket(page)
@@ -631,6 +665,44 @@ test('workflow edge editor never exposes technical node ids when node titles are
   const chatTitle = page.locator('.workflow-chat-title')
   await expect(chatTitle).toContainText('Unknown node')
   await expect(chatTitle).not.toContainText(technicalNodeId)
+
+  const workflowBody = page.locator('.workflow-body')
+  const chatPanel = page.locator('.workflow-chat-panel')
+  const resizeHandle = page.locator('.workflow-chat-resize-handle')
+  const geometry = async () => {
+    const [body, panel, handle] = await Promise.all([
+      workflowBody.boundingBox(),
+      chatPanel.boundingBox(),
+      resizeHandle.boundingBox(),
+    ])
+    expect(body).not.toBeNull()
+    expect(panel).not.toBeNull()
+    expect(handle).not.toBeNull()
+    return { body: body!, panel: panel!, handle: handle! }
+  }
+
+  const ltr = await geometry()
+  expect(Math.abs(ltr.panel.x - ltr.body.x)).toBeLessThanOrEqual(1)
+  expect(Math.abs(ltr.handle.x + ltr.handle.width / 2 - (ltr.panel.x + ltr.panel.width))).toBeLessThanOrEqual(1)
+  await page.mouse.move(ltr.handle.x + ltr.handle.width / 2, ltr.handle.y + ltr.handle.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(ltr.handle.x + ltr.handle.width / 2 - 32, ltr.handle.y + ltr.handle.height / 2)
+  await page.mouse.up()
+  await expect.poll(async () => (await chatPanel.boundingBox())!.width).toBeLessThan(ltr.panel.width - 20)
+
+  await page.locator('html').evaluate(element => element.setAttribute('dir', 'rtl'))
+  await expect.poll(async () => {
+    const { body, panel } = await geometry()
+    return Math.abs(panel.x + panel.width - (body.x + body.width)) <= 1
+  }).toBe(true)
+  const rtl = await geometry()
+  expect(Math.abs(rtl.handle.x + rtl.handle.width / 2 - rtl.panel.x)).toBeLessThanOrEqual(1)
+  await page.mouse.move(rtl.handle.x + rtl.handle.width / 2, rtl.handle.y + rtl.handle.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(rtl.handle.x + rtl.handle.width / 2 + 32, rtl.handle.y + rtl.handle.height / 2)
+  await page.mouse.up()
+  await expect.poll(async () => (await chatPanel.boundingBox())!.width).toBeLessThan(rtl.panel.width - 20)
+
   expect(api.unexpectedRequests).toEqual([])
 })
 
@@ -717,11 +789,11 @@ test('workflow loop validation blocks invalid editor and workflow saves before A
   }], workflowRuns: [] })
   await page.goto('/#/hermes/workflow')
 
-  const patchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-invalid-loops').length
+  const patchCount = api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-invalid-loops').length
   await page.locator('.header-actions').getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.getByText('Each loop history label must be unique.', { exact: true }).last()).toBeVisible()
   await page.waitForTimeout(100)
-  expect(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-invalid-loops')).toHaveLength(patchCount)
+  expect(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-invalid-loops')).toHaveLength(patchCount)
 
   const feedbackEdge = page.locator('.vue-flow__edge[data-id="b-a"]')
   await feedbackEdge.dblclick({ force: true })
@@ -735,8 +807,8 @@ test('workflow loop validation blocks invalid editor and workflow saves before A
   await expect(edgeDialog).toBeHidden()
 
   await page.locator('.header-actions').getByRole('button', { name: 'Save', exact: true }).click()
-  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-invalid-loops').length).toBe(patchCount + 1)
-  const saved = JSON.parse(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/hermes/workflows/wf-invalid-loops').at(-1)!.postData || '{}')
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-invalid-loops').length).toBe(patchCount + 1)
+  const saved = JSON.parse(api.requests.filter(request => request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-invalid-loops').at(-1)!.postData || '{}')
   expect(saved.edges.find((edge: { id: string }) => edge.id === 'b-a').data.orchestration.feedback.loopId).toBe('a')
   expect(saved.edges.find((edge: { id: string }) => edge.id === 'd-c').data.orchestration.feedback.loopId).toBe('retry')
   expect(api.unexpectedRequests).toEqual([])
@@ -1159,7 +1231,7 @@ test('workflow import reports an unsupported version without confirming or creat
     buffer: Buffer.from(JSON.stringify({ format: 'hermes-studio.workflow', version: 2, definition: {} })),
   })
   await expect(page.getByText(/unsupported workflow import version/)).toBeVisible()
-  expect(api.requests.filter(request => request.pathname === '/api/hermes/workflows/import/confirm')).toHaveLength(0)
+  expect(api.requests.filter(request => request.pathname === '/api/studio/workflows/import/confirm')).toHaveLength(0)
   expect(api.unexpectedRequests).toEqual([])
 })
 
@@ -1176,4 +1248,316 @@ test('workflow title is hidden on mobile', async ({ page }) => {
   const workspaceBadge = page.locator('.workspace-badge')
   await expect(workspaceBadge).toHaveCSS('flex-grow', '1')
   await expect(workspaceBadge).toHaveCSS('max-width', 'none')
+})
+
+test('workflow schedules can be created, edited, disabled, and deleted from the Workflow page', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page, {
+    workflows: [{
+      id: 'wf-schedule-ui', name: 'Scheduled workflow', profile: 'research', workspace: null,
+      nodes: [{ id: 'agent-a', type: 'agent', position: { x: 80, y: 80 }, data: { title: 'Agent A', agent: 'hermes', input: 'Run', skills: [], images: [], approvalRequired: false } }],
+      edges: [], viewport: { x: 80, y: 80, zoom: .75 }, created_at: 1, updated_at: 1,
+    }],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await expect(modal).toBeVisible()
+  await expect(modal.getByTestId('workflow-schedule-frequency')).toContainText('Select a frequency')
+  await selectWorkflowScheduleFrequency(page, modal, 'Every week')
+  await selectWorkflowScheduleField(page, modal, 'workflow-schedule-weekday', 'Wednesday')
+  await selectWorkflowScheduleField(page, modal, 'workflow-schedule-hour', '08')
+  await selectWorkflowScheduleField(page, modal, 'workflow-schedule-minute', '05')
+  await modal.getByRole('textbox', { name: 'Timezone' }).fill('Asia/Shanghai')
+  await modal.getByRole('button', { name: 'Create schedule' }).click()
+  await expect(modal.getByText('5 8 * * 3', { exact: true })).toBeVisible()
+  await modal.getByRole('button', { name: 'Edit schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every month')
+  await selectWorkflowScheduleField(page, modal, 'workflow-schedule-month-day', '5')
+  await modal.getByRole('button', { name: 'Save schedule' }).click()
+  await expect(modal.getByText('5 8 5 * *', { exact: true })).toBeVisible()
+  await modal.getByRole('button', { name: 'Disable schedule' }).click()
+  await expect(modal.getByText('Disabled', { exact: true })).toBeVisible()
+  await modal.getByRole('button', { name: 'Delete schedule' }).click()
+  await page.getByRole('button', { name: 'Confirm' }).click()
+  await expect(modal.getByText('No schedules yet', { exact: true })).toBeVisible()
+})
+
+test('workflow schedule form preserves disabled state and input whitespace after an inline toggle', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflows: [{
+      id: 'wf-schedule-edit', name: 'Scheduled workflow', profile: 'research', workspace: null,
+      nodes: [{ id: 'agent-a', type: 'agent', position: { x: 80, y: 80 }, data: { title: 'Agent A', agent: 'hermes', input: 'Run', skills: [], images: [], approvalRequired: false } }],
+      edges: [], viewport: { x: 80, y: 80, zoom: .75 }, created_at: 1, updated_at: 1,
+    }],
+    workflowSchedules: [{
+      id: 'schedule-1', workflow_id: 'wf-schedule-edit', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true,
+      input: '  preserve me  ', start_node_ids: ['agent-a'], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip',
+      last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1,
+    }],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await modal.getByRole('button', { name: 'Edit schedule' }).click()
+  await modal.getByRole('button', { name: 'Disable schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every hour')
+  await modal.getByRole('button', { name: 'Save schedule' }).click()
+
+  const saveRequest = api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-1')).at(-1)
+  expect(JSON.parse(saveRequest?.postData || '{}')).toMatchObject({ enabled: false, input: '  preserve me  ' })
+})
+
+test('workflow schedule start nodes only include the saved workflow definition', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page, {
+    workflows: [{
+      id: 'wf-schedule-nodes', name: 'Scheduled workflow', profile: 'research', workspace: null,
+      nodes: [{ id: 'agent-a', type: 'agent', position: { x: 80, y: 80 }, data: { title: 'Agent A', agent: 'hermes', input: 'Run', skills: [], images: [], approvalRequired: false } }],
+      edges: [], viewport: { x: 80, y: 80, zoom: .75 }, created_at: 1, updated_at: 1,
+    }],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Add Node' }).click()
+  await expect(page.locator('.vue-flow__node')).toHaveCount(2)
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await modal.getByTestId('workflow-schedule-start-nodes').click()
+  await expect(page.getByText('Agent A', { exact: true }).last()).toBeVisible()
+  await expect(page.getByText('Node 2', { exact: true })).toHaveCount(0)
+})
+
+test('workflow schedule loads do not overwrite the active workflow schedule list', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page, {
+    workflowScheduleDelays: { 'wf-schedule-a': 500 },
+    workflows: [
+      { id: 'wf-schedule-a', name: 'Workflow A', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 },
+      { id: 'wf-schedule-b', name: 'Workflow B', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 },
+    ],
+    workflowSchedules: [
+      { id: 'schedule-a', workflow_id: 'wf-schedule-a', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+      { id: 'schedule-b', workflow_id: 'wf-schedule-b', profile: 'research', schedule: '@hourly', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.locator('.workflow-list-item').filter({ hasText: 'Workflow B' }).click()
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await expect(modal.getByText('@hourly', { exact: true })).toBeVisible()
+  await page.waitForTimeout(650)
+  await expect(modal.getByText('@hourly', { exact: true })).toBeVisible()
+  await expect(modal.getByText('@daily', { exact: true })).toHaveCount(0)
+})
+
+test('workflow schedule saves do not overwrite the active workflow schedule list', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { POST: 500 },
+    workflows: [
+      { id: 'wf-schedule-a', name: 'Workflow A', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 },
+      { id: 'wf-schedule-b', name: 'Workflow B', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 },
+    ],
+    workflowSchedules: [
+      { id: 'schedule-b', workflow_id: 'wf-schedule-b', profile: 'research', schedule: '@hourly', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await selectWorkflowScheduleFrequency(page, modal, 'Every week')
+  await modal.getByRole('button', { name: 'Create schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => (
+    request.method === 'POST' && request.pathname === '/api/studio/workflows/wf-schedule-a/schedules'
+  )).length).toBe(1)
+
+  await page.keyboard.press('Escape')
+  await expect(modal).toBeHidden()
+  await page.locator('.workflow-list-item').filter({ hasText: 'Workflow B' }).click()
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  await expect(modal.getByText('@hourly', { exact: true })).toBeVisible()
+  await page.waitForTimeout(650)
+  await expect(modal.getByText('@hourly', { exact: true })).toBeVisible()
+  await expect(modal.getByText('0 9 * * 1', { exact: true })).toHaveCount(0)
+  expect(api.requests.filter(request => (
+    request.pathname.startsWith('/api/studio/workflows/wf-schedule-b/schedules/')
+    && request.method !== 'GET'
+  ))).toEqual([])
+})
+
+test('workflow schedule saves cannot restore a schedule deleted while the save is pending', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { PATCH: 500 },
+    workflows: [
+      { id: 'wf-schedule-delete', name: 'Workflow delete', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 },
+    ],
+    workflowSchedules: [
+      { id: 'schedule-delete', workflow_id: 'wf-schedule-delete', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await modal.getByRole('button', { name: 'Edit schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every hour')
+  await modal.getByRole('button', { name: 'Save schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => (
+    request.method === 'PATCH' && request.pathname === '/api/studio/workflows/wf-schedule-delete/schedules/schedule-delete'
+  )).length).toBe(1)
+
+  await modal.getByRole('button', { name: 'Delete schedule' }).click()
+  await page.getByRole('button', { name: 'Confirm' }).click()
+  await expect.poll(() => api.requests.filter(request => (
+    request.method === 'DELETE' && request.pathname === '/api/studio/workflows/wf-schedule-delete/schedules/schedule-delete'
+  )).length).toBe(1)
+  await expect(modal.getByText('No schedules yet', { exact: true })).toBeVisible()
+  await page.waitForTimeout(650)
+  await expect(modal.getByText('No schedules yet', { exact: true })).toBeVisible()
+  await expect(modal.getByText('0 * * * *', { exact: true })).toHaveCount(0)
+})
+
+test('workflow schedules show server errors without changing displayed schedule state', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page, {
+    workflowScheduleError: 'Schedule service unavailable',
+    workflows: [{ id: 'wf-schedule-error', name: 'Scheduled workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: { x: 80, y: 80, zoom: .75 }, created_at: 1, updated_at: 1 }],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await expect(modal).toBeVisible()
+  await expect(modal.getByText('No schedules yet', { exact: true })).toHaveCount(0)
+  await expect(modal.getByText(/Schedule service unavailable|Failed to load schedules/)).toBeVisible()
+})
+
+test('workflow schedule mutations keep unrelated saves and toggles synchronized', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { PATCH: 350 },
+    workflows: [{ id: 'wf-schedule-concurrent', name: 'Concurrent workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 }],
+    workflowSchedules: [
+      { id: 'schedule-a', workflow_id: 'wf-schedule-concurrent', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+      { id: 'schedule-b', workflow_id: 'wf-schedule-concurrent', profile: 'research', schedule: '@hourly', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  const scheduleA = modal.locator('.workflow-schedule-item').filter({ hasText: '@daily' })
+  const scheduleB = modal.locator('.workflow-schedule-item').filter({ hasText: '@hourly' })
+  await scheduleA.getByRole('button', { name: 'Edit schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every week')
+  await modal.getByRole('button', { name: 'Save schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-a')).length).toBe(1)
+  await scheduleB.getByRole('button', { name: 'Disable schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-b')).length).toBe(1)
+
+  await expect(modal.getByRole('button', { name: 'Create schedule' })).toBeEnabled()
+  await expect(modal.getByText('0 0 * * 1', { exact: true })).toBeVisible()
+  await expect(scheduleB.getByText('Disabled', { exact: true })).toBeVisible()
+})
+
+test('workflow schedule mutations keep each concurrent toggle result', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { PATCH: 350 },
+    workflows: [{ id: 'wf-schedule-toggles', name: 'Toggle workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 }],
+    workflowSchedules: [
+      { id: 'schedule-a', workflow_id: 'wf-schedule-toggles', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+      { id: 'schedule-b', workflow_id: 'wf-schedule-toggles', profile: 'research', schedule: '@hourly', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  const scheduleA = modal.locator('.workflow-schedule-item').filter({ hasText: '@daily' })
+  const scheduleB = modal.locator('.workflow-schedule-item').filter({ hasText: '@hourly' })
+  await scheduleA.getByRole('button', { name: 'Disable schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-a')).length).toBe(1)
+  await scheduleB.getByRole('button', { name: 'Disable schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-b')).length).toBe(1)
+
+  await expect(scheduleA.getByText('Disabled', { exact: true })).toBeVisible()
+  await expect(scheduleB.getByText('Disabled', { exact: true })).toBeVisible()
+})
+
+test('a stale schedule list response cannot overwrite a successful create', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  await mockHermesApi(page, {
+    workflowScheduleDelays: { 'wf-schedule-stale-list': 1_500 },
+    workflowScheduleGetSnapshotAtRequest: true,
+    workflows: [{ id: 'wf-schedule-stale-list', name: 'Stale list workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 }],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  await selectWorkflowScheduleFrequency(page, modal, 'Every hour')
+  await modal.getByRole('textbox', { name: 'Timezone' }).fill('UTC')
+  await modal.getByRole('button', { name: 'Create schedule' }).click()
+  await expect(modal.getByText('0 * * * *', { exact: true })).toBeVisible()
+  await page.waitForTimeout(1_600)
+  await expect(modal.getByText('0 * * * *', { exact: true })).toBeVisible()
+})
+
+test('a completed save does not reset a newer schedule editing draft', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { PATCH: 350 },
+    workflows: [{ id: 'wf-schedule-draft', name: 'Draft workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 }],
+    workflowSchedules: [
+      { id: 'schedule-a', workflow_id: 'wf-schedule-draft', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+      { id: 'schedule-b', workflow_id: 'wf-schedule-draft', profile: 'research', schedule: '@hourly', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  const scheduleA = modal.locator('.workflow-schedule-item').filter({ hasText: '@daily' })
+  const scheduleB = modal.locator('.workflow-schedule-item').filter({ hasText: '@hourly' })
+  await scheduleA.getByRole('button', { name: 'Edit schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every week')
+  await modal.getByRole('button', { name: 'Save schedule' }).click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-a')).length).toBe(1)
+  await scheduleB.getByRole('button', { name: 'Edit schedule' }).click()
+  await selectWorkflowScheduleFrequency(page, modal, 'Every month')
+
+  await page.waitForTimeout(450)
+  await expect(modal.getByTestId('workflow-schedule-frequency')).toContainText('Every month')
+  await expect(modal.getByRole('button', { name: 'Save schedule' })).toBeEnabled()
+})
+
+test('a pending schedule toggle disables that schedule until its request completes', async ({ page }) => {
+  await authenticate(page, TEST_ACCESS_KEY, 'research')
+  const api = await mockHermesApi(page, {
+    workflowScheduleMutationDelays: { PATCH: 350 },
+    workflows: [{ id: 'wf-schedule-toggle-pending', name: 'Pending toggle workflow', profile: 'research', workspace: null, nodes: [], edges: [], viewport: null, created_at: 1, updated_at: 1 }],
+    workflowSchedules: [
+      { id: 'schedule-a', workflow_id: 'wf-schedule-toggle-pending', profile: 'research', schedule: '@daily', timezone: 'UTC', enabled: true, input: null, start_node_ids: [], timeout_ms: null, concurrency_policy: 'skip', misfire_policy: 'skip', last_scheduled_at: null, next_run_at: null, last_run_id: null, last_error: null, created_at: 1, updated_at: 1 },
+    ],
+  })
+
+  await page.goto('/#/hermes/workflow')
+  await page.getByRole('button', { name: 'Manage schedules' }).click()
+  const modal = page.getByTestId('workflow-schedules-modal')
+  const scheduleA = modal.locator('.workflow-schedule-item').filter({ hasText: '@daily' })
+  const toggle = scheduleA.getByRole('button', { name: 'Disable schedule' })
+  await toggle.click()
+  await expect.poll(() => api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-a')).length).toBe(1)
+  await expect(toggle).toBeDisabled()
+  await page.waitForTimeout(450)
+  await expect(api.requests.filter(request => request.method === 'PATCH' && request.pathname.endsWith('/schedules/schedule-a'))).toHaveLength(1)
+  await expect(scheduleA.getByText('Disabled', { exact: true })).toBeVisible()
 })

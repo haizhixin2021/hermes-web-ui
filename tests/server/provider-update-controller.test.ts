@@ -4,8 +4,13 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import YAML from 'js-yaml'
 
-vi.mock('../../packages/server/src/services/hermes/hermes-cli', () => ({
+const mockInvalidateProviderRuntime = vi.hoisted(() => vi.fn())
+
+vi.mock('../../packages/server/src/modules/hermes/services/runtime/cli', () => ({
   restartGateway: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock('../../packages/server/src/modules/studio/public/provider-runtime', () => ({
+  invalidateProviderRuntime: mockInvalidateProviderRuntime,
 }))
 
 let hermesHome = ''
@@ -13,7 +18,8 @@ let hermesHome = ''
 async function loadProvidersController() {
   vi.resetModules()
   process.env.HERMES_HOME = hermesHome
-  return import('../../packages/server/src/controllers/hermes/providers')
+  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+  return import('../../packages/server/src/modules/hermes/controllers/providers')
 }
 
 function makeCtx(poolKey: string, body: Record<string, any>, profile = 'research') {
@@ -32,6 +38,7 @@ function readYaml(filePath: string) {
 
 describe('providers controller update', () => {
   beforeEach(() => {
+    mockInvalidateProviderRuntime.mockReset()
     hermesHome = mkdtempSync(join(tmpdir(), 'hwui-provider-update-'))
     mkdirSync(join(hermesHome, 'profiles', 'research'), { recursive: true })
     writeFileSync(join(hermesHome, 'config.yaml'), 'model:\n  provider: deepseek\n  default: keep-default-model\n')
@@ -58,7 +65,7 @@ describe('providers controller update', () => {
 
   afterEach(() => {
     delete process.env.HERMES_HOME
-    vi.doUnmock('../../packages/server/src/controllers/hermes/providers')
+    vi.doUnmock('../../packages/server/src/modules/hermes/controllers/providers')
     vi.clearAllMocks()
     if (hermesHome) rmSync(hermesHome, { recursive: true, force: true })
     hermesHome = ''
@@ -73,6 +80,17 @@ describe('providers controller update', () => {
     expect(ctx.body).toEqual({ success: true })
     expect(readFileSync(join(hermesHome, '.env'), 'utf-8')).toContain('DEEPSEEK_API_KEY=keep-default-key')
     expect(readFileSync(join(hermesHome, 'profiles', 'research', '.env'), 'utf-8')).toContain('DEEPSEEK_API_KEY=new-research-key')
+    expect(mockInvalidateProviderRuntime).toHaveBeenCalledWith('research', 'deepseek')
+  })
+
+  it('does not invalidate a runtime when a custom provider update is rejected', async () => {
+    const { update } = await loadProvidersController()
+    const ctx = makeCtx('custom:missing-provider', { api_key: 'unused-key' })
+
+    await update(ctx)
+
+    expect(ctx.status).toBe(404)
+    expect(mockInvalidateProviderRuntime).not.toHaveBeenCalled()
   })
 
   it('updates custom provider API keys in the request-scoped profile config only', async () => {
@@ -127,4 +145,5 @@ describe('providers controller update', () => {
     expect(defaultConfig.custom_providers[0].api_mode).toBe('codex_responses')
     expect(researchConfig.custom_providers[0].api_mode).toBe('chat_completions')
   })
+
 })

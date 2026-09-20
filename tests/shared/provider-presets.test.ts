@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest'
 import {
   PROVIDER_PRESETS as SERVER_PROVIDER_PRESETS,
   buildProviderModelMap as buildServerProviderModelMap,
-} from '../../packages/server/src/shared/providers'
-import { PROVIDER_ENV_MAP } from '../../packages/server/src/services/config-helpers'
+} from '../../packages/server/src/modules/studio/contracts/providers'
+import { PROVIDER_ENV_MAP } from '../../packages/server/src/modules/hermes/services/profiles/config'
 
 const OPENAI_CODEX_PROVIDER = 'openai-codex'
 const COPILOT_PROVIDER = 'copilot'
@@ -15,6 +15,7 @@ const KIMI_CODING_CN_PROVIDER = 'kimi-coding-cn'
 const GLM_CODING_PLAN_PROVIDER = 'glm'
 const ALIBABA_CODING_PLAN_PROVIDER = 'alibaba-coding-plan'
 const MINIMAX_PROVIDER = 'minimax'
+const MINIMAX_OAUTH_PROVIDER = 'minimax-oauth'
 const MINIMAX_CN_PROVIDER = 'minimax-cn'
 
 const STEPFUN_PROVIDER = 'stepfun'
@@ -236,7 +237,7 @@ describe('provider presets', () => {
     expect(missingMappings).toEqual([])
   })
 
-  it('routes apikey.fun Codex through the Responses transport', () => {
+  it('routes apikey.fan Codex through the Responses transport', () => {
     const preset = SERVER_PROVIDER_PRESETS.find((candidate) => candidate.value === FUN_CODEX_PROVIDER)
     expect(preset?.api_mode).toBe('codex_responses')
   })
@@ -329,6 +330,20 @@ describe('provider presets', () => {
         'MiniMax-M2',
       ]))
     }
+  })
+
+  it('keeps MiniMax Coding Plan OAuth separate from API-key providers', () => {
+    expect(PROVIDER_ENV_MAP[MINIMAX_OAUTH_PROVIDER]).toEqual({ api_key_env: '', base_url_env: '' })
+    const preset = SERVER_PROVIDER_PRESETS.find(candidate => candidate.value === MINIMAX_OAUTH_PROVIDER)
+    expect(preset).toMatchObject({
+      base_url: 'https://api.minimax.io/anthropic',
+      api_mode: 'anthropic_messages',
+    })
+    expect(modelsForProvider(SERVER_PROVIDER_PRESETS, MINIMAX_OAUTH_PROVIDER)).toEqual([
+      'MiniMax-M3',
+      'MiniMax-M2.7',
+      'MiniMax-M2.7-highspeed',
+    ])
   })
 
   it('includes current GitHub Copilot fallback models', () => {

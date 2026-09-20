@@ -18,7 +18,18 @@ agent can discover without chat history.
 - `docs/harness/validation.md` maps change types to checks.
 - `docs/harness/worktree-runbook.md` explains isolated worktree development.
 - `docs/harness/pr-review.md` provides a PR self-review checklist.
-- `scripts/harness-check.mjs` enforces baseline repository invariants.
+- `docs/harness/startup-tasks.md` describes one-time startup operations and their persistent execution records.
+- `docs/harness/server-module-boundaries.md` defines backend ownership and the migration target.
+- `scripts/harness-check.mjs` is the single harness entry point. It enforces
+  repository, desktop release/runtime, and backend module-boundary invariants.
+- `scripts/server-module-boundaries.mjs` implements the backend boundary portion
+  consumed by the unified harness and its focused unit tests.
+
+The only public harness command is:
+
+```bash
+npm run harness:check
+```
 
 ## Operating Model
 

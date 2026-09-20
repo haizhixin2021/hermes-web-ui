@@ -1,10 +1,18 @@
 import type { ModelRequestStyle } from './types'
+import type { EkkoModelApiMode } from './provider-presets'
 
-export type AuthorizedModelProviderId = 'nous' | 'openai-codex' | 'xai-oauth' | 'qwen-oauth'
+export type AuthorizedModelProviderId =
+  | 'nous'
+  | 'openai-codex'
+  | 'xai-oauth'
+  | 'qwen-oauth'
+  | 'claude-oauth'
+  | 'minimax-oauth'
 
 export interface AuthorizedModelProviderPreset {
   id: AuthorizedModelProviderId
   baseUrl: string
+  apiMode: EkkoModelApiMode
   requestStyle: ModelRequestStyle
   headers: Record<string, string>
 }
@@ -18,6 +26,10 @@ const AUTHORIZED_PROVIDER_ALIASES: Record<string, AuthorizedModelProviderId> = {
   'grok-oauth': 'xai-oauth',
   'qwen-oauth': 'qwen-oauth',
   'qwen-portal': 'qwen-oauth',
+  'claude-oauth': 'claude-oauth',
+  'anthropic-oauth': 'claude-oauth',
+  'minimax-oauth': 'minimax-oauth',
+  'minimax-portal': 'minimax-oauth',
 }
 
 export function authorizedModelProviderId(provider: string): AuthorizedModelProviderId | undefined {
@@ -35,6 +47,7 @@ export function authorizedModelProviderPreset(
     return {
       id,
       baseUrl: 'https://inference-api.nousresearch.com/v1',
+      apiMode: 'chat_completions',
       requestStyle: 'openai-chat',
       headers: {},
     }
@@ -43,6 +56,7 @@ export function authorizedModelProviderPreset(
     return {
       id,
       baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiMode: 'codex_responses',
       requestStyle: 'openai-responses',
       headers: codexHeaders(accessToken),
     }
@@ -51,13 +65,33 @@ export function authorizedModelProviderPreset(
     return {
       id,
       baseUrl: 'https://api.x.ai/v1',
+      apiMode: 'codex_responses',
       requestStyle: 'openai-responses',
+      headers: {},
+    }
+  }
+  if (id === 'claude-oauth') {
+    return {
+      id,
+      baseUrl: 'https://api.anthropic.com',
+      apiMode: 'anthropic_messages',
+      requestStyle: 'anthropic-messages',
+      headers: { 'anthropic-beta': 'oauth-2025-04-20' },
+    }
+  }
+  if (id === 'minimax-oauth') {
+    return {
+      id,
+      baseUrl: 'https://api.minimax.io/anthropic',
+      apiMode: 'anthropic_messages',
+      requestStyle: 'anthropic-messages',
       headers: {},
     }
   }
   return {
     id,
     baseUrl: 'https://portal.qwen.ai/v1',
+    apiMode: 'chat_completions',
     requestStyle: 'openai-chat',
     headers: qwenHeaders(),
   }

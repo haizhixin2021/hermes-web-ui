@@ -1,7 +1,8 @@
 # Architecture
 
-Hermes Web UI is a TypeScript monorepo that ships a browser dashboard, a Koa
-backend, and an Electron desktop distribution around Hermes Agent.
+Ekko Studio is a TypeScript monorepo that ships a local-first AI workspace
+through a web console, a Koa backend, and an Electron desktop app. It integrates
+Ekko Agent, Hermes Agent, and coding agents for chat, coding, and workflows.
 
 ## Package Boundaries
 
@@ -9,6 +10,7 @@ backend, and an Electron desktop distribution around Hermes Agent.
 | --- | --- | --- |
 | Client | `packages/client/src` | Vue UI, routing, Pinia stores, API wrappers, i18n, browser-visible state. |
 | Server | `packages/server/src` | HTTP API, auth, Socket.IO, SQLite stores, file access, Hermes runtime integration. |
+| Ekko Agent | `packages/ekko-agent` | Canonical Ekko runtime, profile facade, providers, tools, memory, skills, conversations, and package API. |
 | Desktop | `packages/desktop` | Electron shell, local Web UI server bootstrap, updater, bundled Python/Hermes runtime. |
 | Tests | `tests` | Vitest unit/integration tests and Playwright browser tests. |
 | CI | `.github/workflows` | Build, e2e, lockfile, Docker, and desktop release automation. |
@@ -17,7 +19,7 @@ backend, and an Electron desktop distribution around Hermes Agent.
 
 1. The browser loads the Vite-built client from the Koa server.
 2. Client modules call API helpers from `packages/client/src/api`.
-3. Server routes in `packages/server/src/routes` wire HTTP paths to controllers.
+3. Server routes in `packages/server/src/modules/*/routes` wire HTTP paths to controllers.
 4. Controllers validate request concerns and delegate reusable behavior to services.
 5. Services own side effects: files, SQLite, Hermes profiles, subprocesses, bridges, and credentials.
 6. Long-running chat and group-chat flows use Socket.IO namespaces managed by server services.
@@ -36,17 +38,22 @@ should not duplicate server persistence rules.
 
 ## Server Structure
 
-- `routes/` registers HTTP and WebSocket entry points.
-- `controllers/` handles request-level behavior.
-- `services/` owns reusable IO, domain behavior, external process calls, and integration logic.
-- `db/` owns SQLite schemas and stores.
-- `middleware/` owns request middleware such as user auth.
-- `shared/` contains cross-server constants and helpers.
+Server code is separated by business ownership under `modules/studio`,
+`modules/hermes`, `modules/ekko`, and `modules/coding-agents`; concrete module
+composition belongs in `bootstrap`.
+See `docs/harness/server-module-boundaries.md` for the complete target tree,
+ownership decisions, allowed dependency matrix, and migration rules.
+
+- Module `routes/` register HTTP entry points; `sockets/` own Socket.IO transports.
+- Module `controllers/` handle request-level behavior.
+- Module `services/` own reusable IO, domain behavior, processes, and integrations.
+- Studio `repositories/` and `infrastructure/` own application persistence.
+- Studio `middleware/legacy-app-api.ts` is the only released App and MCU firmware URL compatibility map.
 
 Architecture rules:
 
 - Register local API routes before proxy catch-all routes.
-- Keep auth behavior centralized in `packages/server/src/services/auth.ts`.
+- Keep auth behavior under `packages/server/src/modules/studio/services/auth`.
 - Prefer `execFile` or `spawn` with argument arrays over shell command strings.
 - Use structured file and YAML/JSON parsers when editing structured data.
 
@@ -82,6 +89,49 @@ Desktop packaging is intentionally split:
 Do not make a Windows job require macOS `.dmg` files or a Linux job require
 Windows installers. Keep `fail_on_unmatched_files: true` where platform-specific
 artifact lists make the expectation explicit.
+
+### Desktop Hermes Runtime
+
+Hermes runtime assets are built separately by
+`.github/workflows/desktop-runtime.yml`. `packages/desktop/scripts/runtime-config.mjs`
+pins an upstream Hermes version, Git ref, and full commit; version overrides
+must supply the ref and commit together.
+
+The portable Node.js included in runtime assets is pinned independently from
+the GitHub Actions runner. Manual runtime dispatches take a target release tag;
+when the release does not exist, the upload step creates it with the workflow's
+`GITHUB_TOKEN`. Do not pre-publish runtime-only releases with a user token,
+because that emits `release.published` and starts the normal Web UI and Docker
+release workflows.
+
+The published runtime keeps this updateable layout:
+
+```text
+python/                 Hermes Agent Git checkout and source root
+  .git/
+  base/                 Windows python-build-standalone base runtime
+  venv/                 bundled Python environment
+    Scripts/python.exe  Windows PEP 405 venv interpreter
+  agent-browser/
+  node/                  browser CLI npm prefix
+  ms-playwright/
+node/                    bundled Node.js
+git/                     bundled MinGit on Windows
+runtime-manifest.json
+```
+
+`prepare:runtime` fetches the exact source commit and installs its locked
+dependencies into `python/venv`. On Windows, the standalone base interpreter is
+embedded at `python/base` and a sibling PEP 405 venv wraps it. Windows requires
+an absolute `pyvenv.cfg` home, so the build, package validation, extraction, and
+runtime migration paths rebase that value before launching Python. This lets
+upstream `hermes update` safely target the environment through `VIRTUAL_ENV`.
+The build also creates the upstream TUI/dashboard and verifies that the retained
+checkout is clean. `package:runtime` includes the source and Git metadata in the
+GitHub/CF archive and records them in schema 2 of the runtime manifest. Do not
+patch tracked Hermes source during this build:
+Studio-specific integration belongs in Studio, and the clean checkout is what
+allows users to run the upstream `hermes update` command directly.
 
 ## Validation Surface
 

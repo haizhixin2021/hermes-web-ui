@@ -4,8 +4,9 @@ import {
   isAgentMentioned,
   isReservedMentionName,
   resolveMentionTargets,
+  resolveStructuredMentionTargets,
   stripMentionRoutingTokens,
-} from '../../packages/server/src/services/hermes/group-chat/mention-routing'
+} from '../../packages/server/src/modules/studio/services/group-chat/mention-routing'
 
 type TestAgent = { name: string; id?: string; agentId?: string; profile?: string }
 
@@ -36,6 +37,14 @@ describe('group chat mention routing', () => {
     expect(isAgentMentioned('@RegexxBot should not match', 'Regex.Bot')).toBe(false)
     expect(isAgentMentioned('@Alice, please review', 'Alice')).toBe(true)
     expect(isAgentMentioned('mailto@Alice.example', 'Alice')).toBe(false)
+  })
+
+  it('routes mentions after CJK speaker prefixes, emoji, and punctuation', () => {
+    expect(isAgentMentioned('hermes：@Bob 老板喊你，出来露个脸。', 'Bob')).toBe(true)
+    expect(isAgentMentioned('老板喊你@Bob 出来露个脸。', 'Bob')).toBe(true)
+    expect(isAgentMentioned('🤖@Bob 出来露个脸。', 'Bob')).toBe(true)
+    expect(isAgentMentioned('(agent)@Bob 出来露个脸。', 'Bob')).toBe(true)
+    expect(isAgentMentioned('mailto@Bob.example', 'Bob')).toBe(false)
   })
 
   it('routes @all to every room agent except the sender identity', () => {
@@ -96,6 +105,21 @@ describe('group chat mention routing', () => {
 
   it('dedupes mixed @all and explicit mentions', () => {
     expect(resolveMentionTargets(agents, '@all @Bob compare plans', 'socket-alice').map(a => a.name)).toEqual(['Bob', 'Regex.Bot'])
+  })
+
+  it('routes only stable structured agent identities and never resolves display-name collisions', () => {
+    const sameNameAgents: TestAgent[] = [
+      { name: 'Alex', id: 'socket-agent-alex', agentId: 'agent-alex' },
+      { name: 'Alex', id: 'socket-agent-alex-2', agentId: 'agent-alex-2' },
+    ]
+
+    expect(resolveStructuredMentionTargets(sameNameAgents, [
+      { type: 'agent', participantId: 'agent-alex-2' },
+    ], 'human-alex').map(agent => agent.agentId)).toEqual(['agent-alex-2'])
+    expect(resolveStructuredMentionTargets(sameNameAgents, [
+      { type: 'agent', participantId: 'missing-agent' },
+    ], 'human-alex')).toEqual([])
+    expect(resolveStructuredMentionTargets(sameNameAgents, [], 'human-alex')).toEqual([])
   })
 
   it('strips the broadcast token and this agent mention before routing to the model', () => {

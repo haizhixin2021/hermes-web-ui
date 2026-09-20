@@ -13,7 +13,8 @@ import type {
   ModelUsage,
 } from '../types'
 import { ModelProviderError } from '../errors'
-import { isPlainRecord, parseJson, postJson, postStream, providerUrl, readServerSentEvents, requestHeaders } from '../http'
+import { isPlainRecord, parseJson, postJson, postStream, providerUrl, readServerSentEvents, modelRequestHeaders } from '../http'
+import { agentReasoningText, normalizeAgentReasoning } from '../messages'
 
 interface AnthropicPayload {
   model: string
@@ -36,7 +37,8 @@ interface AnthropicPayload {
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
-  | { type: 'thinking'; thinking: string }
+  | { type: 'thinking'; thinking: string; signature?: string }
+  | { type: 'redacted_thinking'; data: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; tool_use_id: string; content: string | Array<AnthropicToolResultContent> }
 
@@ -80,13 +82,17 @@ export class AnthropicMessagesModelClient implements ModelClient {
     this.capabilities = { ...capabilities, ...config.capabilities }
   }
 
+  requestTarget(): string {
+    return anthropicUrl(this.config)
+  }
+
   async create(request: ModelRequest): Promise<ModelResponse> {
     const response = await postJson<AnthropicResponse>(
       this.config,
       this.fetchImpl,
       anthropicUrl(this.config),
       toAnthropicMessagesPayload(this.config, { ...request, stream: false }),
-      anthropicHeaders(this.config),
+      anthropicHeaders(this.config, request),
       request.signal,
     )
     assertAnthropicSuccess(this.config, response)
@@ -99,11 +105,12 @@ export class AnthropicMessagesModelClient implements ModelClient {
       this.fetchImpl,
       anthropicUrl(this.config),
       toAnthropicMessagesPayload(this.config, { ...request, stream: true }),
-      anthropicHeaders(this.config),
+      anthropicHeaders(this.config, request),
       request.signal,
     )
 
     const toolCallBlocks = new Map<number, { id: string; name: string; argumentsText: string }>()
+    const reasoningBlocks = new Map<number, AnthropicContentBlock>()
     let finishReason: string | undefined
     let usage: ModelUsage | undefined
 
@@ -125,6 +132,16 @@ export class AnthropicMessagesModelClient implements ModelClient {
         if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
           toolCallBlocks.set(index, { id: block.id, name: block.name, argumentsText: '' })
         }
+        if (block.type === 'thinking') {
+          reasoningBlocks.set(index, {
+            type: 'thinking',
+            thinking: typeof block.thinking === 'string' ? block.thinking : '',
+            ...(typeof block.signature === 'string' ? { signature: block.signature } : {}),
+          })
+        }
+        if (block.type === 'redacted_thinking' && typeof block.data === 'string') {
+          reasoningBlocks.set(index, { type: 'redacted_thinking', data: block.data })
+        }
       }
 
       if (chunk.type === 'content_block_delta' && isPlainRecord(chunk.delta)) {
@@ -132,7 +149,17 @@ export class AnthropicMessagesModelClient implements ModelClient {
           yield { type: 'text-delta', text: chunk.delta.text }
         }
         if (chunk.delta.type === 'thinking_delta' && typeof chunk.delta.thinking === 'string') {
+          const index = typeof chunk.index === 'number' ? chunk.index : 0
+          const current = reasoningBlocks.get(index)
+          if (current?.type === 'thinking') current.thinking += chunk.delta.thinking
           yield { type: 'reasoning-delta', text: chunk.delta.thinking }
+        }
+        if (chunk.delta.type === 'signature_delta' && typeof chunk.delta.signature === 'string') {
+          const index = typeof chunk.index === 'number' ? chunk.index : 0
+          const current = reasoningBlocks.get(index)
+          if (current?.type === 'thinking') {
+            current.signature = `${current.signature || ''}${chunk.delta.signature}`
+          }
         }
         if (chunk.delta.type === 'input_json_delta' && typeof chunk.delta.partial_json === 'string') {
           const index = typeof chunk.index === 'number' ? chunk.index : 0
@@ -150,7 +177,16 @@ export class AnthropicMessagesModelClient implements ModelClient {
           yield { type: 'tool-call', toolCall: normalizeToolCall(toolCall.id, toolCall.name, toolCall.argumentsText) }
         }
         if (usage) yield { type: 'usage', usage }
-        yield { type: 'done', response: { finishReason } }
+        yield {
+          type: 'done',
+          response: {
+            finishReason,
+            reasoning: normalizeAgentReasoning(
+              undefined,
+              anthropicReasoningDetails([...reasoningBlocks.values()]),
+            ),
+          },
+        }
         return
       }
     }
@@ -158,14 +194,23 @@ export class AnthropicMessagesModelClient implements ModelClient {
 }
 
 export function toAnthropicMessagesPayload(config: ModelProviderConfig, request: ModelRequest): AnthropicPayload {
+  const tools = request.tools?.length ? request.tools.map(toAnthropicTool) : undefined
   return {
     model: request.model ?? config.defaultModel,
     system: request.messages.filter(message => message.role === 'system').map(message => message.content).join('\n\n') || undefined,
-    messages: request.messages.filter(message => message.role !== 'system').map(toAnthropicMessage),
+    messages: request.messages
+      .filter(message => message.role !== 'system')
+      .map(message => toAnthropicMessage(message, config, request.model ?? config.defaultModel)),
     max_tokens: request.maxTokens ?? 4096,
     temperature: request.temperature,
-    tools: request.tools?.map(toAnthropicTool),
-    tool_choice: request.toolChoice ? { type: request.toolChoice === 'required' ? 'any' : request.toolChoice } : undefined,
+    ...(tools
+      ? {
+          tools,
+          ...(request.toolChoice
+            ? { tool_choice: { type: request.toolChoice === 'required' ? 'any' : request.toolChoice } }
+            : {}),
+        }
+      : {}),
     stream: request.stream,
   }
 }
@@ -175,7 +220,10 @@ export function normalizeAnthropicResponse(response: AnthropicResponse): ModelRe
     id: response.id,
     model: response.model,
     content: response.content?.filter(block => block.type === 'text').map(block => block.text).join('') ?? '',
-    reasoning: response.content?.filter(block => block.type === 'thinking').map(block => block.thinking).join('') || undefined,
+    reasoning: normalizeAgentReasoning(
+      response.content?.filter(block => block.type === 'thinking').map(block => block.thinking).join('') || undefined,
+      anthropicReasoningDetails(response.content),
+    ),
     toolCalls: response.content?.filter(block => block.type === 'tool_use').map(block => ({
       id: block.id,
       name: block.name,
@@ -188,11 +236,16 @@ export function normalizeAnthropicResponse(response: AnthropicResponse): ModelRe
   }
 }
 
-function toAnthropicMessage(message: AgentMessage): AnthropicPayload['messages'][number] {
+function toAnthropicMessage(
+  message: AgentMessage,
+  config: ModelProviderConfig,
+  model: string,
+): AnthropicPayload['messages'][number] {
   if (message.role === 'assistant') {
     return {
       role: 'assistant',
       content: [
+        ...anthropicReasoningBlocks(message, config, model),
         ...(message.content ? [{ type: 'text' as const, text: message.content }] : []),
         ...(message.toolCalls?.map(toolCall => ({
           type: 'tool_use' as const,
@@ -236,6 +289,59 @@ function toAnthropicMessage(message: AgentMessage): AnthropicPayload['messages']
       })),
     ],
   }
+}
+
+function anthropicReasoningBlocks(
+  message: AgentMessage,
+  config: ModelProviderConfig,
+  model: string,
+): AnthropicContentBlock[] {
+  if (message.role !== 'assistant') return []
+  const nativeBlocks = message.reasoning?.native?.format === 'anthropic-thinking-blocks' &&
+    Array.isArray(message.reasoning.native.data)
+    ? message.reasoning.native.data.filter(isAnthropicReasoningBlock)
+    : []
+  if (isClaudeModel(config, model)) {
+    return nativeBlocks.filter(block =>
+      block.type === 'redacted_thinking' ||
+      (block.type === 'thinking' && typeof block.signature === 'string' && !!block.signature))
+  }
+  const unsignedBlocks = nativeBlocks.filter(block =>
+    block.type === 'thinking' && !block.signature)
+  if (unsignedBlocks.length) return unsignedBlocks
+  const text = agentReasoningText(message.reasoning)
+  return text ? [{ type: 'thinking', thinking: text }] : []
+}
+
+function anthropicReasoningDetails(content: AnthropicResponse['content'] | AnthropicContentBlock[]) {
+  const blocks = content?.filter(isAnthropicReasoningBlock) ?? []
+  return blocks.length
+    ? {
+        format: 'anthropic-thinking-blocks' as const,
+        data: blocks,
+      }
+    : undefined
+}
+
+function isAnthropicReasoningBlock(value: unknown): value is Extract<
+  AnthropicContentBlock,
+  { type: 'thinking' | 'redacted_thinking' }
+> {
+  if (!isPlainRecord(value)) return false
+  if (value.type === 'thinking') {
+    return typeof value.thinking === 'string' &&
+      (value.signature === undefined || typeof value.signature === 'string')
+  }
+  return value.type === 'redacted_thinking' && typeof value.data === 'string'
+}
+
+function isClaudeModel(config: ModelProviderConfig, model: string): boolean {
+  const identifier = `${config.id} ${model}`.toLowerCase()
+  return identifier.includes('claude') ||
+    (
+      (config.id.toLowerCase().includes('anthropic') || config.id === 'claude-oauth') &&
+      ['sonnet', 'opus', 'haiku'].some(part => identifier.includes(part))
+    )
 }
 
 function toAnthropicTool(tool: AgentToolDefinition): NonNullable<AnthropicPayload['tools']>[number] {
@@ -284,10 +390,11 @@ function anthropicUrl(config: ModelProviderConfig): string {
   return providerUrl(config, 'https://api.anthropic.com/v1', config.endpointPath ?? defaultAnthropicEndpointPath(config))
 }
 
-function anthropicHeaders(config: ModelProviderConfig): HeadersInit {
-  const headers = requestHeaders(config, { 'anthropic-version': '2023-06-01' }) as Record<string, string>
-  if (isOfficialAnthropicBaseUrl(config.baseUrl)) delete headers.authorization
-  if (config.apiKey) headers['x-api-key'] = config.apiKey
+function anthropicHeaders(config: ModelProviderConfig, request: ModelRequest): HeadersInit {
+  const headers = modelRequestHeaders(config, request, { 'anthropic-version': '2023-06-01' }) as Record<string, string>
+  const usesBearerAuth = ['claude-oauth', 'minimax-oauth'].includes(config.id)
+  if (isOfficialAnthropicBaseUrl(config.baseUrl) && !usesBearerAuth) delete headers.authorization
+  if (config.apiKey && !usesBearerAuth) headers['x-api-key'] = config.apiKey
   return headers
 }
 

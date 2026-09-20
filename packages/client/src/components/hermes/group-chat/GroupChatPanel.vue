@@ -1,31 +1,102 @@
 <script setup lang="ts">
-import { ref, computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import DshSessionPresetSelect from "@/components/coding-agents/dsh/DshSessionPresetSelect.vue"
+import { ref, computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useMessage, NInput, NButton, NSpace, NSelect, NPopover, NPopconfirm, NInputNumber, NDropdown, NModal, type DropdownOption } from 'naive-ui'
+import { useMessage, NInput, NButton, NSpace, NSelect, NPopconfirm, NInputNumber, NDropdown, NModal, NPopover, NDrawer, NDrawerContent, NSwitch, type DropdownOption } from 'naive-ui'
 import { useGroupChatStore } from '@/stores/hermes/group-chat'
 import { useAppStore } from '@/stores/hermes/app'
 import { useProfilesStore } from '@/stores/hermes/profiles'
-import { updateRoomConfig, forceCompress } from '@/api/hermes/group-chat'
+import {
+    createGroupAgentPreset,
+    deleteGroupAgentPreset,
+    getRoomSummary,
+    groupAgentPresetToRoomAgentInput,
+    listGroupAgentPresets,
+    listStoppedRoomAgentHandoffs,
+    continueRoomAgentHandoff,
+    updateGroupAgentPreset,
+    updateRoomConfig,
+    updateRoomSummary,
+} from '@/api/studio/group-chat'
+import {
+    decideGroupAgentPairing,
+    leaveLocalGroupAgentRoom,
+    listLocalGroupAgentConnections,
+    listPendingGroupAgentPairings,
+    renameLocalGroupAgentRoom,
+    updateGuestAgentPolicy,
+    type GroupAgentPairingRequest,
+    type LocalGroupAgentConnection,
+} from '@/api/studio/group-chat-agent-link'
 import GroupMessageList from './GroupMessageList.vue'
 import GroupChatInput from './GroupChatInput.vue'
+import GroupRoomAgentAvatar from './GroupRoomAgentAvatar.vue'
+import MessageQueueFloatPanel from '@/components/hermes/chat/MessageQueueFloatPanel.vue'
+import PendingInteractionCountdown from '@/components/hermes/chat/PendingInteractionCountdown.vue'
 import FolderPicker from '@/components/hermes/chat/FolderPicker.vue'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
 import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
-import SettingsCircuitBadge from '@/components/layout/SettingsCircuitBadge.vue'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { Attachment } from '@/stores/hermes/chat'
-import type { RoomAgent, RoomInfo } from '@/api/hermes/group-chat'
+import type {
+    GroupAgentPreset,
+    GroupAgentPresetInput,
+    GroupChatMention,
+    MemberInfo,
+    RoomAgent,
+    RoomAgentInput,
+    RoomInfo,
+    RoomSummaryAnchor,
+    RoomSummaryConfig,
+    RoomSummaryState,
+} from '@/api/studio/group-chat'
 import { useFilesStore } from '@/stores/hermes/files'
 import { useToolPanelStore } from '@/stores/hermes/tool-panel'
 import { hasDesktopBrowserBridge } from '@/utils/desktop-bridge'
 import { OPEN_DESKTOP_BROWSER_PANEL_EVENT } from '@/utils/desktop-browser'
+import {
+    createBrowserAnnotationAttachment,
+    type BrowserAnnotationSubmission,
+} from '@/utils/browser-annotation-submit'
+import { canScopedCodingAgentUseProvider } from '@/utils/codingAgentProviders'
+import {
+    inferCodingAgentApiMode,
+    normalizeCodingAgentApiMode,
+    type CodingAgentApiMode,
+} from '@/api/coding-agents'
+import type { ProfileAvatar as ProfileAvatarData } from '@/api/hermes/profiles'
+import {
+    defaultGroupAgentAvatar,
+    groupAgentAvatar,
+    parseStoredAvatar,
+} from '@/utils/group-agent-avatar'
+import { generateGroupChatInviteCode } from '@/utils/group-chat-invite-code'
+import { buildRemoteGroupChatRooms, type RemoteGroupChatRoom } from '@/utils/group-chat-remote-rooms'
+import { handoffErrorTranslationKey } from './handoff-presentation'
+import { clearGroupChatRoomDraft } from './group-chat-room-drafts'
+import {
+    fetchAgentStatusSnapshot,
+    isAgentStatusAvailable,
+    type AgentStatusSnapshot,
+} from '@/api/agent-status'
 
 const FilesPanel = defineAsyncComponent(async () => (await import('@/components/hermes/chat/FilesPanel.vue')).default)
 const FilePreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/FilePreview.vue')).default)
 const WorkspaceDiffPreview = defineAsyncComponent(async () => (await import('@/components/hermes/files/WorkspaceDiffPreview.vue')).default)
 const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('@/components/hermes/chat/DesktopBrowserPanel.vue')).default)
+const TerminalPanel = defineAsyncComponent(async () => (await import('@/components/hermes/chat/TerminalPanel.vue')).default)
 
+const props = withDefaults(defineProps<{
+    standalone?: boolean
+}>(), {
+    standalone: false,
+})
+
+const emit = defineEmits<{
+    requestAgentLink: []
+    requestAgentEdit: [agent: RoomAgent]
+}>()
 const { t } = useI18n()
 const router = useRouter()
 const message = useMessage()
@@ -35,7 +106,7 @@ const profilesStore = useProfilesStore()
 const filesStore = useFilesStore()
 const toolPanelStore = useToolPanelStore()
 
-const showSidebar = ref(window.innerWidth > 768)
+const showSidebar = ref(!props.standalone && window.innerWidth > 768)
 watch(
     showSidebar,
     expanded => appStore.setPageSidebarExpanded(expanded),
@@ -43,19 +114,81 @@ watch(
 )
 const showCreateModal = ref(false)
 const showCloneModal = ref(false)
-const showAddAgentModal = ref(false)
-const showCompressionModal = ref(false)
+const showAddAgentDrawer = ref(false)
+const showGroupChatRefactorNotice = ref(false)
+const showManualRoomLinkModal = ref(false)
+const manualRoomLink = ref('')
+const manualRoomLinkInput = ref<HTMLInputElement | null>(null)
+const showMemberRail = ref(true)
+const editingAgent = ref<RoomAgent | null>(null)
+const isSavingAgent = ref(false)
+const agentStatusSnapshot = ref<AgentStatusSnapshot | null>(null)
+const showRoomSettingsModal = ref(false)
 const showUserProfileModal = ref(false)
 const userProfileName = ref('')
 const userProfileDescription = ref('')
 const isSavingUserProfile = ref(false)
-const compressionConfig = ref({ triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 })
-const isCompressing = ref(false)
+const summaryConfig = ref<RoomSummaryConfig>({
+    summaryProfile: 'default',
+    summaryProvider: '',
+    summaryModel: '',
+    summaryApiMode: 'chat_completions',
+    summaryEveryTurns: 20,
+})
+const agentHandoffEnabledDraft = ref(true)
+const agentHandoffMaxDepthDraft = ref<number | null>(4)
+const agentHandoffUnlimitedDraft = ref(false)
+const agentHandoffRecommendation = computed(() => Math.max(4, store.agents.length + 1))
+const isContinuingHandoff = ref(false)
+const roomSummaryState = ref<RoomSummaryState | null>(null)
+const roomSummaryAnchor = ref<RoomSummaryAnchor | null>(null)
+const roomSummaryDraft = ref('')
+const isLoadingRoomSummary = ref(false)
+const isSavingRoomSummary = ref(false)
+const inlineSummaryStatus = ref<{
+    roomId: string
+    status: 'summarizing' | 'success' | 'failed'
+    error: string
+} | null>(null)
+let inlineSummaryStatusTimer: ReturnType<typeof setTimeout> | null = null
+const roomNameDraft = ref('')
+const isSavingRoomName = ref(false)
 const inviteCodeDraft = ref('')
 const isSavingInviteCode = ref(false)
+const pendingAgentPairings = ref<GroupAgentPairingRequest[]>([])
+const remoteRoomConnections = ref<LocalGroupAgentConnection[]>([])
+const localRoomsCollapsed = ref(false)
+const remoteRoomsCollapsed = ref(false)
+const isDecidingAgentPairing = ref(false)
+const clarifyResponse = ref('')
+const allowGuestAgentsDraft = ref(false)
+const maxGuestAgentsPerMemberDraft = ref(1)
+const allowRemoteWorkspaceAccessDraft = ref(false)
+const isSavingGuestAgentPolicy = ref(false)
+let agentPairingRefreshTimer: ReturnType<typeof setInterval> | null = null
+let remoteRoomRefreshTimer: ReturnType<typeof setInterval> | null = null
+const selectedAgentType = ref<GroupAgentType>('hermes')
+const selectedAgentMode = ref<'scoped' | 'global'>('scoped')
 const selectedProfile = ref<string | null>(null)
+const selectedAgentProvider = ref('')
+const selectedAgentModel = ref('')
+const selectedAgentApiMode = ref<CodingAgentApiMode>('codex_responses')
+const selectedAgentReasoningEffort = ref('')
+const selectedRuntimePreset = ref<string>()
+const selectedRuntimePresetReady = ref(false)
 const agentName = ref('')
 const agentDescription = ref('')
+const agentAvatar = ref<ProfileAvatarData | null>(null)
+const agentAvatarFileInput = ref<HTMLInputElement | null>(null)
+const agentPresets = ref<GroupAgentPreset[]>([])
+const selectedAgentPresetId = ref<string | null>(null)
+const showAgentPresetDialog = ref(false)
+const agentPresetDialogMode = ref<'select' | 'manage'>('select')
+const agentPresetSearch = ref('')
+const pendingAgentPresetId = ref<string | null>(null)
+const isLoadingAgentPresets = ref(false)
+const agentPresetLoadError = ref('')
+const isSavingAgentPreset = ref(false)
 const cloneSourceRoomId = ref<string | null>(null)
 const cloneRoomName = ref('')
 const cloneInviteCode = ref('')
@@ -63,19 +196,37 @@ const contextRoomId = ref<string | null>(null)
 const showRoomContextMenu = ref(false)
 const roomContextMenuX = ref(0)
 const roomContextMenuY = ref(0)
-const groupChatInputRef = ref<(InstanceType<typeof GroupChatInput> & { addFiles?: (files: File[]) => void }) | null>(null)
+const remoteRoomContext = ref<RemoteGroupChatRoom | null>(null)
+const showRemoteRoomContextMenu = ref(false)
+const remoteRoomContextMenuX = ref(0)
+const remoteRoomContextMenuY = ref(0)
+const showRemoteRoomRenameModal = ref(false)
+const remoteRoomNameDraft = ref('')
+const remoteRoomBeingRenamed = ref<RemoteGroupChatRoom | null>(null)
+const remoteRoomBeingLeft = ref<RemoteGroupChatRoom | null>(null)
+const isUpdatingRemoteRoom = ref(false)
+const groupChatInputRef = ref<(InstanceType<typeof GroupChatInput> & {
+    addFiles?: (files: File[]) => void
+    insertMention?: (name: string, participantId?: string) => void
+    completeSend?: (success: boolean) => void
+}) | null>(null)
+const summarySettingsSectionRef = ref<HTMLElement | null>(null)
 const chatDropCounter = ref(0)
 const isChatDropActive = ref(false)
 const groupChatContentWrapperRef = ref<HTMLElement | null>(null)
+const groupChatSurfaceRef = ref<HTMLElement | null>(null)
+let roomFadeAnimation: Animation | null = null
 const showWorkspacePanel = ref(false)
-const activeWorkspacePanel = ref<'files' | 'browser'>('files')
+const toolPanelTransitionReady = ref(false)
+const activeWorkspacePanel = ref<'files' | 'terminal' | 'browser'>('files')
 const desktopBrowserAvailable = hasDesktopBrowserBridge()
 const workspacePanelMobile = ref(window.innerWidth <= 768)
+const GROUP_CHAT_REFACTOR_NOTICE_STORAGE_KEY = 'hermes.groupChat.refactorNotice.v1.acknowledged'
 const WORKSPACE_PANEL_MIN_WIDTH = 360
 const WORKSPACE_PANEL_DEFAULT_WIDTH = 560
 const WORKSPACE_PANEL_STORAGE_KEY = 'hermes.groupChat.workspacePanelWidth'
 const workspacePanelWidth = ref(loadWorkspacePanelWidth())
-const workspaceResizeStart = ref<{ x: number; width: number } | null>(null)
+const workspaceResizeStart = ref<{ x: number; width: number; deltaSign: 1 | -1 } | null>(null)
 const workspacePanelStyle = computed(() => ({
     width: workspacePanelMobile.value ? '100%' : `${workspacePanelWidth.value}px`,
 }))
@@ -84,13 +235,382 @@ const profileOptions = computed(() =>
     profilesStore.profiles.map(p => ({ label: p.name, value: p.name }))
 )
 
-function profileAvatarFor(profileName?: string) {
-    if (!profileName) return null
-    return profilesStore.profiles.find(profile => profile.name === profileName)?.avatar || null
+type GroupAgentType = 'hermes' | 'ekko' | 'codex' | 'claude' | 'pi' | 'grok' | 'opencode' | 'dsh'
+
+const groupAgentTypeDefinitions: Array<{ label: string; value: GroupAgentType }> = [
+    { label: 'Hermes', value: 'hermes' },
+    { label: 'Ekko', value: 'ekko' },
+    { label: 'Claude', value: 'claude' },
+    { label: 'Codex', value: 'codex' },
+    { label: 'Pi', value: 'pi' },
+    { label: 'Grok', value: 'grok' },
+    { label: 'OpenCode', value: 'opencode' },
+  { label: 'DeepSeek Harness', value: 'dsh' },
+]
+
+const groupAgentTypeOptions = computed(() => groupAgentTypeDefinitions.map((option) => {
+    const disabled = !isAgentStatusAvailable(agentStatusSnapshot.value, option.value)
+    return {
+        ...option,
+        disabled,
+        label: disabled ? `${option.label} · ${t('codingAgents.notInstalled')}` : option.label,
+    }
+}))
+
+const firstAvailableGroupAgentType = computed<GroupAgentType | null>(() =>
+    groupAgentTypeOptions.value.find(option => !option.disabled)?.value || null
+)
+const supportsGlobalAgentMode = computed(() => ['claude', 'codex', 'pi', 'grok', 'opencode', 'dsh'].includes(selectedAgentType.value))
+const usesGlobalAgentMode = computed(() => supportsGlobalAgentMode.value && selectedAgentMode.value === 'global')
+const agentModeOptions = computed(() => [
+    { label: t('codingAgents.launchModeGlobal'), value: 'global' },
+    { label: t('codingAgents.launchModeScoped'), value: 'scoped' },
+])
+
+function groupAgentDisplayName(agent: GroupAgentType): string {
+    return groupAgentTypeDefinitions.find(option => option.value === agent)?.label || agent
+}
+
+function isGroupAgentAvailable(agent: GroupAgentType): boolean {
+    return isAgentStatusAvailable(agentStatusSnapshot.value, agent)
+}
+
+function warnAgentUnavailable(agent: GroupAgentType) {
+    message.warning(t('codingAgents.installRequired', { agent: groupAgentDisplayName(agent) }))
+}
+
+async function refreshAgentAvailability() {
+    try {
+        agentStatusSnapshot.value = await fetchAgentStatusSnapshot()
+    } catch {
+        agentStatusSnapshot.value = null
+    }
+}
+
+function getAgentModelGroups(profile: string) {
+    return (appStore.profileModelGroups.find(entry => entry.profile === profile)?.groups || [])
+        .filter((group) => {
+            if (group.provider === 'moa') return selectedAgentType.value === 'hermes'
+            if (selectedAgentType.value === 'hermes') return true
+            const codingAgentId = selectedAgentType.value === 'ekko'
+                ? 'ekko-agent'
+                : selectedAgentType.value === 'claude'
+                    ? 'claude-code'
+                    : selectedAgentType.value === 'pi'
+                        ? 'pi'
+                        : selectedAgentType.value === 'grok'
+                            ? 'grok'
+                            : selectedAgentType.value === 'dsh' ? 'dsh' : selectedAgentType.value === 'opencode'
+                                ? 'opencode'
+                            : 'codex'
+            return canScopedCodingAgentUseProvider(codingAgentId, group.provider)
+        })
+}
+
+function getDefaultAgentModel(profile: string) {
+    const groups = getAgentModelGroups(profile)
+    const selectedGroup = groups.find(group => group.provider === appStore.selectedProvider)
+    if (
+        profile === profilesStore.activeProfileName &&
+        selectedGroup?.models.includes(appStore.selectedModel)
+    ) {
+        return { provider: appStore.selectedProvider, model: appStore.selectedModel }
+    }
+    const profileModels = appStore.profileModelGroups.find(entry => entry.profile === profile)
+    const defaultGroup = groups.find(group => group.provider === profileModels?.default_provider)
+    const fallbackGroup = defaultGroup || groups.find(group => group.models.length > 0)
+    return {
+        provider: fallbackGroup?.provider || '',
+        model: fallbackGroup?.models.includes(profileModels?.default || '')
+            ? profileModels?.default || ''
+            : fallbackGroup?.models[0] || '',
+    }
+}
+
+const agentProviderOptions = computed(() =>
+    getAgentModelGroups(selectedProfile.value || '').map(group => ({
+        label: group.label || group.provider,
+        value: group.provider,
+    }))
+)
+
+const agentModelOptions = computed(() => {
+    const group = getAgentModelGroups(selectedProfile.value || '')
+        .find(item => item.provider === selectedAgentProvider.value)
+    return (group?.models || []).map(modelId => ({
+        label: appStore.displayModelName(modelId, group?.provider),
+        value: modelId,
+    }))
+})
+
+const selectedAgentProviderGroup = computed(() =>
+    getAgentModelGroups(selectedProfile.value || '')
+        .find(item => item.provider === selectedAgentProvider.value)
+)
+
+const agentApiModeOptions = computed(() => [
+    { label: t('codingAgents.protocolOpenAiChat'), value: 'chat_completions' },
+    { label: t('codingAgents.protocolOpenAiResponses'), value: 'codex_responses' },
+    { label: t('codingAgents.protocolAnthropicMessages'), value: 'anthropic_messages' },
+])
+const filteredAgentPresets = computed(() => {
+    const query = agentPresetSearch.value.trim().toLocaleLowerCase()
+    if (!query) return agentPresets.value
+    return agentPresets.value.filter((preset) => {
+        const searchable = [
+            preset.name,
+            preset.description,
+            preset.profile,
+            preset.provider,
+            preset.model,
+            preset.validationError,
+        ].join(' ').toLocaleLowerCase()
+        return searchable.includes(query)
+    })
+})
+const pendingAgentPreset = computed(() =>
+    agentPresets.value.find(preset => preset.id === pendingAgentPresetId.value) || null
+)
+
+const agentReasoningEffortOptions = computed(() => [
+    { label: t('chat.reasoningEffort.options.default'), value: '' },
+    { label: t('chat.reasoningEffort.options.none'), value: 'none' },
+    { label: t('chat.reasoningEffort.options.minimal'), value: 'minimal' },
+    { label: t('chat.reasoningEffort.options.low'), value: 'low' },
+    { label: t('chat.reasoningEffort.options.medium'), value: 'medium' },
+    { label: t('chat.reasoningEffort.options.high'), value: 'high' },
+    { label: t('chat.reasoningEffort.options.xhigh'), value: 'xhigh' },
+    { label: t('chat.reasoningEffort.options.max'), value: 'max' },
+])
+
+const summaryModelGroups = computed(() =>
+    (appStore.profileModelGroups.find(entry => entry.profile === summaryConfig.value.summaryProfile)?.groups || [])
+        .filter(group => group.provider !== 'moa' && canScopedCodingAgentUseProvider('ekko-agent', group.provider))
+)
+const summaryProviderOptions = computed(() => summaryModelGroups.value.map(group => ({
+    label: group.label || group.provider,
+    value: group.provider,
+})))
+const selectedSummaryProviderGroup = computed(() =>
+    summaryModelGroups.value.find(group => group.provider === summaryConfig.value.summaryProvider)
+)
+const summaryModelOptions = computed(() =>
+    (selectedSummaryProviderGroup.value?.models || []).map(model => ({
+        label: appStore.displayModelName(model, summaryConfig.value.summaryProvider),
+        value: model,
+    }))
+)
+const summaryApiModeOptions = computed(() => [
+    { label: t('codingAgents.protocolOpenAiChat'), value: 'chat_completions' },
+    { label: t('codingAgents.protocolOpenAiResponses'), value: 'codex_responses' },
+    { label: t('codingAgents.protocolAnthropicMessages'), value: 'anthropic_messages' },
+])
+const liveRoomSummaryState = computed(() => {
+    const roomId = store.currentRoomId
+    return (roomId && store.roomSummaryStates.get(roomId))
+        || (roomSummaryState.value?.roomId === roomId ? roomSummaryState.value : null)
+})
+
+function clearInlineSummaryStatusTimer() {
+    if (inlineSummaryStatusTimer === null) return
+    clearTimeout(inlineSummaryStatusTimer)
+    inlineSummaryStatusTimer = null
+}
+
+function hideInlineSummaryStatus() {
+    clearInlineSummaryStatusTimer()
+    inlineSummaryStatus.value = null
+}
+
+watch(
+    () => {
+        const state = liveRoomSummaryState.value
+        return state ? `${state.roomId}:${state.version}:${state.status}:${state.updatedAt}` : ''
+    },
+    async () => {
+        const state = liveRoomSummaryState.value
+        if (!state || state.roomId !== store.currentRoomId) {
+            hideInlineSummaryStatus()
+            return
+        }
+        if (state.status === 'summarizing') {
+            clearInlineSummaryStatusTimer()
+            inlineSummaryStatus.value = {
+                roomId: state.roomId,
+                status: 'summarizing',
+                error: '',
+            }
+        } else if (state.status === 'idle') {
+            hideInlineSummaryStatus()
+        } else if (
+            (state.status === 'success' || state.status === 'failed')
+            && inlineSummaryStatus.value?.roomId === state.roomId
+            && inlineSummaryStatus.value.status === 'summarizing'
+        ) {
+            inlineSummaryStatus.value = {
+                roomId: state.roomId,
+                status: state.status,
+                error: state.status === 'failed' ? String(state.lastError || '').trim() : '',
+            }
+            clearInlineSummaryStatusTimer()
+            const completedRoomId = state.roomId
+            const timer = setTimeout(() => {
+                if (inlineSummaryStatusTimer !== timer) return
+                if (inlineSummaryStatus.value?.roomId === completedRoomId) {
+                    inlineSummaryStatus.value = null
+                }
+                inlineSummaryStatusTimer = null
+            }, state.status === 'failed' ? 6000 : 3000)
+            inlineSummaryStatusTimer = timer
+        }
+        if (!showRoomSettingsModal.value) return
+        roomSummaryState.value = state
+        if (state.status === 'success') roomSummaryDraft.value = state.summary
+        try {
+            const result = await getRoomSummary(state.roomId)
+            if (store.currentRoomId === state.roomId) roomSummaryAnchor.value = result.anchor
+        } catch { /* the next settings open refreshes it */ }
+    },
+    { flush: 'sync' },
+)
+
+function handleSummaryProviderChange(provider: string) {
+    summaryConfig.value.summaryProvider = provider
+    const group = summaryModelGroups.value.find(item => item.provider === provider)
+    summaryConfig.value.summaryModel = group?.models[0] || ''
+    summaryConfig.value.summaryApiMode = normalizeCodingAgentApiMode(
+        group?.api_mode,
+        inferCodingAgentApiMode(group?.provider || provider, group?.base_url),
+    )
+}
+
+const agentAvatarPreview = computed(() =>
+    agentAvatar.value || defaultGroupAgentAvatar(selectedAgentType.value)
+)
+
+const canConfirmAddAgent = computed(() =>
+    Boolean(
+        isGroupAgentAvailable(selectedAgentType.value) &&
+        (selectedAgentType.value !== 'dsh' || (selectedRuntimePreset.value && selectedRuntimePresetReady.value)) &&
+        selectedProfile.value &&
+        (usesGlobalAgentMode.value || (
+            selectedAgentProvider.value &&
+            selectedAgentModel.value &&
+            (selectedAgentType.value === 'hermes' || selectedAgentApiMode.value)
+        )),
+    )
+)
+
+function syncAgentApiMode() {
+    const group = selectedAgentProviderGroup.value
+    selectedAgentApiMode.value = normalizeCodingAgentApiMode(
+        group?.api_mode,
+        inferCodingAgentApiMode(group?.provider || selectedAgentProvider.value, group?.base_url),
+    )
+}
+
+function syncAgentModelSelection(profile: string) {
+    const defaults = getDefaultAgentModel(profile)
+    selectedAgentProvider.value = defaults.provider
+    selectedAgentModel.value = defaults.model
+    selectedAgentReasoningEffort.value = ''
+    syncAgentApiMode()
+}
+
+function handleAgentProfileChange(profile: string) {
+    selectedProfile.value = profile
+    syncAgentModelSelection(profile)
+}
+
+function handleAgentTypeChange(agent: GroupAgentType) {
+    if (!isGroupAgentAvailable(agent)) {
+        warnAgentUnavailable(agent)
+        return
+    }
+    selectedRuntimePreset.value = undefined
+    selectedRuntimePresetReady.value = false
+    selectedAgentType.value = agent
+    if (!['claude', 'codex', 'pi', 'grok', 'opencode', 'dsh'].includes(agent)) selectedAgentMode.value = 'scoped'
+    if (selectedProfile.value) syncAgentModelSelection(selectedProfile.value)
+}
+
+function handleAgentModeChange(mode: 'scoped' | 'global') {
+    selectedAgentMode.value = mode
+    selectedAgentPresetId.value = null
+}
+
+function handleAgentProviderChange(provider: string) {
+    selectedAgentProvider.value = provider
+    selectedAgentModel.value = agentModelOptions.value[0]?.value || ''
+    selectedAgentReasoningEffort.value = ''
+    syncAgentApiMode()
+}
+
+function handleAgentModelChange(model: string) {
+    selectedAgentModel.value = model
+    selectedAgentReasoningEffort.value = ''
 }
 
 function agentAvatarName(agent: RoomAgent): string {
-    return agent.profile || agent.name || agent.agentId
+    return agent.agent || 'hermes'
+}
+
+function agentContextStatus(agent: RoomAgent): { agentName: string; status: string } | undefined {
+    return store.contextStatuses.get(agent.name)
+        || Array.from(store.contextStatuses.values()).find(status => status.agentName === agent.name)
+}
+
+function agentActivityLabel(agent: RoomAgent): string {
+    return agentContextStatus(agent)?.status === 'compressing'
+        ? t('groupChat.agentCompressing')
+        : t('groupChat.agentReplying')
+}
+
+function canStopAgent(agent: RoomAgent): boolean {
+    return currentRoomCanManage.value
+        || (
+            agent.executorType === 'remote'
+            && agent.ownerMemberId === store.userId
+        )
+}
+
+function canRemoveAgent(agent: RoomAgent): boolean {
+    return currentRoomCanManage.value
+        || (
+            agent.executorType === 'remote'
+            && agent.ownerMemberId === store.userId
+        )
+}
+
+function handleMentionAgent(agent: RoomAgent) {
+    if (agent.connectionStatus === 'offline') return
+    groupChatInputRef.value?.insertMention?.(agent.name, agent.agentId)
+}
+
+function handleAgentRailAdd() {
+    if (props.standalone) {
+        emit('requestAgentLink')
+        return
+    }
+    handleAddAgent()
+}
+
+function handleAgentRailClick(agent: RoomAgent) {
+    if (currentRoomCanManage.value && agent.executorType !== 'remote') {
+        void handleEditAgent(agent)
+        return
+    }
+    if (
+        props.standalone
+        && agent.executorType === 'remote'
+        && agent.ownerMemberId === store.userId
+        && Boolean(agent.connectorId)
+        && Boolean(agent.remoteOrigin)
+    ) {
+        emit('requestAgentEdit', agent)
+        return
+    }
+    handleMentionAgent(agent)
 }
 
 const hasRoom = computed(() => !!store.currentRoomId)
@@ -99,9 +619,80 @@ const contextRoom = computed(() => store.rooms.find(room => room.id === contextR
 function canManageRoom(room: Pick<RoomInfo, 'canManage'> | null | undefined): boolean {
     return room?.canManage === true
 }
-const currentRoomCanManage = computed(() => canManageRoom(currentRoom.value))
-const visibleApproval = computed(() => currentRoomCanManage.value ? store.activePendingApproval : null)
+const currentRoomCanManage = computed(() => !props.standalone && canManageRoom(currentRoom.value))
+provide('hermesWorkspaceFilePreview', currentRoomCanManage)
+const currentRoomCanMentionAll = computed(() => !props.standalone && currentRoom.value?.canMentionAll === true)
+const currentRoomNeedsSummaryConfiguration = computed(() => {
+    if (props.standalone) return false
+    const room = currentRoom.value
+    if (!room) return false
+    return !String(room.summaryProfile || '').trim()
+        || !String(room.summaryProvider || '').trim()
+        || !String(room.summaryModel || '').trim()
+        || !String(room.summaryApiMode || '').trim()
+        || Number(room.summaryEveryTurns || 0) < 1
+})
+const railMembers = computed<MemberInfo[]>(() => {
+    const members = store.members.some(member => member.userId === store.userId)
+        ? [...store.members]
+        : [{
+            id: `current:${store.userId}`,
+            userId: store.userId,
+            name: store.userName || t('groupChat.you'),
+            description: '',
+            joinedAt: 0,
+            avatar: store.currentUserAvatar,
+        }, ...store.members]
+    const ownerMemberId = currentRoom.value?.ownerMemberId || ''
+    return members.sort((left, right) => {
+        const rank = (member: MemberInfo) => {
+            if (ownerMemberId && member.userId === ownerMemberId) return 0
+            if (member.userId === store.userId) return 1
+            return 2
+        }
+        return rank(left) - rank(right)
+            || Number(left.joinedAt || 0) - Number(right.joinedAt || 0)
+            || left.name.localeCompare(right.name)
+    })
+})
+const participantCount = computed(() => railMembers.value.length + store.agents.length)
+function agentOwnerMember(agent: RoomAgent): MemberInfo | null {
+    if (!agent.ownerMemberId) return null
+    return railMembers.value.find(member => member.userId === agent.ownerMemberId) || null
+}
+function agentOwnerAvatar(agent: RoomAgent) {
+    const owner = agentOwnerMember(agent)
+    return owner ? memberAvatarFor(owner) : null
+}
+const visibleApproval = computed(() =>
+    pendingAgentPairings.value.length === 0
+        ? store.activePendingApproval
+        : null,
+)
+const visibleClarify = computed(() =>
+    currentRoomCanManage.value && pendingAgentPairings.value.length === 0
+        ? store.activePendingClarify
+        : null,
+)
+watch(
+    () => visibleClarify.value?.clarifyId,
+    () => { clarifyResponse.value = visibleClarify.value?.initialResponse || '' },
+)
+const visibleAgentPairing = computed(() =>
+    currentRoomCanManage.value ? pendingAgentPairings.value[0] || null : null,
+)
 const currentWorkspaceLabel = computed(() => workspaceBasename(currentRoom.value?.workspace || ''))
+const groupToolPanelTitle = computed(() => desktopBrowserAvailable
+    ? `${t('drawer.files')} / ${t('drawer.terminal')} / ${t('browser.title')}`
+    : `${t('drawer.files')} / ${t('drawer.terminal')}`
+)
+const canUpdateRoomName = computed(() => {
+    const nextName = roomNameDraft.value.trim()
+    return currentRoomCanManage.value
+        && !isSavingRoomName.value
+        && !!nextName
+        && nextName !== (currentRoom.value?.name || '')
+})
 const canUpdateInviteCode = computed(() => {
     const nextCode = inviteCodeDraft.value.trim()
     return currentRoomCanManage.value && !isSavingInviteCode.value && !!nextCode && nextCode !== (currentRoom.value?.inviteCode || '')
@@ -115,17 +706,34 @@ const userMemberAvatar = computed(() => {
     // Prefer the live member list (populated when a room is active)
     const member = store.members.find(m => m.userId === store.userId)
     const raw = member?.avatar || store.currentUserAvatar
-    if (!raw) return null
-    try {
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
-        if (parsed && parsed.type === 'image' && parsed.dataUrl) return parsed
-    } catch { /* malformed JSON — fall through to multiavatar */ }
-    return null
+    return parseMemberAvatar(raw)
 })
 
+function parseMemberAvatar(raw: unknown) {
+    return parseStoredAvatar(raw)
+}
+
+function memberAvatarFor(member: MemberInfo) {
+    return member.userId === store.userId ? userMemberAvatar.value : parseMemberAvatar(member.avatar)
+}
+
+function handleRoomMemberClick(member: MemberInfo) {
+    if (member.userId === store.userId) handleOpenUserProfile()
+}
+
+async function handleRemoveMember(member: MemberInfo) {
+    if (!currentRoomCanMentionAll.value || !store.currentRoomId || member.userId === store.userId) return
+    try {
+        await store.removeMemberFromRoom(store.currentRoomId, member.userId)
+        message.success(t('groupChat.memberRemoved', { name: member.name }))
+    } catch (err: any) {
+        message.error(err?.message || t('common.deleteFailed'))
+    }
+}
+
 function formatTokens(tokens: number): string {
-    if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k tokens`
-    return `${tokens} tokens`
+    const value = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens)
+    return `${value} ${t('usage.tokens')}`
 }
 
 function workspaceBasename(path: string): string {
@@ -135,6 +743,7 @@ function workspaceBasename(path: string): string {
 }
 
 function toggleSidebar() {
+    if (props.standalone) return
     showSidebar.value = !showSidebar.value
 }
 
@@ -162,7 +771,8 @@ function handleWorkspacePanelResize(): void {
 function handleWorkspaceResizeMove(event: PointerEvent): void {
     if (!workspaceResizeStart.value) return
     workspacePanelWidth.value = clampWorkspacePanelWidth(
-        workspaceResizeStart.value.width + workspaceResizeStart.value.x - event.clientX,
+        workspaceResizeStart.value.width
+            + (event.clientX - workspaceResizeStart.value.x) * workspaceResizeStart.value.deltaSign,
     )
 }
 
@@ -181,7 +791,11 @@ function stopWorkspaceResize(): void {
 function startWorkspaceResize(event: PointerEvent): void {
     if (workspacePanelMobile.value) return
     event.preventDefault()
-    workspaceResizeStart.value = { x: event.clientX, width: workspacePanelWidth.value }
+    workspaceResizeStart.value = {
+        x: event.clientX,
+        width: workspacePanelWidth.value,
+        deltaSign: document.documentElement.dir === 'rtl' ? 1 : -1,
+    }
     window.addEventListener('pointermove', handleWorkspaceResizeMove)
     window.addEventListener('pointerup', stopWorkspaceResize)
     document.body.style.userSelect = 'none'
@@ -200,18 +814,41 @@ function closeWorkspacePanel(): void {
 }
 
 function toggleWorkspacePanel(): void {
+    if (showWorkspacePanel.value) {
+        closeWorkspacePanel()
+        return
+    }
+    showWorkspacePanel.value = true
+}
+
+function handleToolPanelBeforeEnter(): void {
+    toolPanelTransitionReady.value = false
+}
+
+function handleToolPanelAfterEnter(): void {
+    toolPanelTransitionReady.value = true
+}
+
+function handleToolPanelBeforeLeave(): void {
+    toolPanelTransitionReady.value = false
+}
+
+function handleToolPanelLeaveCancelled(): void {
+    toolPanelTransitionReady.value = true
+}
+
+function openWorkspaceFilesPanel(): void {
     if (!currentRoom.value?.workspace) return
     if (showWorkspacePanel.value && activeWorkspacePanel.value === 'files') {
         closeWorkspacePanel()
         return
     }
-    activeWorkspacePanel.value = 'files'
-    showWorkspacePanel.value = true
+    selectWorkspacePanel('files')
 }
 
-function selectWorkspacePanel(panel: 'files' | 'browser'): void {
-    if (panel === 'browser') {
-        if (!desktopBrowserAvailable) return
+function selectWorkspacePanel(panel: 'files' | 'terminal' | 'browser'): void {
+    if (panel === 'browser' && !desktopBrowserAvailable) return
+    if (panel !== 'files') {
         if (toolPanelStore.workspaceDiff?.editable && filesStore.hasUnsavedChanges) {
             message.warning(t('files.unsavedChanges'))
             return
@@ -228,8 +865,20 @@ function handleOpenDesktopBrowserPanelRequest(): void {
     selectWorkspacePanel('browser')
 }
 
-function handleBrowserAttachment(payload: { file: File }): void {
-    groupChatInputRef.value?.addFiles?.([payload.file])
+async function submitBrowserAnnotations(payload: BrowserAnnotationSubmission): Promise<boolean> {
+    if (currentRoomNeedsSummaryConfiguration.value) {
+        await handleSummaryConfigurationRequired()
+        return false
+    }
+    const attachment = createBrowserAnnotationAttachment(payload)
+    try {
+        await store.sendMessage('', [attachment])
+        return true
+    } catch (err: any) {
+        URL.revokeObjectURL(attachment.url)
+        message.error(err instanceof Error ? err.message : String(err))
+        return false
+    }
 }
 
 function groupWorkspacePreviewPath(filePath: string): string | null {
@@ -248,25 +897,101 @@ function groupWorkspacePreviewPath(filePath: string): string | null {
 }
 
 function handleWorkspaceFilePreviewRequest(event: Event): void {
-    const customEvent = event as CustomEvent<{ path?: string; fileName?: string }>
+    const customEvent = event as CustomEvent<{
+        path?: string
+        fileName?: string
+        startLine?: number
+        endLine?: number
+    }>
     const roomId = store.currentRoomId
     const path = groupWorkspacePreviewPath(typeof customEvent.detail?.path === 'string' ? customEvent.detail.path : '')
     if (!roomId || !path || !currentRoomCanManage.value) return
     customEvent.preventDefault()
     const fileName = customEvent.detail?.fileName || path.split('/').pop() || path
+    const requestedStartLine = customEvent.detail?.startLine
+    const startLine = Number.isInteger(requestedStartLine) && requestedStartLine! > 0
+        ? requestedStartLine
+        : undefined
+    const requestedEndLine = customEvent.detail?.endLine
+    const endLine = startLine && Number.isInteger(requestedEndLine) && requestedEndLine! >= startLine
+        ? requestedEndLine
+        : startLine
     toolPanelStore.closeWorkspaceDiff()
     filesStore.closePreview()
-    void filesStore.openGroupWorkspacePreview(roomId, path, fileName).catch(error => {
+    void filesStore.openGroupWorkspacePreview(
+        roomId,
+        path,
+        fileName,
+        -1,
+        startLine ? { startLine, endLine } : undefined,
+    ).catch(error => {
+        message.error(error instanceof Error ? error.message : t('files.previewFailed'))
+    })
+}
+
+function handleGroupAttachmentPreviewRequest(event: Event): void {
+    const customEvent = event as CustomEvent<{ sourceUrl?: string; fileName?: string; size?: number }>
+    const roomId = store.currentRoomId
+    const sourceUrl = String(customEvent.detail?.sourceUrl || '').trim()
+    const fileName = String(customEvent.detail?.fileName || '').trim()
+    if (!roomId || !sourceUrl || !fileName) return
+    customEvent.preventDefault()
+    toolPanelStore.closeWorkspaceDiff()
+    filesStore.closePreview()
+    void filesStore.openRemotePreview(
+        sourceUrl,
+        fileName,
+        Number(customEvent.detail?.size ?? -1),
+        { workspaceRoomId: roomId },
+    ).then(opened => {
+        if (!opened) return
+        activeWorkspacePanel.value = 'files'
+        showWorkspacePanel.value = true
+    }).catch(error => {
         message.error(error instanceof Error ? error.message : t('files.previewFailed'))
     })
 }
 
 function openPageSidebar() {
+    if (props.standalone) return
     showSidebar.value = true
+}
+
+function acknowledgeGroupChatRefactorNotice() {
+    try {
+        window.localStorage.setItem(GROUP_CHAT_REFACTOR_NOTICE_STORAGE_KEY, '1')
+    } catch {
+        // The notice can still be dismissed when persistent browser storage is unavailable.
+    }
+    showGroupChatRefactorNotice.value = false
 }
 
 function openSettingsPage() {
     router.push({ name: 'hermes.settings' })
+}
+
+const remoteRooms = computed(() => buildRemoteGroupChatRooms(
+    remoteRoomConnections.value,
+))
+
+async function refreshRemoteRooms() {
+    if (props.standalone) return
+    try {
+        remoteRoomConnections.value = (await listLocalGroupAgentConnections()).connections
+    } catch {
+        // Keep the last successful list during transient local API failures.
+    }
+}
+
+function handleWindowFocus() {
+    void refreshRemoteRooms()
+}
+
+function handleSelectRemoteRoom(room: RemoteGroupChatRoom) {
+    if (!room.inviteCode) return
+    const url = `${room.cloudOrigin}/#/share/group-chat/${encodeURIComponent(room.inviteCode)}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+    if (window.innerWidth <= 768) showSidebar.value = false
 }
 
 function hasDraggedFiles(event: DragEvent) {
@@ -279,12 +1004,14 @@ function resetChatDropState() {
 }
 
 function handleChatDragOver(event: DragEvent) {
+    if (props.standalone) return
     if (!hasRoom.value || !hasDraggedFiles(event)) return
     event.preventDefault()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
 }
 
 function handleChatDragEnter(event: DragEvent) {
+    if (props.standalone) return
     if (!hasRoom.value || !hasDraggedFiles(event)) return
     event.preventDefault()
     chatDropCounter.value += 1
@@ -292,12 +1019,14 @@ function handleChatDragEnter(event: DragEvent) {
 }
 
 function handleChatDragLeave(event: DragEvent) {
+    if (props.standalone) return
     if (!hasRoom.value || !hasDraggedFiles(event)) return
     chatDropCounter.value -= 1
     if (chatDropCounter.value <= 0) resetChatDropState()
 }
 
 function handleChatDrop(event: DragEvent) {
+    if (props.standalone) return
     if (!hasRoom.value || !hasDraggedFiles(event)) return
     event.preventDefault()
     const files = Array.from(event.dataTransfer?.files || [])
@@ -309,15 +1038,6 @@ function handleChatDrop(event: DragEvent) {
 
 function handleWorkspaceFileAttach(file: File) {
     groupChatInputRef.value?.addFiles?.([file])
-}
-
-function generateCode(): string {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    let code = ''
-    for (let i = 0; i < 6; i++) {
-        code += chars[Math.floor(Math.random() * chars.length)]
-    }
-    return code
 }
 
 function formatAgentFailures(results?: Array<{ ok: boolean; profile: string; error?: string; reason?: string }>): string | null {
@@ -342,14 +1062,22 @@ function extractApiErrorMessage(err: any): string {
     return raw || t('common.saveFailed')
 }
 
-async function handleCreateRoom(name: string, inviteCode: string, userName: string, description: string, compression: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }, workspace: string) {
+async function handleCreateRoom(
+    name: string,
+    inviteCode: string,
+    userName: string,
+    description: string,
+    summary: RoomSummaryConfig,
+    workspace: string,
+    agents: RoomAgentInput[],
+) {
     try {
         store.setUserInfo(userName, description)
         const res = await store.createNewRoom(
             name,
             inviteCode,
-            undefined,
-            compression,
+            agents,
+            summary,
             workspace,
             { name: userName, description },
         )
@@ -378,14 +1106,34 @@ async function handleDeleteRoom(roomId: string) {
 }
 
 function buildRoomUrl(roomId: string) {
-    const href = router.resolve({ name: 'hermes.groupChatRoom', params: { roomId } }).href
+    const room = store.rooms.find(candidate => candidate.id === roomId)
+    const href = room?.inviteCode
+        ? router.resolve({ name: 'share.groupChat', params: { inviteCode: room.inviteCode } }).href
+        : router.resolve({ name: 'hermes.groupChatRoom', params: { roomId } }).href
     return `${window.location.origin}${window.location.pathname}${href}`
 }
 
 async function copyRoomLink(roomId: string) {
-    const ok = await copyToClipboard(buildRoomUrl(roomId))
-    if (ok) message.success(t('common.copied'))
-    else message.error(t('common.copied') + ' ✗')
+    const roomLink = buildRoomUrl(roomId)
+    const ok = await copyToClipboard(roomLink)
+    if (ok) {
+        message.success(t('common.copied'))
+        return
+    }
+
+    manualRoomLink.value = roomLink
+    showManualRoomLinkModal.value = true
+}
+
+function selectManualRoomLink() {
+    void nextTick(() => {
+        manualRoomLinkInput.value?.focus()
+        manualRoomLinkInput.value?.select()
+    })
+}
+
+function copyCurrentRoomLink() {
+    if (store.currentRoomId) void copyRoomLink(store.currentRoomId)
 }
 
 const roomContextMenuOptions = computed<DropdownOption[]>(() => {
@@ -397,16 +1145,90 @@ const roomContextMenuOptions = computed<DropdownOption[]>(() => {
     return options
 })
 
+const remoteRoomContextMenuOptions = computed<DropdownOption[]>(() => [
+    { label: t('groupChat.renameRemoteRoom'), key: 'rename' },
+    { label: t('groupChat.leaveRemoteRoom'), key: 'leave' },
+])
+
 function handleRoomContextMenu(event: MouseEvent, roomId: string) {
     event.preventDefault()
+    showRemoteRoomContextMenu.value = false
     contextRoomId.value = roomId
     roomContextMenuX.value = event.clientX
     roomContextMenuY.value = event.clientY
     showRoomContextMenu.value = true
 }
 
+function handleRemoteRoomContextMenu(event: MouseEvent, room: RemoteGroupChatRoom) {
+    event.preventDefault()
+    showRoomContextMenu.value = false
+    remoteRoomContext.value = room
+    remoteRoomContextMenuX.value = event.clientX
+    remoteRoomContextMenuY.value = event.clientY
+    showRemoteRoomContextMenu.value = true
+}
+
 function handleRoomContextClickOutside() {
     showRoomContextMenu.value = false
+}
+
+function handleRemoteRoomContextClickOutside() {
+    showRemoteRoomContextMenu.value = false
+}
+
+function handleRemoteRoomContextSelect(key: string) {
+    showRemoteRoomContextMenu.value = false
+    const room = remoteRoomContext.value
+    if (!room) return
+    if (key === 'rename') {
+        remoteRoomBeingRenamed.value = room
+        remoteRoomNameDraft.value = room.roomName
+        showRemoteRoomRenameModal.value = true
+    } else if (key === 'leave') {
+        remoteRoomBeingLeft.value = room
+    }
+}
+
+async function confirmRemoteRoomRename() {
+    const room = remoteRoomBeingRenamed.value
+    const name = remoteRoomNameDraft.value.trim()
+    const connectorId = room?.connectorIds[0]
+    if (!room || !connectorId || !name || isUpdatingRemoteRoom.value) return
+    isUpdatingRemoteRoom.value = true
+    try {
+        await renameLocalGroupAgentRoom(connectorId, name)
+        await refreshRemoteRooms()
+        showRemoteRoomRenameModal.value = false
+        remoteRoomBeingRenamed.value = null
+        message.success(t('groupChat.remoteRoomRenamed'))
+    } catch {
+        message.error(t('groupChat.remoteRoomRenameFailed'))
+    } finally {
+        isUpdatingRemoteRoom.value = false
+    }
+}
+
+async function confirmLeaveRemoteRoom() {
+    const room = remoteRoomBeingLeft.value
+    const connectorId = room?.connectorIds[0]
+    if (!room || !connectorId || isUpdatingRemoteRoom.value) return
+    isUpdatingRemoteRoom.value = true
+    try {
+        const result = await leaveLocalGroupAgentRoom(connectorId)
+        remoteRoomBeingLeft.value = null
+        await refreshRemoteRooms()
+        if (result.notified < result.removed) {
+            message.warning(t('groupChat.remoteRoomLeavePartial', {
+                count: result.removed - result.notified,
+            }))
+        } else {
+            message.success(t('groupChat.remoteRoomLeft'))
+        }
+    } catch {
+        message.error(t('groupChat.remoteRoomLeaveFailed'))
+    } finally {
+        isUpdatingRemoteRoom.value = false
+    }
 }
 
 function handleRoomContextSelect(key: string) {
@@ -429,7 +1251,7 @@ function handleOpenCloneRoom(roomId: string) {
     if (!canManageRoom(room)) return
     cloneSourceRoomId.value = roomId
     cloneRoomName.value = room?.name ? `${room.name} Copy` : ''
-    cloneInviteCode.value = generateCode()
+    cloneInviteCode.value = generateGroupChatInviteCode()
     showCloneModal.value = true
 }
 
@@ -477,44 +1299,387 @@ async function handleSelectRoom(roomId: string) {
     }
 }
 
-async function handleSendMessage(content: string, attachments?: Attachment[]) {
+async function handleSendMessage(content: string, attachments?: Attachment[], mentions?: GroupChatMention[]) {
+    const submittedRoomId = store.currentRoomId
     try {
-        await store.sendMessage(content, attachments)
+        await store.sendMessage(content, attachments, mentions)
+        if (submittedRoomId) clearGroupChatRoomDraft(submittedRoomId)
+        groupChatInputRef.value?.completeSend?.(true)
     } catch (err: any) {
+        groupChatInputRef.value?.completeSend?.(false)
         message.error(err.message)
     }
 }
 
+async function handleCancelQueuedExecution(queueId: string) {
+    try {
+        await store.cancelExecutionQueueItem(queueId)
+    } catch (err: any) {
+        message.error(err?.message || t('groupChat.executionQueueCancelFailed'))
+    }
+}
+
+async function handleSummaryConfigurationRequired() {
+    if (!currentRoomCanManage.value) {
+        message.warning(t('groupChat.summaryConfigurationOwnerRequired'))
+        return
+    }
+    message.warning(t('groupChat.summaryConfigurationRequired'))
+    void handleOpenRoomSettings()
+    await nextTick()
+    summarySettingsSectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function resetAgentForm() {
+    selectedAgentPresetId.value = null
+    selectedProfile.value = null
+    selectedRuntimePreset.value = undefined
+    selectedRuntimePresetReady.value = false
+    selectedAgentType.value = firstAvailableGroupAgentType.value || 'hermes'
+    selectedAgentMode.value = 'scoped'
+    selectedAgentProvider.value = ''
+    selectedAgentModel.value = ''
+    selectedAgentApiMode.value = 'codex_responses'
+    selectedAgentReasoningEffort.value = ''
+    agentName.value = ''
+    agentDescription.value = ''
+    agentAvatar.value = null
+}
+
+function currentAgentPresetInput(): GroupAgentPresetInput | null {
+    if (!canConfirmAddAgent.value || !selectedProfile.value) return null
+    return {
+        agent: selectedAgentType.value,
+        agentMode: usesGlobalAgentMode.value ? 'global' : 'scoped',
+        profile: selectedProfile.value,
+        provider: usesGlobalAgentMode.value ? '' : selectedAgentProvider.value,
+        model: usesGlobalAgentMode.value ? '' : selectedAgentModel.value,
+        apiMode: selectedAgentType.value === 'hermes' || usesGlobalAgentMode.value ? '' : selectedAgentApiMode.value,
+        reasoningEffort: usesGlobalAgentMode.value ? '' : selectedAgentReasoningEffort.value,
+        agentPreset: selectedAgentType.value === 'dsh' ? selectedRuntimePreset.value : undefined,
+        name: agentName.value.trim() || selectedProfile.value,
+        description: agentDescription.value.trim(),
+        avatar: agentAvatar.value ? JSON.stringify(agentAvatar.value) : '',
+    }
+}
+
+async function loadAgentPresets() {
+    isLoadingAgentPresets.value = true
+    agentPresetLoadError.value = ''
+    try {
+        agentPresets.value = (await listGroupAgentPresets()).presets
+    } catch (err: any) {
+        agentPresetLoadError.value = extractApiErrorMessage(err) || t('groupChat.agentPresetLoadFailed')
+        message.error(agentPresetLoadError.value)
+    } finally {
+        isLoadingAgentPresets.value = false
+    }
+}
+
+function openAgentPresetSelection() {
+    agentPresetDialogMode.value = 'select'
+    pendingAgentPresetId.value = selectedAgentPresetId.value
+    agentPresetSearch.value = ''
+    showAgentPresetDialog.value = true
+}
+
+function openAgentPresetManager() {
+    agentPresetDialogMode.value = 'manage'
+    pendingAgentPresetId.value = null
+    agentPresetSearch.value = ''
+    showAgentPresetDialog.value = true
+}
+
+function closeAgentPresetDialog() {
+    showAgentPresetDialog.value = false
+    pendingAgentPresetId.value = null
+    agentPresetSearch.value = ''
+}
+
+function selectAgentPresetForDialog(preset: GroupAgentPreset) {
+    if (!preset.available) return
+    pendingAgentPresetId.value = preset.id
+}
+
+function confirmAgentPresetSelection() {
+    const preset = pendingAgentPreset.value
+    if (!preset?.available) return
+    applyAgentPreset(preset.id)
+    closeAgentPresetDialog()
+}
+
+function applyAgentPreset(presetId: string | null) {
+    selectedAgentPresetId.value = presetId
+    const preset = agentPresets.value.find(item => item.id === presetId)
+    if (!preset) return
+    if (!preset.available) {
+        message.warning(preset.validationError || t('groupChat.agentPresetUnavailable'))
+        return
+    }
+    const input = groupAgentPresetToRoomAgentInput(preset)
+    selectedAgentType.value = input.agent
+    selectedAgentMode.value = input.agentMode === 'global' ? 'global' : 'scoped'
+    selectedProfile.value = input.profile
+    selectedAgentProvider.value = input.provider || ''
+    selectedAgentModel.value = input.model || ''
+    selectedAgentApiMode.value = normalizeCodingAgentApiMode(
+        input.apiMode,
+        inferCodingAgentApiMode(input.provider),
+    )
+    selectedAgentReasoningEffort.value = input.reasoningEffort || ''
+    selectedRuntimePreset.value = input.agentPreset
+    agentName.value = input.name || ''
+    agentDescription.value = input.description || ''
+    agentAvatar.value = parseStoredAvatar(input.avatar)
+}
+
+async function saveAgentPreset(presetId: string | null) {
+    const input = currentAgentPresetInput()
+    if (!input || isSavingAgentPreset.value) return
+    isSavingAgentPreset.value = true
+    try {
+        const result = presetId
+            ? await updateGroupAgentPreset(presetId, input)
+            : await createGroupAgentPreset(input)
+        const index = agentPresets.value.findIndex(item => item.id === result.preset.id)
+        if (index >= 0) agentPresets.value[index] = result.preset
+        else agentPresets.value = [result.preset, ...agentPresets.value]
+        pendingAgentPresetId.value = result.preset.id
+        message.success(t('groupChat.agentPresetSaved'))
+    } catch (err: any) {
+        message.error(
+            err?.code === 'GROUP_AGENT_PRESET_NAME_CONFLICT'
+                ? t('groupChat.agentPresetAlreadyExists')
+                : extractApiErrorMessage(err) || t('groupChat.agentPresetOperationFailed'),
+        )
+    } finally {
+        isSavingAgentPreset.value = false
+    }
+}
+
+async function createAgentPresetFromCurrent() {
+    pendingAgentPresetId.value = null
+    await saveAgentPreset(null)
+}
+
+async function updateSelectedAgentPreset() {
+    if (!pendingAgentPresetId.value) return
+    await saveAgentPreset(pendingAgentPresetId.value)
+}
+
+async function deleteAgentPreset() {
+    const presetId = pendingAgentPresetId.value
+    if (!presetId || isSavingAgentPreset.value) return
+    isSavingAgentPreset.value = true
+    try {
+        await deleteGroupAgentPreset(presetId)
+        agentPresets.value = agentPresets.value.filter(item => item.id !== presetId)
+        if (selectedAgentPresetId.value === presetId) selectedAgentPresetId.value = null
+        pendingAgentPresetId.value = null
+        message.success(t('groupChat.agentPresetDeleted'))
+    } catch (err: any) {
+        message.error(extractApiErrorMessage(err) || t('groupChat.agentPresetOperationFailed'))
+    } finally {
+        isSavingAgentPreset.value = false
+    }
+}
+
+function closeAgentDrawer() {
+    closeAgentPresetDialog()
+    showAddAgentDrawer.value = false
+    editingAgent.value = null
+    resetAgentForm()
+}
+
 async function handleAddAgent() {
     if (!currentRoomCanManage.value) return
-    await profilesStore.fetchProfiles()
-    showAddAgentModal.value = true
+    await Promise.all([
+        profilesStore.fetchProfiles(),
+        appStore.loadModels(),
+        loadAgentPresets(),
+        refreshAgentAvailability(),
+    ])
+    editingAgent.value = null
+    resetAgentForm()
+    selectedRuntimePreset.value = undefined
+    selectedRuntimePresetReady.value = false
+    selectedAgentType.value = firstAvailableGroupAgentType.value || 'hermes'
+    selectedProfile.value =
+        profilesStore.activeProfileName ||
+        profilesStore.profiles.find(profile => profile.active)?.name ||
+        profilesStore.profiles[0]?.name ||
+        'default'
+    syncAgentModelSelection(selectedProfile.value)
+    selectedAgentReasoningEffort.value = ''
+    showAddAgentDrawer.value = true
+}
+
+function randomAgentAvatarSeed() {
+    return `group-agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function handleRandomAgentAvatar() {
+    agentAvatar.value = { type: 'generated', seed: randomAgentAvatarSeed() }
+}
+
+function handleResetAgentAvatar() {
+    agentAvatar.value = null
+}
+
+function triggerAgentAvatarUpload() {
+    agentAvatarFileInput.value?.click()
+}
+
+async function handleAgentAvatarFileChange(event: Event) {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file) return
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+        message.warning(t('profiles.avatar.invalidType'))
+        return
+    }
+    if (file.size > 1024 * 1024) {
+        message.warning(t('profiles.avatar.tooLarge'))
+        return
+    }
+    try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve(String(reader.result || ''))
+            reader.onerror = () => reject(reader.error || new Error('Failed to read file'))
+            reader.readAsDataURL(file)
+        })
+        agentAvatar.value = { type: 'image', dataUrl }
+    } catch {
+        message.error(t('profiles.avatar.saveFailed'))
+    }
+}
+
+async function handleEditAgent(agent: RoomAgent) {
+    if (!currentRoomCanManage.value) return
+    await Promise.all([
+        profilesStore.fetchProfiles(),
+        appStore.loadModels(),
+        loadAgentPresets(),
+        refreshAgentAvailability(),
+    ])
+    selectedAgentPresetId.value = null
+    editingAgent.value = agent
+    selectedAgentType.value = agent.agent || 'hermes'
+    selectedAgentMode.value = agent.agentMode === 'global' ? 'global' : 'scoped'
+    selectedProfile.value = agent.profile
+    selectedAgentProvider.value = agent.provider || ''
+    selectedAgentModel.value = agent.model || ''
+    selectedAgentApiMode.value = normalizeCodingAgentApiMode(
+        agent.apiMode,
+        inferCodingAgentApiMode(agent.provider),
+    )
+    selectedAgentReasoningEffort.value = agent.reasoningEffort || ''
+    selectedRuntimePreset.value = agent.agentPreset
+    agentName.value = agent.name || ''
+    agentDescription.value = agent.description || ''
+    agentAvatar.value = parseStoredAvatar(agent.avatar)
+    showAddAgentDrawer.value = true
 }
 
 onMounted(() => {
+    if (!props.standalone) void refreshAgentAvailability()
+    if (!props.standalone) {
+        try {
+            showGroupChatRefactorNotice.value = window.localStorage.getItem(GROUP_CHAT_REFACTOR_NOTICE_STORAGE_KEY) !== '1'
+        } catch {
+            showGroupChatRefactorNotice.value = true
+        }
+    }
     window.addEventListener('hermes:open-page-sidebar', openPageSidebar)
     window.addEventListener('hermes:preview-workspace-file', handleWorkspaceFilePreviewRequest)
+    window.addEventListener('hermes:preview-group-attachment', handleGroupAttachmentPreviewRequest)
     window.addEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest)
     window.addEventListener('resize', handleWorkspacePanelResize)
+    window.addEventListener('focus', handleWindowFocus)
     handleWorkspacePanelResize()
-    if (profilesStore.profiles.length === 0) {
+    if (!props.standalone && profilesStore.profiles.length === 0) {
         void profilesStore.fetchProfiles()
+    }
+    if (!props.standalone) {
+        agentPairingRefreshTimer = setInterval(() => void refreshPendingAgentPairings(), 3_000)
+        remoteRoomRefreshTimer = setInterval(() => void refreshRemoteRooms(), 5_000)
+        void refreshPendingAgentPairings()
+        void refreshRemoteRooms()
     }
 })
 
 onUnmounted(() => {
+    hideInlineSummaryStatus()
     window.removeEventListener('hermes:open-page-sidebar', openPageSidebar)
     window.removeEventListener('hermes:preview-workspace-file', handleWorkspaceFilePreviewRequest)
+    window.removeEventListener('hermes:preview-group-attachment', handleGroupAttachmentPreviewRequest)
     window.removeEventListener(OPEN_DESKTOP_BROWSER_PANEL_EVENT, handleOpenDesktopBrowserPanelRequest)
     window.removeEventListener('resize', handleWorkspacePanelResize)
+    window.removeEventListener('focus', handleWindowFocus)
     stopWorkspaceResize()
+    roomFadeAnimation?.cancel()
     if (showWorkspacePanel.value) closeWorkspacePanel()
     else toolPanelStore.closeWorkspaceDiff()
+    roomFadeAnimation = null
+    if (agentPairingRefreshTimer) clearInterval(agentPairingRefreshTimer)
+    agentPairingRefreshTimer = null
+    if (remoteRoomRefreshTimer) clearInterval(remoteRoomRefreshTimer)
+    remoteRoomRefreshTimer = null
 })
 
+async function loadRoomSummaryState(roomId: string) {
+    try {
+        const result = await getRoomSummary(roomId)
+        store.applyRoomSummaryState(result.summary)
+        if (store.currentRoomId !== roomId) return
+        roomSummaryState.value = store.roomSummaryStates.get(roomId) || result.summary
+        roomSummaryAnchor.value = result.anchor
+        roomSummaryDraft.value = roomSummaryState.value.summary
+    } catch {
+        // A missing summary should not block entering or reading the room.
+    }
+}
+
 watch(() => store.currentRoomId, (roomId, previousRoomId) => {
-    if (roomId !== previousRoomId && (filesStore.previewFile || toolPanelStore.workspaceDiff || showWorkspacePanel.value)) closeWorkspacePanel()
+    if (roomId === previousRoomId) return
+    if (inlineSummaryStatus.value?.roomId !== roomId) hideInlineSummaryStatus()
+    roomSummaryState.value = null
+    roomSummaryAnchor.value = null
+    roomSummaryDraft.value = ''
+    if (filesStore.previewFile || toolPanelStore.workspaceDiff || showWorkspacePanel.value) closeWorkspacePanel()
+    if (roomId && !props.standalone) void loadRoomSummaryState(roomId)
+    if (!props.standalone) void refreshPendingAgentPairings()
+}, { immediate: true, flush: 'sync' })
+
+watch(() => store.agentPairingRevision, () => {
+    if (!props.standalone) void refreshPendingAgentPairings()
 })
+
+watch(
+    () => store.currentRoomId,
+    async (roomId, previousRoomId) => {
+        if (!roomId || !previousRoomId || roomId === previousRoomId) return
+
+        await nextTick()
+        const surface = groupChatSurfaceRef.value
+        if (!surface || typeof surface.animate !== 'function') return
+
+        roomFadeAnimation?.cancel()
+        roomFadeAnimation = surface.animate(
+            [
+                { opacity: 0 },
+                { opacity: 1 },
+            ],
+            {
+                duration: 1500,
+                easing: 'ease',
+            },
+        )
+    },
+    { flush: 'post' },
+)
 
 watch(() => filesStore.previewFile, previewFile => {
     if (previewFile?.workspaceRoomId === store.currentRoomId) {
@@ -541,17 +1706,28 @@ async function confirmAddAgent() {
         message.warning(t('groupChat.selectRoomFirst'))
         return
     }
-    if (!selectedProfile.value) return
+    if (!isGroupAgentAvailable(selectedAgentType.value)) {
+        warnAgentUnavailable(selectedAgentType.value)
+        return
+    }
+    if (!canConfirmAddAgent.value || !selectedProfile.value || isSavingAgent.value) return
+    isSavingAgent.value = true
     try {
         await store.addAgentToRoom(store.currentRoomId, {
+            presetId: selectedAgentPresetId.value || undefined,
+            agent: selectedAgentType.value,
+            agentMode: usesGlobalAgentMode.value ? 'global' : 'scoped',
             profile: selectedProfile.value,
+            provider: usesGlobalAgentMode.value ? '' : selectedAgentProvider.value,
+            model: usesGlobalAgentMode.value ? '' : selectedAgentModel.value,
+            apiMode: selectedAgentType.value === 'hermes' || usesGlobalAgentMode.value ? undefined : selectedAgentApiMode.value,
+            reasoningEffort: usesGlobalAgentMode.value ? '' : selectedAgentReasoningEffort.value,
+            agentPreset: selectedAgentType.value === 'dsh' ? selectedRuntimePreset.value : undefined,
             name: agentName.value.trim() || undefined,
             description: agentDescription.value.trim() || undefined,
+            avatar: agentAvatar.value ? JSON.stringify(agentAvatar.value) : '',
         })
-        showAddAgentModal.value = false
-        selectedProfile.value = null
-        agentName.value = ''
-        agentDescription.value = ''
+        closeAgentDrawer()
         message.success(t('groupChat.agentAdded'))
     } catch (err: any) {
         if (err.message?.includes('already')) {
@@ -559,6 +1735,39 @@ async function confirmAddAgent() {
         } else {
             message.error(extractApiErrorMessage(err))
         }
+    } finally {
+        isSavingAgent.value = false
+    }
+}
+
+async function confirmUpdateAgent() {
+    if (!store.currentRoomId || !editingAgent.value) return
+    if (!isGroupAgentAvailable(selectedAgentType.value)) {
+        warnAgentUnavailable(selectedAgentType.value)
+        return
+    }
+    if (!canConfirmAddAgent.value || !selectedProfile.value || isSavingAgent.value) return
+    isSavingAgent.value = true
+    try {
+        await store.updateAgentInRoom(store.currentRoomId, editingAgent.value.id, {
+            agent: selectedAgentType.value,
+            agentMode: usesGlobalAgentMode.value ? 'global' : 'scoped',
+            profile: selectedProfile.value,
+            provider: usesGlobalAgentMode.value ? '' : selectedAgentProvider.value,
+            model: usesGlobalAgentMode.value ? '' : selectedAgentModel.value,
+            apiMode: selectedAgentType.value === 'hermes' || usesGlobalAgentMode.value ? undefined : selectedAgentApiMode.value,
+            reasoningEffort: usesGlobalAgentMode.value ? '' : selectedAgentReasoningEffort.value,
+            agentPreset: selectedAgentType.value === 'dsh' ? selectedRuntimePreset.value : undefined,
+            name: agentName.value.trim() || undefined,
+            description: agentDescription.value.trim() || undefined,
+            avatar: agentAvatar.value ? JSON.stringify(agentAvatar.value) : '',
+        })
+        closeAgentDrawer()
+        message.success(t('common.saved'))
+    } catch (err: any) {
+        message.error(extractApiErrorMessage(err))
+    } finally {
+        isSavingAgent.value = false
     }
 }
 
@@ -577,7 +1786,8 @@ async function handleSaveWorkspace() {
     const room = store.rooms.find(r => r.id === roomId)
     if (!canManageRoom(room)) return
     try {
-        await store.setRoomWorkspace(roomId, String(workspaceValue.value || '').trim())
+        const updatedRoom = await store.setRoomWorkspace(roomId, String(workspaceValue.value || '').trim())
+        workspaceValue.value = updatedRoom?.workspace || ''
         showWorkspaceModal.value = false
         workspaceRoomId.value = null
         message.success(t('chat.workspaceSet'))
@@ -613,18 +1823,124 @@ async function handleSaveUserProfile() {
     }
 }
 
-function handleOpenRoomSettings() {
+async function handleOpenRoomSettings() {
     if (!currentRoomCanManage.value) return
     const room = store.rooms.find(r => r.id === store.currentRoomId)
     if (room) {
+        roomNameDraft.value = room.name
         inviteCodeDraft.value = room.inviteCode || ''
-        compressionConfig.value = {
-            triggerTokens: room.triggerTokens ?? 100000,
-            maxHistoryTokens: room.maxHistoryTokens ?? 32000,
-            tailMessageCount: room.tailMessageCount ?? 10,
+        workspaceRoomId.value = room.id
+        workspaceValue.value = room.workspace || ''
+        allowGuestAgentsDraft.value = Number(room.allowGuestAgents || 0) === 1
+        maxGuestAgentsPerMemberDraft.value = Math.max(1, Number(room.maxGuestAgentsPerMember || 1))
+        allowRemoteWorkspaceAccessDraft.value = Number(room.allowRemoteWorkspaceAccess || 0) === 1
+        summaryConfig.value = {
+            summaryProfile: room.summaryProfile || profilesStore.activeProfileName || 'default',
+            summaryProvider: room.summaryProvider || '',
+            summaryModel: room.summaryModel || '',
+            summaryApiMode: room.summaryApiMode || 'chat_completions',
+            summaryEveryTurns: room.summaryEveryTurns || 20,
         }
+        agentHandoffEnabledDraft.value = Number(room.agentHandoffEnabled ?? 1) === 1
+        agentHandoffMaxDepthDraft.value = room.agentHandoffMaxDepth ?? 4
+        agentHandoffUnlimitedDraft.value = Number(room.agentHandoffUnlimited ?? 0) === 1
     }
-    showCompressionModal.value = true
+    showRoomSettingsModal.value = true
+    try {
+        const result = await listStoppedRoomAgentHandoffs(store.currentRoomId!)
+        store.handoffChains = new Map(result.chains.map(chain => [chain.chainId, chain]))
+    } catch {
+        store.handoffChains = new Map()
+    }
+    if (!store.currentRoomId) return
+    const summaryRoomId = store.currentRoomId
+    void refreshPendingAgentPairings()
+    isLoadingRoomSummary.value = true
+    try {
+        const result = await getRoomSummary(summaryRoomId)
+        store.applyRoomSummaryState(result.summary)
+        if (store.currentRoomId !== summaryRoomId) return
+        roomSummaryState.value = store.roomSummaryStates.get(summaryRoomId) || result.summary
+        roomSummaryAnchor.value = result.anchor
+        roomSummaryDraft.value = roomSummaryState.value.summary
+    } catch (err: any) {
+        message.error(err?.message || t('groupChat.summaryLoadFailed'))
+    } finally {
+        isLoadingRoomSummary.value = false
+    }
+}
+
+async function refreshPendingAgentPairings(): Promise<void> {
+    const roomId = store.currentRoomId
+    if (!roomId || !currentRoomCanManage.value) {
+        pendingAgentPairings.value = []
+        return
+    }
+    try {
+        const result = await listPendingGroupAgentPairings(roomId)
+        if (store.currentRoomId === roomId) pendingAgentPairings.value = result.requests
+    } catch {
+        // The next refresh retries without interrupting the chat.
+    }
+}
+
+async function handleAgentPairingDecision(
+    approved: boolean,
+    selectedRequest: GroupAgentPairingRequest | null = visibleAgentPairing.value,
+): Promise<void> {
+    const roomId = store.currentRoomId
+    const request = selectedRequest
+    if (!roomId || !request || isDecidingAgentPairing.value) return
+    isDecidingAgentPairing.value = true
+    try {
+        await decideGroupAgentPairing(roomId, request.id, approved)
+        pendingAgentPairings.value = pendingAgentPairings.value.filter(item => item.id !== request.id)
+        message.success(approved ? t('groupChat.agentPairingApproved') : t('groupChat.agentPairingRejected'))
+    } catch (error: any) {
+        message.error(error?.message || t('common.saveFailed'))
+        await refreshPendingAgentPairings()
+    } finally {
+        isDecidingAgentPairing.value = false
+    }
+}
+
+async function handleSaveGuestAgentPolicy(): Promise<void> {
+    const roomId = store.currentRoomId
+    if (!roomId || !currentRoomCanManage.value || isSavingGuestAgentPolicy.value) return
+    isSavingGuestAgentPolicy.value = true
+    try {
+        const result = await updateGuestAgentPolicy(roomId, {
+            allowGuestAgents: allowGuestAgentsDraft.value,
+            maxGuestAgentsPerMember: maxGuestAgentsPerMemberDraft.value,
+            allowRemoteWorkspaceAccess: allowGuestAgentsDraft.value && allowRemoteWorkspaceAccessDraft.value,
+        })
+        const index = store.rooms.findIndex(room => room.id === roomId)
+        if (index >= 0) store.rooms[index] = {
+            ...store.rooms[index],
+            ...result.policy,
+        }
+        message.success(t('common.saved'))
+    } catch (error: any) {
+        message.error(error?.message || t('common.saveFailed'))
+    } finally {
+        isSavingGuestAgentPolicy.value = false
+    }
+}
+
+async function handleSaveRoomName() {
+    if (!store.currentRoomId || !canUpdateRoomName.value) return
+    isSavingRoomName.value = true
+    try {
+        const res = await updateRoomConfig(store.currentRoomId, { name: roomNameDraft.value.trim() })
+        const idx = store.rooms.findIndex(r => r.id === store.currentRoomId)
+        if (idx >= 0 && res.room) store.rooms[idx] = res.room
+        if (res.room) store.roomName = res.room.name
+        message.success(t('common.saved'))
+    } catch (err: any) {
+        message.error(err?.message || t('common.saveFailed'))
+    } finally {
+        isSavingRoomName.value = false
+    }
 }
 
 async function handleSaveInviteCode() {
@@ -642,59 +1958,117 @@ async function handleSaveInviteCode() {
     }
 }
 
-async function handleSaveCompressionConfig() {
+async function handleSaveSummaryConfig() {
     if (!store.currentRoomId) return
     if (!currentRoomCanManage.value) return
     try {
-        const res = await updateRoomConfig(store.currentRoomId, { ...compressionConfig.value })
+        const res = await updateRoomConfig(store.currentRoomId, {
+            ...summaryConfig.value,
+            agentHandoffEnabled: agentHandoffEnabledDraft.value,
+            agentHandoffMaxDepth: agentHandoffMaxDepthDraft.value,
+            agentHandoffUnlimited: agentHandoffUnlimitedDraft.value,
+        })
         const idx = store.rooms.findIndex(r => r.id === store.currentRoomId)
         if (idx >= 0 && res.room) store.rooms[idx] = res.room
-        showCompressionModal.value = false
-        message.success(t('groupChat.compressionSaved'))
+        message.success(t('groupChat.summaryConfigSaved'))
     } catch {
         message.error(t('common.saveFailed'))
     }
 }
 
-async function handleForceCompress() {
-    if (!store.currentRoomId || isCompressing.value) return
-    if (!currentRoomCanManage.value) return
-    if (store.contextStatuses.size > 0) {
-        message.warning(t('groupChat.compressingInProgress'))
-        return
-    }
-    isCompressing.value = true
+async function handleSaveHandoffConfig() {
+    const roomId = store.currentRoomId
+    if (!roomId || !currentRoomCanManage.value) return
     try {
-        await forceCompress(store.currentRoomId)
-        message.success(t('groupChat.compressionSaved'))
-    } catch {
-        message.error(t('common.saveFailed'))
+        const res = await updateRoomConfig(roomId, {
+            agentHandoffEnabled: agentHandoffEnabledDraft.value,
+            agentHandoffMaxDepth: agentHandoffMaxDepthDraft.value,
+            agentHandoffUnlimited: agentHandoffUnlimitedDraft.value,
+        })
+        const idx = store.rooms.findIndex(r => r.id === roomId)
+        if (idx >= 0 && res.room) store.rooms[idx] = res.room
+        try {
+            const result = await listStoppedRoomAgentHandoffs(roomId)
+            if (store.currentRoomId === roomId) {
+                store.handoffChains = new Map(result.chains.map(chain => [chain.chainId, chain]))
+            }
+        } catch {
+            // Never preserve controls that may have become invalid under the saved policy.
+            if (store.currentRoomId === roomId) store.handoffChains = new Map()
+        }
+        message.success(t('common.saved'))
+    } catch (err: any) {
+        message.error(err?.message || t('common.saveFailed'))
+    }
+}
+
+async function handleContinueHandoff(chainId: string): Promise<void> {
+    if (!store.currentRoomId || isContinuingHandoff.value) return
+    isContinuingHandoff.value = true
+    try {
+        await continueRoomAgentHandoff(store.currentRoomId, chainId)
+        const result = await listStoppedRoomAgentHandoffs(store.currentRoomId)
+        store.handoffChains = new Map(result.chains.map(chain => [chain.chainId, chain]))
+        message.success(t('groupChat.agentHandoffContinued'))
+    } catch (err: any) {
+        try {
+            const result = await listStoppedRoomAgentHandoffs(store.currentRoomId)
+            store.handoffChains = new Map(result.chains.map(chain => [chain.chainId, chain]))
+        } catch {
+            // Keep the original continuation error.
+        }
+        message.error(t(handoffErrorTranslationKey(err?.message) || 'groupChat.agentHandoffErrorGeneric'))
     } finally {
-        isCompressing.value = false
+        isContinuingHandoff.value = false
     }
 }
 
-async function handleRemoveAgent(agentId: string) {
-    if (!store.currentRoomId) return
-    if (!currentRoomCanManage.value) return
+async function handleSaveRoomSummary() {
+    if (!store.currentRoomId || isSavingRoomSummary.value || !currentRoomCanManage.value) return
+    isSavingRoomSummary.value = true
     try {
-        await store.removeAgentFromRoom(store.currentRoomId, agentId)
+        const result = await updateRoomSummary(store.currentRoomId, roomSummaryDraft.value)
+        roomSummaryState.value = result.summary
+        store.roomSummaryStates.set(store.currentRoomId, result.summary)
+        message.success(t('groupChat.summaryUpdated'))
+    } catch (err: any) {
+        message.error(err?.message || t('common.saveFailed'))
+    } finally {
+        isSavingRoomSummary.value = false
+    }
+}
+
+function roomSummaryStatusLabel(status?: RoomSummaryState['status']): string {
+    return t(`groupChat.summaryStatus.${status || 'idle'}`)
+}
+
+function formatSummaryTime(timestamp?: number): string {
+    return timestamp ? new Date(timestamp).toLocaleString() : t('groupChat.summaryNever')
+}
+
+async function handleRemoveAgent(agent: RoomAgent) {
+    if (!store.currentRoomId) return
+    if (!canRemoveAgent(agent)) return
+    try {
+        await store.removeAgentFromRoom(store.currentRoomId, agent.id)
+        if (editingAgent.value && (editingAgent.value.id === agent.id || editingAgent.value.agentId === agent.agentId)) {
+            closeAgentDrawer()
+        }
     } catch {
         message.error(t('common.deleteFailed'))
     }
 }
 
-async function handleInterruptAgent(agentName: string) {
-    if (!currentRoomCanManage.value) return
+async function handleInterruptAgent(agent: RoomAgent) {
+    if (!canStopAgent(agent)) return
     try {
-        await store.interruptAgent(agentName)
+        await store.interruptAgent(agent.name)
     } catch (err: any) {
         message.error(err.message || t('common.saveFailed'))
     }
 }
 
 async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
-    if (!currentRoomCanManage.value) return
     try {
         await store.respondApproval(choice)
     } catch (err: any) {
@@ -702,14 +2076,36 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
     }
 }
 
+async function handleClarify(response?: string) {
+    if (!currentRoomCanManage.value) return
+    const finalResponse = response !== undefined
+        ? response
+        : visibleClarify.value?.responseMode === 'editor'
+            ? clarifyResponse.value
+            : clarifyResponse.value.trim()
+    if (response === undefined && !finalResponse && visibleClarify.value?.responseMode !== 'editor') return
+    try {
+        await store.respondClarify(finalResponse)
+        clarifyResponse.value = ''
+    } catch (err: any) {
+        message.error(err.message || t('common.saveFailed'))
+    }
+}
+
+function handleClarifyKeydown(event: KeyboardEvent) {
+    if (visibleClarify.value?.responseMode === 'editor') return
+    event.preventDefault()
+    void handleClarify()
+}
+
 </script>
 
 <template>
     <div class="group-chat-panel">
         <!-- Mobile backdrop -->
-        <div class="sidebar-backdrop" :class="{ active: showSidebar }" @click="showSidebar = false" />
+        <div v-if="!props.standalone" class="sidebar-backdrop" :class="{ active: showSidebar }" @click="showSidebar = false" />
         <!-- Room sidebar -->
-        <div v-if="showSidebar" class="room-sidebar">
+        <div v-if="!props.standalone && showSidebar" class="room-sidebar">
             <div class="sidebar-header">
                 <PageSidebarNav
                     active="group"
@@ -718,34 +2114,89 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                 />
             </div>
             <div class="room-list">
-                <div
-                    v-for="room in store.rooms"
-                    :key="room.id"
-                    class="room-item"
-                    :class="{ active: store.currentRoomId === room.id }"
-                    @click="handleSelectRoom(room.id)"
-                    @contextmenu="handleRoomContextMenu($event, room.id)"
-                >
-                    <svg class="room-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                    </svg>
-                    <div class="room-info">
-                        <span class="room-name">{{ room.name || room.id }}</span>
-                        <span v-if="room.inviteCode" class="room-code">{{ room.inviteCode }}</span>
-                        <span class="room-tokens">{{ formatTokens(room.totalTokens || 0) }}</span>
+                <section v-if="store.rooms.length" class="room-section">
+                    <button
+                        class="room-section-title"
+                        type="button"
+                        :aria-expanded="!localRoomsCollapsed"
+                        @click="localRoomsCollapsed = !localRoomsCollapsed"
+                    >
+                        <span>{{ t('groupChat.localRooms') }}</span>
+                        <svg class="room-section-chevron" :class="{ collapsed: localRoomsCollapsed }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="m6 9 6 6 6-6" />
+                        </svg>
+                    </button>
+                    <div v-show="!localRoomsCollapsed" class="room-section-content">
+                        <div
+                            v-for="room in store.rooms"
+                            :key="room.id"
+                            class="room-item"
+                            :class="{ active: store.currentRoomId === room.id }"
+                            @click="handleSelectRoom(room.id)"
+                            @contextmenu="handleRoomContextMenu($event, room.id)"
+                        >
+                            <GroupRoomAgentAvatar
+                                :agents="store.roomAgentsForRoom(room.id)"
+                                :active-agent-ids="store.activeAgentIdsForRoom(room.id)"
+                                :label="room.name || room.id"
+                            />
+                            <div class="room-info">
+                                <span class="room-name">{{ room.name || room.id }}</span>
+                                <span v-if="room.inviteCode" class="room-code">{{ room.inviteCode }}</span>
+                                <span class="room-tokens">{{ formatTokens(room.totalTokens || 0) }}</span>
+                            </div>
+                            <NPopconfirm v-if="canManageRoom(room)" @positive-click="handleDeleteRoom(room.id)">
+                                <template #trigger>
+                                    <button class="room-action-btn danger" @click.stop>
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                    </button>
+                                </template>
+                                {{ t('groupChat.deleteRoomConfirm') }}
+                            </NPopconfirm>
+                        </div>
                     </div>
-                    <NPopconfirm v-if="canManageRoom(room)" @positive-click="handleDeleteRoom(room.id)">
-                        <template #trigger>
-                            <button class="room-action-btn danger" @click.stop>
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                            </button>
-                        </template>
-                        {{ t('groupChat.deleteRoomConfirm') }}
-                    </NPopconfirm>
-                </div>
-                <div v-if="store.rooms.length === 0" class="empty-rooms">
-                    {{ t('groupChat.noRooms') }}
-                </div>
+                </section>
+
+                <section v-if="remoteRooms.length" class="room-section">
+                    <button
+                        class="room-section-title"
+                        type="button"
+                        :aria-expanded="!remoteRoomsCollapsed"
+                        @click="remoteRoomsCollapsed = !remoteRoomsCollapsed"
+                    >
+                        <span>{{ t('groupChat.remoteRooms') }}</span>
+                        <svg class="room-section-chevron" :class="{ collapsed: remoteRoomsCollapsed }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="m6 9 6 6 6-6" />
+                        </svg>
+                    </button>
+                    <div v-show="!remoteRoomsCollapsed" class="room-section-content">
+                        <button
+                            v-for="room in remoteRooms"
+                            :key="room.key"
+                            class="room-item remote-room-item"
+                            :class="{ unavailable: !room.inviteCode }"
+                            type="button"
+                            :aria-disabled="!room.inviteCode"
+                            @click="handleSelectRemoteRoom(room)"
+                            @contextmenu="handleRemoteRoomContextMenu($event, room)"
+                        >
+                            <svg class="room-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                            </svg>
+                            <span class="room-info">
+                                <span class="room-name">{{ room.roomName }}</span>
+                                <span v-if="room.inviteCode" class="room-code">{{ room.inviteCode }}</span>
+                                <span class="room-origin">{{ room.cloudOrigin }}</span>
+                            </span>
+                            <span
+                                class="remote-room-state"
+                                :class="{ online: room.connected }"
+                                :title="room.connected ? t('groupChat.agentLinkConnected') : t('groupChat.remoteRoomOffline')"
+                                :aria-label="room.connected ? t('groupChat.agentLinkConnected') : t('groupChat.remoteRoomOffline')"
+                            >{{ room.connected ? '●' : '○' }}</span>
+                        </button>
+                    </div>
+                </section>
             </div>
             <div class="page-sidebar-bottom">
                 <button class="page-sidebar-menu-btn" type="button" @click="openSettingsPage">
@@ -755,11 +2206,11 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </svg>
                     <span>{{ t('sidebar.settings') }}</span>
                 </button>
-                <SettingsCircuitBadge />
             </div>
         </div>
 
         <NDropdown
+            v-if="!props.standalone"
             placement="bottom-start"
             trigger="manual"
             :x="roomContextMenuX"
@@ -768,6 +2219,18 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
             :show="showRoomContextMenu"
             @select="handleRoomContextSelect"
             @clickoutside="handleRoomContextClickOutside"
+        />
+
+        <NDropdown
+            v-if="!props.standalone"
+            placement="bottom-start"
+            trigger="manual"
+            :x="remoteRoomContextMenuX"
+            :y="remoteRoomContextMenuY"
+            :options="remoteRoomContextMenuOptions"
+            :show="showRemoteRoomContextMenu"
+            @select="handleRemoteRoomContextSelect"
+            @clickoutside="handleRemoteRoomContextClickOutside"
         />
 
         <!-- Main chat area -->
@@ -781,9 +2244,12 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
         >
             <div class="chat-header">
                 <div class="header-left">
-                    <button class="icon-btn header-sidebar-toggle" @click="toggleSidebar">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="9" y1="3" x2="9" y2="21" />
+                    <button v-if="!props.standalone" class="icon-btn header-sidebar-toggle" @click="toggleSidebar">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <rect x="3" y="3" width="7" height="7" />
+                            <rect x="14" y="3" width="7" height="7" />
+                            <rect x="3" y="14" width="7" height="7" />
+                            <rect x="14" y="14" width="7" height="7" />
                         </svg>
                     </button>
                     <span class="room-title-text">{{ store.roomName || (store.currentRoomId || t('groupChat.title')) }}</span>
@@ -792,7 +2258,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                         class="workspace-badge"
                         type="button"
                         :title="currentRoom.workspace"
-                        @click="toggleWorkspacePanel"
+                        @click="openWorkspaceFilesPanel"
                     >
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
@@ -801,71 +2267,22 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </button>
                 </div>
                 <div class="header-info">
-                    <!-- Stacked avatars (user + agents) -->
-                    <NPopover v-if="store.agents.length" trigger="click" placement="bottom-end" :width="220">
-                        <template #trigger>
-                            <button
-                                type="button"
-                                class="avatar-stack-inner avatar-stack-trigger"
-                                :aria-label="`${t('groupChat.agents')} (${store.agents.length})`"
-                            >
-                                <!-- User avatar first -->
-                                <span class="avatar-stack-item" :style="{ zIndex: store.agents.length + 1 }">
-                                    <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
-                                </span>
-                                <span
-                                    v-for="(agent, index) in store.agents.slice(-4)"
-                                    :key="agent.id"
-                                    class="avatar-stack-item"
-                                    :style="{ zIndex: store.agents.length - index }"
-                                >
-                                    <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="profileAvatarFor(agent.profile)" :size="24" />
-                                </span>
-                                <span v-if="store.agents.length > 4" class="avatar-stack-more">+{{ store.agents.length - 4 }}</span>
-                            </button>
-                        </template>
-                        <div class="agent-popover">
-                            <div class="agent-popover-item" style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--n-border-color, #efeff5);">
-                                <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="28" />
-                                <div class="agent-popover-info">
-                                    <span class="agent-popover-name">{{ store.userName || 'You' }}</span>
-                                    <span class="agent-popover-profile">{{ t('groupChat.you') }}</span>
-                                </div>
-                            </div>
-                            <div class="agent-popover-title">{{ t('groupChat.agents') }} ({{ store.agents.length }})</div>
-                            <div v-for="agent in store.agents" :key="agent.id" class="agent-popover-item">
-                                <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="profileAvatarFor(agent.profile)" :size="28" />
-                                <div class="agent-popover-info">
-                                    <span class="agent-popover-name">{{ agent.name }}</span>
-                                    <span class="agent-popover-profile">{{ agent.profile }}</span>
-                                </div>
-                                <button v-if="currentRoomCanManage" class="agent-popover-remove" @click="handleRemoveAgent(agent.id)">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                                </button>
-                            </div>
-                        </div>
-                    </NPopover>
-                    <!-- Only user avatar, no agents -->
-                    <div v-else-if="store.userName" class="avatar-stack-inner">
-                        <span class="avatar-stack-item">
-                            <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
-                        </span>
-                    </div>
-                    <button v-if="hasRoom" class="icon-btn" :title="t('groupChat.yourName')" @click="handleOpenUserProfile">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M12 20h9" />
-                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" />
-                        </svg>
-                    </button>
-                    <button v-if="currentRoomCanManage" class="icon-btn" :title="t('groupChat.addAgent')" @click="handleAddAgent">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    <button
+                        v-if="currentRoomCanManage && pendingAgentPairings.length"
+                        class="agent-pairing-header-button"
+                        type="button"
+                        @click="handleOpenRoomSettings"
+                    >
+                        <span class="agent-pairing-header-dot" aria-hidden="true" />
+                        <span>{{ t('groupChat.agentPairingRequestTitle') }}</span>
+                        <strong>{{ pendingAgentPairings.length }}</strong>
                     </button>
                     <button
-                        v-if="currentRoom?.workspace && currentRoomCanManage"
+                        v-if="currentRoomCanManage"
                         class="icon-btn workspace-panel-toggle"
                         :class="{ active: showWorkspacePanel }"
-                        :title="t('chat.workspace')"
-                        :aria-label="t('chat.workspace')"
+                        :title="groupToolPanelTitle"
+                        :aria-label="groupToolPanelTitle"
                         :aria-pressed="showWorkspacePanel"
                         @click="toggleWorkspacePanel"
                     >
@@ -887,9 +2304,18 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                         </template>
                         {{ t('groupChat.clearContextConfirm') }}
                     </NPopconfirm>
-                    <span v-if="store.members.length" class="member-count">
-                        {{ store.members.length }} {{ t('groupChat.members') }}
-                    </span>
+                    <button
+                        v-if="participantCount"
+                        type="button"
+                        class="member-count member-count-toggle"
+                        :aria-expanded="showMemberRail"
+                        @click="showMemberRail = !showMemberRail"
+                    >
+                        <span>{{ t('groupChat.members', { count: participantCount }) }}</span>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" :class="{ collapsed: !showMemberRail }" aria-hidden="true">
+                            <polyline points="15 18 9 12 15 6" />
+                        </svg>
+                    </button>
                     <span class="connection-dot" :class="{ connected: store.connected, disconnected: !store.connected }"></span>
                 </div>
             </div>
@@ -900,9 +2326,189 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                 class="group-chat-content-wrapper"
                 :class="{ 'chat-main--drop-active': isChatDropActive }"
             >
-                <div class="group-chat-surface">
+                <aside
+                    v-if="showMemberRail"
+                    class="agent-avatar-rail"
+                    :aria-label="t('groupChat.members', { count: participantCount })"
+                >
+                    <div class="agent-avatar-rail-trigger">
+                        <NPopover
+                            v-for="member in railMembers"
+                            :key="member.userId"
+                            trigger="hover"
+                            placement="right"
+                            :show-arrow="false"
+                            :disabled="!currentRoomCanMentionAll || member.userId === store.userId"
+                        >
+                            <template #trigger>
+                                <button
+                                    type="button"
+                                    class="agent-avatar-rail-item agent-avatar-rail-user"
+                                    :class="{
+                                        'agent-avatar-rail-current-user': member.userId === store.userId,
+                                        'agent-avatar-rail-typing': member.userId !== store.userId && store.isUserTyping(member.userId),
+                                        'agent-avatar-rail-offline': member.connectionStatus === 'offline',
+                                    }"
+                                    :title="member.userId === store.userId ? t('groupChat.yourName') : member.name"
+                                    :aria-label="member.userId === store.userId ? t('groupChat.yourName') : member.name"
+                                    :disabled="member.userId !== store.userId && !currentRoomCanMentionAll"
+                                    @click="handleRoomMemberClick(member)"
+                                >
+                                    <ProfileAvatar
+                                        class="agent-avatar"
+                                        :name="member.name || t('groupChat.you')"
+                                        :avatar="memberAvatarFor(member)"
+                                        :size="32"
+                                    />
+                                </button>
+                            </template>
+                            <div class="agent-avatar-activity-popover">
+                                <span class="agent-avatar-activity-text">{{ member.name }}</span>
+                                <button
+                                    type="button"
+                                    class="agent-avatar-stop"
+                                    :aria-label="t('groupChat.removeMember')"
+                                    @click.stop="handleRemoveMember(member)"
+                                >
+                                    <span>{{ t('groupChat.removeMember') }}</span>
+                                </button>
+                            </div>
+                        </NPopover>
+                        <span v-if="store.agents.length" class="agent-avatar-rail-divider" aria-hidden="true"></span>
+                        <NPopover
+                            v-for="agent in store.agents"
+                            :key="agent.id"
+                            trigger="hover"
+                            placement="right"
+                            :show-arrow="false"
+                            :disabled="!canRemoveAgent(agent) && !agentContextStatus(agent)"
+                        >
+                            <template #trigger>
+                                <button
+                                    type="button"
+                                    class="agent-avatar-rail-item agent-avatar-rail-agent"
+                                    :class="{
+                                        'agent-avatar-rail-active': !!agentContextStatus(agent),
+                                        'agent-avatar-rail-offline': agent.connectionStatus === 'offline',
+                                    }"
+                                    :aria-label="agent.name"
+                                    :aria-busy="!!agentContextStatus(agent)"
+                                    @click="handleAgentRailClick(agent)"
+                                >
+                                    <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="groupAgentAvatar(agent)" :size="32" />
+                                    <span
+                                        v-if="agentOwnerMember(agent)"
+                                        class="agent-owner-avatar-badge"
+                                        :title="t('groupChat.agentOwner', { name: agentOwnerMember(agent)?.name })"
+                                    >
+                                        <ProfileAvatar
+                                            :name="agentOwnerMember(agent)?.name || ''"
+                                            :avatar="agentOwnerAvatar(agent)"
+                                            :size="14"
+                                        />
+                                    </span>
+                                </button>
+                            </template>
+                            <div class="agent-avatar-activity-popover">
+                                <span class="agent-avatar-activity-text">
+                                    @{{ agent.name }}
+                                    <template v-if="agentContextStatus(agent)">
+                                        {{ agentActivityLabel(agent) }}
+                                    </template>
+                                </span>
+                                <button
+                                    v-if="canStopAgent(agent) && agentContextStatus(agent)"
+                                    type="button"
+                                    class="agent-avatar-stop"
+                                    :aria-label="t('common.stop')"
+                                    @click.stop="handleInterruptAgent(agent)"
+                                >
+                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                        <rect x="6" y="6" width="12" height="12" rx="1" />
+                                    </svg>
+                                    <span>{{ t('common.stop') }}</span>
+                                </button>
+                                <button
+                                    v-if="canRemoveAgent(agent)"
+                                    type="button"
+                                    class="agent-avatar-stop"
+                                    :aria-label="t('common.delete')"
+                                    @click.stop="handleRemoveAgent(agent)"
+                                >
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <path d="M3 6h18" />
+                                        <path d="M8 6V4h8v2" />
+                                        <path d="M19 6l-1 14H6L5 6" />
+                                    </svg>
+                                    <span>{{ t('common.delete') }}</span>
+                                </button>
+                            </div>
+                        </NPopover>
+                    </div>
+                    <button
+                        v-if="currentRoomCanManage || props.standalone"
+                        type="button"
+                        class="agent-avatar-rail-add"
+                        :title="props.standalone ? t('groupChat.agentLinkButton') : t('groupChat.addAgent')"
+                        :aria-label="props.standalone ? t('groupChat.agentLinkButton') : t('groupChat.addAgent')"
+                        @click="handleAgentRailAdd"
+                    >
+                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                            <line x1="12" y1="5" x2="12" y2="19" />
+                            <line x1="5" y1="12" x2="19" y2="12" />
+                        </svg>
+                    </button>
+                </aside>
+                <div ref="groupChatSurfaceRef" class="group-chat-surface">
                     <div class="group-message-shell">
-                        <GroupMessageList />
+                        <GroupMessageList
+                            :allow-speech="!props.standalone"
+                            :can-manage-handoff="currentRoomCanManage"
+                            @mention-agent="handleMentionAgent"
+                            @continue-handoff="handleContinueHandoff"
+                            @adjust-handoff-settings="handleOpenRoomSettings"
+                        />
+                        <Transition name="approval-float">
+                            <div v-if="visibleAgentPairing" class="approval-float-panel agent-pairing-float-panel">
+                                <div class="approval-float-header">
+                                    <span class="approval-float-icon" aria-hidden="true">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="12" cy="8" r="4" />
+                                            <path d="M4 21a8 8 0 0 1 16 0M19 8v6M16 11h6" />
+                                        </svg>
+                                    </span>
+                                    <span>{{ t('groupChat.agentPairingRequestTitle') }}</span>
+                                </div>
+                                <div class="approval-float-title">
+                                    @{{ visibleAgentPairing.agent.name }}
+                                </div>
+                                <div class="approval-float-desc">
+                                    {{ t('groupChat.agentPairingRequestDescription', {
+                                        user: visibleAgentPairing.ownerName,
+                                        origin: visibleAgentPairing.targetOrigin,
+                                    }) }}
+                                </div>
+                                <div class="approval-float-actions">
+                                    <NButton
+                                        size="small"
+                                        type="primary"
+                                        :loading="isDecidingAgentPairing"
+                                        @click="handleAgentPairingDecision(true)"
+                                    >
+                                        {{ t('groupChat.approveAgent') }}
+                                    </NButton>
+                                    <NButton
+                                        size="small"
+                                        type="error"
+                                        secondary
+                                        :disabled="isDecidingAgentPairing"
+                                        @click="handleAgentPairingDecision(false)"
+                                    >
+                                        {{ t('groupChat.rejectAgent') }}
+                                    </NButton>
+                                </div>
+                            </div>
+                        </Transition>
                         <Transition name="approval-float">
                             <div v-if="visibleApproval" class="approval-float-panel">
                                 <div class="approval-float-header">
@@ -913,6 +2519,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                         </svg>
                                     </span>
                                     <span>{{ t('chat.approvalKicker') }}</span>
+                                    <PendingInteractionCountdown :deadline="visibleApproval.countdownDeadline" />
                                 </div>
                                 <div class="approval-float-title">
                                     <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
@@ -926,9 +2533,6 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                     <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
                                         {{ t('chat.approvalAllowOnce') }}
                                     </NButton>
-                                    <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
-                                        {{ t('chat.approvalAllowSession') }}
-                                    </NButton>
                                     <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
                                         {{ t('chat.approvalAlways') }}
                                     </NButton>
@@ -938,106 +2542,226 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                 </div>
                             </div>
                         </Transition>
-                    </div>
-                    <div v-if="store.contextStatuses.size > 0 || (store.typingText && store.contextStatuses.size === 0)" class="status-bar">
-                        <div v-if="store.contextStatuses.size > 0" class="context-status-list">
-                            <div v-for="[name, status] in store.contextStatuses" :key="name" class="context-status">
-                                <span class="typing-dots">
-                                    <span /><span /><span />
-                                </span>
-                                <span v-if="status.status === 'compressing'">
-                                    @{{ status.agentName }} {{ t('groupChat.agentCompressing') }}
-                                </span>
-                                <span v-else>
-                                    @{{ status.agentName }} {{ t('groupChat.agentReplying') }}
-                                </span>
-                                <button v-if="currentRoomCanManage" class="context-stop-btn" :title="t('common.cancel')" @click="handleInterruptAgent(status.agentName)">
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                                        <line x1="18" y1="6" x2="6" y2="18" />
-                                        <line x1="6" y1="6" x2="18" y2="18" />
-                                    </svg>
-                                </button>
+                        <Transition name="approval-float">
+                            <div v-if="!visibleApproval && visibleClarify" class="approval-float-panel">
+                                <div class="approval-float-header">
+                                    <span class="approval-float-icon" aria-hidden="true">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <circle cx="12" cy="12" r="10" />
+                                            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                                            <line x1="12" y1="17" x2="12.01" y2="17" />
+                                        </svg>
+                                    </span>
+                                    <span>{{ t('chat.clarifyKicker') }}</span>
+                                    <PendingInteractionCountdown :deadline="visibleClarify.countdownDeadline" />
+                                </div>
+                                <div class="approval-float-title">
+                                    <span v-if="visibleClarify.agentName">@{{ visibleClarify.agentName }} · </span>{{ t('chat.clarifyTitle') }}
+                                </div>
+                                <div class="approval-float-desc">{{ visibleClarify.question }}</div>
+                                <div v-if="visibleClarify.choices?.length" class="approval-float-actions">
+                                    <NButton v-for="choice in visibleClarify.choices" :key="choice" size="small" type="primary" @click="handleClarify(choice)">
+                                        {{ choice }}
+                                    </NButton>
+                                    <NButton size="small" type="error" secondary @click="handleClarify('')">
+                                        {{ t('chat.clarifyDismiss') }}
+                                    </NButton>
+                                </div>
+                                <div class="clarify-float-input-row">
+                                    <NInput v-model:value="clarifyResponse" size="small" :type="visibleClarify.responseMode === 'editor' ? 'textarea' : 'text'" :placeholder="t('chat.clarifyPlaceholder')" @keydown.enter="handleClarifyKeydown" />
+                                    <NButton size="small" type="primary" :disabled="visibleClarify.responseMode !== 'editor' && !clarifyResponse.trim()" @click="handleClarify()">
+                                        {{ t('chat.clarifySubmit') }}
+                                    </NButton>
+                                </div>
                             </div>
-                        </div>
-                        <div v-else-if="store.typingText" class="typing-indicator">
-                            <span class="typing-dots">
-                                <span /><span /><span />
-                            </span>
-                            {{ store.typingText }}
-                        </div>
+                        </Transition>
                     </div>
-                    <GroupChatInput ref="groupChatInputRef" @send="handleSendMessage" />
-                </div>
-                <aside
-                    v-if="showWorkspacePanel && (activeWorkspacePanel === 'browser' ? desktopBrowserAvailable : (toolPanelStore.workspaceDiff || currentRoom?.workspace || filesStore.previewFile?.workspaceRoomId === store.currentRoomId))"
-                    class="group-workspace-panel"
-                    :style="workspacePanelStyle"
-                >
-                    <div class="group-workspace-resize-handle" @pointerdown="startWorkspaceResize" />
-                    <div class="group-workspace-panel-inner">
+                    <Transition name="summary-inline">
                         <div
-                            v-if="desktopBrowserAvailable && !toolPanelStore.workspaceDiff && !filesStore.previewFile"
-                            class="group-workspace-panel-tabs"
-                            role="tablist"
+                            v-if="inlineSummaryStatus"
+                            class="group-summary-inline-status"
+                            :class="`is-${inlineSummaryStatus.status}`"
+                            role="status"
+                            aria-live="polite"
                         >
-                            <button
-                                type="button"
-                                role="tab"
-                                :class="{ active: activeWorkspacePanel === 'files' }"
-                                :aria-selected="activeWorkspacePanel === 'files'"
-                                @click="selectWorkspacePanel('files')"
+                            <span class="group-summary-inline-label">
+                                {{ roomSummaryStatusLabel(inlineSummaryStatus.status) }}
+                            </span>
+                            <span
+                                v-if="inlineSummaryStatus.status === 'summarizing'"
+                                class="group-summary-inline-spinner"
+                                aria-hidden="true"
+                            ></span>
+                            <svg
+                                v-else-if="inlineSummaryStatus.status === 'success'"
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                class="group-summary-inline-success-icon"
+                                aria-hidden="true"
                             >
-                                {{ t('drawer.files') }}
-                            </button>
-                            <button
-                                type="button"
-                                role="tab"
-                                :class="{ active: activeWorkspacePanel === 'browser' }"
-                                :aria-selected="activeWorkspacePanel === 'browser'"
-                                @click="selectWorkspacePanel('browser')"
+                                <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15" />
+                                <path d="M8 12L11 15L16 9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                            </svg>
+                            <svg
+                                v-else
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                class="group-summary-inline-error-icon"
+                                aria-hidden="true"
                             >
-                                {{ t('browser.title') }}
-                            </button>
-                            <button class="group-workspace-panel-close" type="button" :title="t('files.closePreview')" @click="closeWorkspacePanel">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <line x1="18" y1="6" x2="6" y2="18" />
-                                    <line x1="6" y1="6" x2="18" y2="18" />
-                                </svg>
-                            </button>
+                                <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15" />
+                                <path d="M15 9L9 15M9 9L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                            </svg>
+                            <span
+                                v-if="inlineSummaryStatus.status === 'failed' && inlineSummaryStatus.error"
+                                class="group-summary-inline-detail"
+                                :title="inlineSummaryStatus.error"
+                            >
+                                {{ inlineSummaryStatus.error }}
+                            </span>
                         </div>
-                        <DesktopBrowserPanel
-                            class="group-browser-panel"
-                            v-if="desktopBrowserAvailable && activeWorkspacePanel === 'browser'"
-                            @attach="handleBrowserAttachment"
+                    </Transition>
+                    <div v-if="store.executionQueue.length > 0" class="group-execution-queue-float-stack">
+                        <MessageQueueFloatPanel
+                            :items="store.executionQueue.map(item => ({
+                                id: item.id,
+                                text: item.textSummary,
+                                secondary: item.targetAgentName,
+                                position: item.position,
+                            }))"
+                            test-id="group-execution-queue"
+                            :remove-title="item => t('groupChat.executionQueueCancel', { agent: item.secondary || '' })"
+                            @remove="handleCancelQueuedExecution"
                         />
-                        <WorkspaceDiffPreview
-                            v-else-if="toolPanelStore.workspaceDiff"
-                            :custom-close="closeWorkspacePanel"
-                        />
-                        <FilePreview
-                            v-else-if="filesStore.previewFile?.workspaceRoomId === store.currentRoomId"
-                            :custom-close="closeWorkspacePanel"
-                        />
-                        <template v-else-if="currentRoom?.workspace">
-                            <div v-if="!desktopBrowserAvailable" class="group-workspace-panel-header">
-                                <span>{{ t('drawer.files') }}</span>
-                                <button type="button" :title="t('files.closePreview')" @click="closeWorkspacePanel">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <line x1="18" y1="6" x2="6" y2="18" />
-                                        <line x1="6" y1="6" x2="18" y2="18" />
-                                    </svg>
-                                </button>
-                            </div>
-                            <div class="group-workspace-panel-content">
-                                <FilesPanel
-                                    :workspace-room-id="store.currentRoomId"
-                                    :workspace="currentRoom.workspace"
-                                    @attach="handleWorkspaceFileAttach"
-                                />
-                            </div>
-                        </template>
                     </div>
-                </aside>
+                    <GroupChatInput
+                        ref="groupChatInputRef"
+                        :room-id="store.currentRoomId"
+                        :send-blocked="currentRoomNeedsSummaryConfiguration"
+                        :allow-attachments="true"
+                        :show-settings="!props.standalone"
+                        :allow-all-mention="currentRoomCanMentionAll"
+                        @send="handleSendMessage"
+                        @send-blocked="handleSummaryConfigurationRequired"
+                    />
+                </div>
+                <Transition
+                    name="tool-panel"
+                    @before-enter="handleToolPanelBeforeEnter"
+                    @after-enter="handleToolPanelAfterEnter"
+                    @before-leave="handleToolPanelBeforeLeave"
+                    @leave-cancelled="handleToolPanelLeaveCancelled"
+                >
+                    <aside
+                        v-if="showWorkspacePanel && (
+                            activeWorkspacePanel === 'files'
+                            || activeWorkspacePanel === 'terminal'
+                            || (activeWorkspacePanel === 'browser' && desktopBrowserAvailable)
+                            || toolPanelStore.workspaceDiff
+                            || currentRoom?.workspace
+                            || filesStore.previewFile?.workspaceRoomId === store.currentRoomId
+                        )"
+                        class="group-workspace-panel"
+                        :style="workspacePanelStyle"
+                    >
+                        <div class="group-workspace-resize-handle" @pointerdown="startWorkspaceResize" />
+                        <div class="group-workspace-panel-inner">
+                            <WorkspaceDiffPreview
+                                v-if="toolPanelStore.workspaceDiff"
+                                :custom-close="closeWorkspacePanel"
+                            />
+                            <template v-else>
+                                <div class="group-tool-tabs" role="tablist">
+                                    <button
+                                        class="group-tool-tab"
+                                        :class="{ active: activeWorkspacePanel === 'files' }"
+                                        type="button"
+                                        role="tab"
+                                        :title="t('drawer.files')"
+                                        :aria-label="t('drawer.files')"
+                                        :aria-selected="activeWorkspacePanel === 'files'"
+                                        @click="selectWorkspacePanel('files')"
+                                    >
+                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+                                        </svg>
+                                    </button>
+                                    <button
+                                        class="group-tool-tab"
+                                        :class="{ active: activeWorkspacePanel === 'terminal' }"
+                                        type="button"
+                                        role="tab"
+                                        :title="t('drawer.terminal')"
+                                        :aria-label="t('drawer.terminal')"
+                                        :aria-selected="activeWorkspacePanel === 'terminal'"
+                                        @click="selectWorkspacePanel('terminal')"
+                                    >
+                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                            <rect x="3" y="4" width="18" height="16" rx="2" />
+                                            <path d="m7 9 3 3-3 3M13 15h4" />
+                                        </svg>
+                                    </button>
+                                    <button
+                                        v-if="desktopBrowserAvailable"
+                                        class="group-tool-tab"
+                                        :class="{ active: activeWorkspacePanel === 'browser' }"
+                                        type="button"
+                                        role="tab"
+                                        :title="t('browser.title')"
+                                        :aria-label="t('browser.title')"
+                                        :aria-selected="activeWorkspacePanel === 'browser'"
+                                        @click="selectWorkspacePanel('browser')"
+                                    >
+                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                            <rect x="3" y="4" width="18" height="16" rx="2" />
+                                            <path d="M3 9h18" />
+                                            <circle cx="6.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                                            <circle cx="9.5" cy="6.5" r=".75" fill="currentColor" stroke="none" />
+                                        </svg>
+                                    </button>
+                                </div>
+                                <div class="group-tool-content">
+                                    <template v-if="currentRoom?.workspace">
+                                        <FilesPanel
+                                            v-show="activeWorkspacePanel === 'files'"
+                                            :workspace-room-id="store.currentRoomId"
+                                            :workspace="currentRoom.workspace"
+                                            @attach="handleWorkspaceFileAttach"
+                                        />
+                                    </template>
+                                    <FilePreview
+                                        v-else-if="filesStore.previewFile?.workspaceRoomId === store.currentRoomId"
+                                        :custom-close="closeWorkspacePanel"
+                                    />
+                                    <div v-else-if="activeWorkspacePanel === 'files'" class="group-workspace-empty">
+                                        <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+                                            <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                                        </svg>
+                                        <span>{{ t('chat.setWorkspaceTitle') }}</span>
+                                        <NButton type="primary" size="small" @click="handleOpenWorkspacePicker()">
+                                            {{ t('chat.setWorkspace') }}
+                                        </NButton>
+                                    </div>
+                                    <TerminalPanel
+                                        v-show="activeWorkspacePanel === 'terminal'"
+                                        class="group-terminal-panel"
+                                        :visible="showWorkspacePanel && activeWorkspacePanel === 'terminal'"
+                                    />
+                                    <DesktopBrowserPanel
+                                        v-if="desktopBrowserAvailable && activeWorkspacePanel === 'browser'"
+                                        class="group-browser-panel"
+                                        :visible="toolPanelTransitionReady"
+                                        :submit="submitBrowserAnnotations"
+                                    />
+                                </div>
+                            </template>
+                        </div>
+                    </aside>
+                </Transition>
             </div>
 
             <div v-else class="no-room">
@@ -1050,26 +2774,130 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
             </div>
         </div>
 
-        <!-- Create room modal -->
-        <Teleport to="body">
-            <div v-if="showCreateModal" class="modal-backdrop" @click.self="showCreateModal = false">
-                <div class="modal">
-                    <h3>{{ t('groupChat.createRoom') }}</h3>
-                    <CreateRoomForm @submit="handleCreateRoom" @cancel="showCreateModal = false" />
-                </div>
-            </div>
-        </Teleport>
+        <NDrawer v-model:show="showCreateModal" placement="right" :width="workspacePanelMobile ? '100%' : 520">
+            <NDrawerContent :title="t('groupChat.createRoom')" closable>
+                <CreateRoomForm @submit="handleCreateRoom" @cancel="showCreateModal = false" />
+            </NDrawerContent>
+        </NDrawer>
 
-        <Teleport to="body">
-            <div v-if="showAddAgentModal" class="modal-backdrop" @click.self="showAddAgentModal = false">
-                <div class="modal">
-                    <h3>{{ t('groupChat.addAgent') }}</h3>
+        <NDrawer
+            :show="showAddAgentDrawer"
+            placement="right"
+            :width="workspacePanelMobile ? '100%' : 520"
+            :z-index="1000"
+            :mask-closable="!isSavingAgent"
+            :close-on-esc="!isSavingAgent && !showAgentPresetDialog"
+            :trap-focus="!showAgentPresetDialog"
+            @update:show="!$event && closeAgentDrawer()"
+        >
+            <NDrawerContent
+                :title="editingAgent ? t('groupChat.editAgentTitle', { name: editingAgent.name }) : t('groupChat.addAgent')"
+                :closable="!isSavingAgent"
+            >
+                    <div v-if="!editingAgent" class="agent-preset-entry">
+                        <NButton secondary block @click="openAgentPresetSelection">
+                            {{ t('groupChat.chooseAgentPreset') }}
+                        </NButton>
+                        <p class="form-hint">{{ t('groupChat.agentPresetSnapshotHint') }}</p>
+                    </div>
+                    <div v-if="editingAgent" class="agent-preset-entry">
+                        <NButton secondary block @click="openAgentPresetManager">
+                            {{ t('groupChat.manageAgentPresets') }}
+                        </NButton>
+                        <p class="form-hint">{{ t('groupChat.agentPresetSnapshotHint') }}</p>
+                    </div>
+                    <div class="group-agent-avatar-editor">
+                        <ProfileAvatar
+                            :name="selectedAgentType"
+                            :avatar="agentAvatarPreview"
+                            :size="64"
+                        />
+                        <div class="group-agent-avatar-controls">
+                            <span class="form-label">{{ t('profiles.avatar.customize') }}</span>
+                            <div class="group-agent-avatar-actions">
+                                <NButton size="small" @click="triggerAgentAvatarUpload">
+                                    {{ t('profiles.avatar.upload') }}
+                                </NButton>
+                                <NButton size="small" @click="handleRandomAgentAvatar">
+                                    {{ t('profiles.avatar.random') }}
+                                </NButton>
+                                <NButton size="small" @click="handleResetAgentAvatar">
+                                    {{ t('profiles.avatar.reset') }}
+                                </NButton>
+                            </div>
+                            <span class="group-agent-avatar-hint">{{ t('profiles.avatar.hint') }}</span>
+                        </div>
+                        <input
+                            ref="agentAvatarFileInput"
+                            class="group-agent-avatar-file"
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp"
+                            @change="handleAgentAvatarFileChange"
+                        >
+                    </div>
                     <div class="form-group">
+                        <label class="form-label">{{ t('groupChat.agentType') }}</label>
                         <NSelect
-                            v-model:value="selectedProfile"
+                            :value="selectedAgentType"
+                            :options="groupAgentTypeOptions"
+                            @update:value="handleAgentTypeChange"
+                        />
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ t('sidebar.profiles') }}</label>
+                        <NSelect
+                            :value="selectedProfile"
                             :options="profileOptions"
                             :placeholder="t('groupChat.selectProfile')"
                             filterable
+                            @update:value="handleAgentProfileChange"
+                        />
+                    </div>
+                    <DshSessionPresetSelect v-if="selectedAgentType === 'dsh'" class="form-group"
+                        v-model="selectedRuntimePreset" :disabled="isSavingAgent"
+                        @valid="selectedRuntimePresetReady = $event" />
+                    <div v-if="supportsGlobalAgentMode" class="form-group">
+                        <label class="form-label">{{ t('codingAgents.launchModeScope') }}</label>
+                        <NSelect
+                            :value="selectedAgentMode"
+                            :options="agentModeOptions"
+                            @update:value="handleAgentModeChange"
+                        />
+                    </div>
+                    <div v-if="!usesGlobalAgentMode" class="form-group">
+                        <label class="form-label">{{ t('models.provider') }}</label>
+                        <NSelect
+                            :value="selectedAgentProvider"
+                            :options="agentProviderOptions"
+                            :placeholder="t('models.selectProvider')"
+                            filterable
+                            @update:value="handleAgentProviderChange"
+                        />
+                    </div>
+                    <div v-if="!usesGlobalAgentMode" class="form-group">
+                        <label class="form-label">{{ t('models.models') }}</label>
+                        <NSelect
+                            :value="selectedAgentModel"
+                            :options="agentModelOptions"
+                            :placeholder="t('models.selectModel')"
+                            :disabled="!selectedAgentProvider"
+                            filterable
+                            @update:value="handleAgentModelChange"
+                        />
+                    </div>
+                    <div v-if="selectedAgentType !== 'hermes' && !usesGlobalAgentMode" class="form-group">
+                        <label class="form-label">{{ t('codingAgents.protocolScope') }}</label>
+                        <NSelect
+                            v-model:value="selectedAgentApiMode"
+                            :options="agentApiModeOptions"
+                        />
+                    </div>
+                    <div v-if="!usesGlobalAgentMode" class="form-group">
+                        <label class="form-label">{{ t('chat.reasoningEffort.tooltip') }}</label>
+                        <NSelect
+                            v-model:value="selectedAgentReasoningEffort"
+                            :options="agentReasoningEffortOptions"
+                            :placeholder="t('chat.reasoningEffort.tooltip')"
                         />
                     </div>
                     <div class="form-group">
@@ -1088,11 +2916,132 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                             :placeholder="t('groupChat.agentDescPlaceholder')"
                         />
                     </div>
-                    <div class="modal-actions">
+                <template #footer>
+                    <div class="agent-drawer-actions" :class="{ 'is-editing': editingAgent }">
+                        <NButton
+                            v-if="editingAgent"
+                            type="error"
+                            secondary
+                            :disabled="isSavingAgent"
+                            @click="handleRemoveAgent(editingAgent)"
+                        >
+                            {{ t('common.delete') }}
+                        </NButton>
                         <NSpace justify="end">
-                            <NButton @click="showAddAgentModal = false">{{ t('common.cancel') }}</NButton>
-                            <NButton type="primary" :disabled="!selectedProfile" @click="confirmAddAgent">{{ t('common.add') }}</NButton>
+                            <NButton :disabled="isSavingAgent" @click="closeAgentDrawer">{{ t('common.cancel') }}</NButton>
+                            <NButton
+                                type="primary"
+                                :disabled="!canConfirmAddAgent"
+                                :loading="isSavingAgent"
+                                @click="editingAgent ? confirmUpdateAgent() : confirmAddAgent()"
+                            >
+                                {{ editingAgent ? t('common.update') : t('common.add') }}
+                            </NButton>
                         </NSpace>
+                    </div>
+                </template>
+            </NDrawerContent>
+        </NDrawer>
+
+        <Teleport to="body">
+            <div
+                v-if="showAgentPresetDialog"
+                class="modal-backdrop agent-preset-dialog-backdrop"
+                @click.self="closeAgentPresetDialog"
+            >
+                <div class="modal agent-preset-dialog">
+                    <h3>
+                        {{ agentPresetDialogMode === 'select'
+                            ? t('groupChat.chooseAgentPreset')
+                            : t('groupChat.manageAgentPresets') }}
+                    </h3>
+                    <NInput
+                        v-model:value="agentPresetSearch"
+                        clearable
+                        :placeholder="t('groupChat.searchAgentPresets')"
+                    />
+                    <div v-if="isLoadingAgentPresets" class="agent-preset-dialog-state">
+                        {{ t('groupChat.agentPresetsLoading') }}
+                    </div>
+                    <div v-else-if="agentPresetLoadError" class="agent-preset-dialog-state is-error">
+                        <span>{{ agentPresetLoadError }}</span>
+                        <NButton size="small" secondary @click="loadAgentPresets">
+                            {{ t('common.retry') }}
+                        </NButton>
+                    </div>
+                    <div v-else-if="agentPresets.length === 0" class="agent-preset-dialog-state">
+                        {{ t('groupChat.agentPresetsEmpty') }}
+                    </div>
+                    <div v-else-if="filteredAgentPresets.length === 0" class="agent-preset-dialog-state">
+                        {{ t('groupChat.agentPresetsNoResults') }}
+                    </div>
+                    <div v-else class="agent-preset-dialog-list">
+                        <button
+                            v-for="preset in filteredAgentPresets"
+                            :key="preset.id"
+                            type="button"
+                            class="agent-preset-dialog-row"
+                            :class="{
+                                selected: pendingAgentPresetId === preset.id,
+                                unavailable: !preset.available,
+                            }"
+                            :disabled="!preset.available"
+                            :aria-pressed="pendingAgentPresetId === preset.id"
+                            @click="selectAgentPresetForDialog(preset)"
+                        >
+                            <span class="agent-preset-dialog-row-name">{{ preset.name }}</span>
+                            <span class="agent-preset-dialog-row-config">
+                                {{ preset.profile }} · {{ preset.agentMode === 'global'
+                                    ? t('codingAgents.launchModeGlobal')
+                                    : `${preset.provider}/${preset.model}` }}
+                            </span>
+                            <span v-if="!preset.available" class="agent-preset-dialog-row-error">
+                                {{ preset.validationError || t('groupChat.agentPresetUnavailable') }}
+                            </span>
+                        </button>
+                    </div>
+                    <p class="form-hint">{{ t('groupChat.agentPresetSnapshotHint') }}</p>
+                    <div v-if="agentPresetDialogMode === 'manage'" class="agent-preset-management-actions">
+                        <NButton
+                            secondary
+                            :disabled="!canConfirmAddAgent || isSavingAgentPreset"
+                            :loading="isSavingAgentPreset && !pendingAgentPresetId"
+                            @click="createAgentPresetFromCurrent"
+                        >
+                            {{ t('groupChat.saveCurrentAgentAsPreset') }}
+                        </NButton>
+                        <NButton
+                            secondary
+                            :disabled="!pendingAgentPresetId || !canConfirmAddAgent || isSavingAgentPreset"
+                            :loading="isSavingAgentPreset && Boolean(pendingAgentPresetId)"
+                            @click="updateSelectedAgentPreset"
+                        >
+                            {{ t('groupChat.updateAgentPreset') }}
+                        </NButton>
+                        <NPopconfirm
+                            v-if="pendingAgentPresetId"
+                            @positive-click="deleteAgentPreset"
+                        >
+                            <template #trigger>
+                                <NButton type="error" secondary :disabled="isSavingAgentPreset">
+                                    {{ t('groupChat.deleteAgentPreset') }}
+                                </NButton>
+                            </template>
+                            {{ t('groupChat.deleteAgentPresetConfirm') }}
+                        </NPopconfirm>
+                    </div>
+                    <div class="modal-actions">
+                        <NButton @click="closeAgentPresetDialog">
+                            {{ t('common.cancel') }}
+                        </NButton>
+                        <NButton
+                            v-if="agentPresetDialogMode === 'select'"
+                            type="primary"
+                            :disabled="!pendingAgentPreset?.available"
+                            @click="confirmAgentPresetSelection"
+                        >
+                            {{ t('groupChat.applyAgentPreset') }}
+                        </NButton>
                     </div>
                 </div>
             </div>
@@ -1115,7 +3064,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                 :placeholder="t('groupChat.autoGenerate')"
                                 @keyup.enter="confirmCloneRoom"
                             />
-                            <NButton size="small" @click="cloneInviteCode = generateCode()">
+                            <NButton size="small" @click="cloneInviteCode = generateGroupChatInviteCode()">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                                     <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
                                 </svg>
@@ -1130,6 +3079,101 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </div>
                 </div>
             </div>
+            <NModal
+                v-model:show="showRemoteRoomRenameModal"
+                preset="dialog"
+                :title="t('groupChat.renameRemoteRoom')"
+                style="width: 460px; max-width: 92vw"
+                @after-leave="remoteRoomBeingRenamed = null"
+            >
+                <NInput
+                    v-model:value="remoteRoomNameDraft"
+                    :placeholder="t('groupChat.roomNamePlaceholder')"
+                    :maxlength="120"
+                    @keyup.enter="confirmRemoteRoomRename"
+                />
+                <p class="form-hint">{{ t('groupChat.renameRemoteRoomHint') }}</p>
+                <template #action>
+                    <NSpace justify="end">
+                        <NButton :disabled="isUpdatingRemoteRoom" @click="showRemoteRoomRenameModal = false">
+                            {{ t('common.cancel') }}
+                        </NButton>
+                        <NButton
+                            type="primary"
+                            :loading="isUpdatingRemoteRoom"
+                            :disabled="!remoteRoomNameDraft.trim()"
+                            @click="confirmRemoteRoomRename"
+                        >
+                            {{ t('groupChat.renameRemoteRoom') }}
+                        </NButton>
+                    </NSpace>
+                </template>
+            </NModal>
+            <NModal
+                :show="Boolean(remoteRoomBeingLeft)"
+                preset="dialog"
+                :title="t('groupChat.leaveRemoteRoom')"
+                style="width: 480px; max-width: 92vw"
+                @update:show="visible => { if (!visible && !isUpdatingRemoteRoom) remoteRoomBeingLeft = null }"
+            >
+                <p class="manual-room-link-hint">
+                    {{ t('groupChat.leaveRemoteRoomConfirm', { name: remoteRoomBeingLeft?.roomName || '' }) }}
+                </p>
+                <template #action>
+                    <NSpace justify="end">
+                        <NButton :disabled="isUpdatingRemoteRoom" @click="remoteRoomBeingLeft = null">
+                            {{ t('common.cancel') }}
+                        </NButton>
+                        <NButton type="error" :loading="isUpdatingRemoteRoom" @click="confirmLeaveRemoteRoom">
+                            {{ t('groupChat.leaveRemoteRoom') }}
+                        </NButton>
+                    </NSpace>
+                </template>
+            </NModal>
+            <NModal
+                v-model:show="showManualRoomLinkModal"
+                preset="dialog"
+                :title="t('groupChat.copyRoomLink')"
+                :aria-label="t('groupChat.copyRoomLink')"
+                style="width: 560px; max-width: 92vw"
+                @after-enter="selectManualRoomLink"
+            >
+                <p class="manual-room-link-hint">
+                    {{ t('groupChat.manualCopyRoomLinkHint') }}
+                </p>
+                <input
+                    ref="manualRoomLinkInput"
+                    class="manual-room-link-input"
+                    type="text"
+                    :value="manualRoomLink"
+                    :aria-label="t('groupChat.copyRoomLink')"
+                    readonly
+                    @click="selectManualRoomLink"
+                >
+                <template #action>
+                    <NButton type="primary" @click="showManualRoomLinkModal = false">
+                        {{ t('common.ok') }}
+                    </NButton>
+                </template>
+            </NModal>
+            <NModal
+                v-model:show="showGroupChatRefactorNotice"
+                preset="dialog"
+                :title="t('groupChat.refactorNoticeTitle')"
+                :mask-closable="false"
+                :close-on-esc="false"
+                :closable="false"
+                style="width: 480px; max-width: 92vw"
+            >
+                <p class="group-chat-refactor-notice">
+                    {{ t('groupChat.refactorNoticeMessage') }}
+                </p>
+                <template #action>
+                    <NButton type="primary" @click="acknowledgeGroupChatRefactorNotice">
+                        {{ t('common.confirm') }}
+                    </NButton>
+                </template>
+            </NModal>
             <NModal
                 v-model:show="showWorkspaceModal"
                 preset="dialog"
@@ -1185,73 +3229,271 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </NSpace>
                 </template>
             </NModal>
-            <div v-if="showCompressionModal" class="modal-backdrop" @click.self="showCompressionModal = false">
-                <div class="modal room-settings-modal">
-                    <h3>{{ t('groupChat.roomSettings') }}</h3>
-                    <section class="settings-section">
-                        <h4>{{ t('groupChat.inviteCodeSettings') }}</h4>
-                        <div class="form-group">
-                            <label class="form-label">{{ t('groupChat.inviteCode') }}</label>
-                            <div class="code-row invite-code-row">
+            <NDrawer
+                v-model:show="showRoomSettingsModal"
+                placement="right"
+                :width="workspacePanelMobile ? '100%' : 520"
+            >
+                <NDrawerContent :title="t('groupChat.roomSettings')" closable>
+                    <div class="room-settings-drawer">
+                        <section v-if="pendingAgentPairings.length" class="settings-section pending-agent-pairings-section">
+                            <h4>{{ t('groupChat.agentPairingRequestTitle') }} ({{ pendingAgentPairings.length }})</h4>
+                            <article
+                                v-for="request in pendingAgentPairings"
+                                :key="request.id"
+                                class="pending-agent-pairing-card"
+                            >
+                                <strong>@{{ request.agent.name }}</strong>
+                                <p>
+                                    {{ t('groupChat.agentPairingRequestDescription', {
+                                        user: request.ownerName,
+                                        origin: request.targetOrigin,
+                                    }) }}
+                                </p>
+                                <NSpace>
+                                    <NButton
+                                        size="small"
+                                        type="primary"
+                                        :loading="isDecidingAgentPairing"
+                                        @click="handleAgentPairingDecision(true, request)"
+                                    >
+                                        {{ t('groupChat.approveAgent') }}
+                                    </NButton>
+                                    <NButton
+                                        size="small"
+                                        type="error"
+                                        secondary
+                                        :disabled="isDecidingAgentPairing"
+                                        @click="handleAgentPairingDecision(false, request)"
+                                    >
+                                        {{ t('groupChat.rejectAgent') }}
+                                    </NButton>
+                                </NSpace>
+                            </article>
+                        </section>
+                        <section class="settings-section">
+                            <h4>{{ t('groupChat.roomName') }}</h4>
+                            <div class="code-row room-name-row">
                                 <NInput
-                                    v-model:value="inviteCodeDraft"
-                                    :placeholder="t('groupChat.inviteCodePlaceholder')"
-                                    :disabled="isSavingInviteCode"
-                                    @keyup.enter="handleSaveInviteCode"
+                                    v-model:value="roomNameDraft"
+                                    :placeholder="t('groupChat.roomNamePlaceholder')"
+                                    :maxlength="120"
+                                    :disabled="isSavingRoomName"
+                                    @keyup.enter="handleSaveRoomName"
                                 />
-                                <NButton size="small" :disabled="isSavingInviteCode" :title="t('groupChat.generateInviteCode')" @click="inviteCodeDraft = generateCode()">
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                                        <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-                                    </svg>
-                                </NButton>
                                 <NButton
                                     type="primary"
-                                    :disabled="!canUpdateInviteCode"
-                                    :loading="isSavingInviteCode"
-                                    @click="handleSaveInviteCode"
+                                    :disabled="!canUpdateRoomName"
+                                    :loading="isSavingRoomName"
+                                    @click="handleSaveRoomName"
                                 >
                                     {{ t('common.update') }}
                                 </NButton>
                             </div>
-                            <p class="form-hint">{{ t('groupChat.inviteCodeRotateHint') }}</p>
+                        </section>
+                        <section class="settings-section">
+                            <h4>{{ t('groupChat.inviteCodeSettings') }}</h4>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.inviteCode') }}</label>
+                                <div class="code-row invite-code-row">
+                                    <NInput
+                                        v-model:value="inviteCodeDraft"
+                                        :placeholder="t('groupChat.inviteCodePlaceholder')"
+                                        :disabled="isSavingInviteCode"
+                                        @keyup.enter="handleSaveInviteCode"
+                                    />
+                                    <NButton size="small" :disabled="isSavingInviteCode" :title="t('groupChat.generateInviteCode')" @click="inviteCodeDraft = generateGroupChatInviteCode()">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                                            <polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                                        </svg>
+                                    </NButton>
+                                    <NButton
+                                        type="primary"
+                                        :disabled="!canUpdateInviteCode"
+                                        :loading="isSavingInviteCode"
+                                        @click="handleSaveInviteCode"
+                                    >
+                                        {{ t('common.update') }}
+                                    </NButton>
+                                </div>
+                                <p class="form-hint">{{ t('groupChat.inviteCodeRotateHint') }}</p>
+                                <NButton
+                                    class="share-link-button"
+                                    secondary
+                                    block
+                                    :disabled="!currentRoom?.inviteCode"
+                                    @click="copyCurrentRoomLink"
+                                >
+                                    {{ t('groupChat.copyRoomLink') }}
+                                </NButton>
+                            </div>
+                        </section>
+                        <section class="settings-section">
+                            <h4>{{ t('groupChat.guestAgentSettings') }}</h4>
+                            <div class="guest-agent-policy-row">
+                                <div>
+                                    <strong>{{ t('groupChat.allowGuestAgents') }}</strong>
+                                    <p class="form-hint">{{ t('groupChat.ownerApprovalHint') }}</p>
+                                </div>
+                                <NSwitch v-model:value="allowGuestAgentsDraft" />
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.maxGuestAgentsPerMember') }}</label>
+                                <NInputNumber
+                                    v-model:value="maxGuestAgentsPerMemberDraft"
+                                    :min="1"
+                                    :max="5"
+                                    :step="1"
+                                    :disabled="!allowGuestAgentsDraft"
+                                    style="width: 100%"
+                                />
+                            </div>
+                            <div class="guest-agent-policy-row">
+                                <div>
+                                    <strong>{{ t('groupChat.allowRemoteWorkspaceAccess') }}</strong>
+                                    <p class="form-hint">{{ t('groupChat.remoteWorkspaceAccessHint') }}</p>
+                                </div>
+                                <NSwitch
+                                    v-model:value="allowRemoteWorkspaceAccessDraft"
+                                    :disabled="!allowGuestAgentsDraft"
+                                />
+                            </div>
+                            <NButton
+                                type="primary"
+                                :loading="isSavingGuestAgentPolicy"
+                                @click="handleSaveGuestAgentPolicy"
+                            >
+                                {{ t('common.save') }}
+                            </NButton>
+                        </section>
+                        <section class="settings-section">
+                            <h4>{{ t('chat.setWorkspaceTitle') }}</h4>
+                            <FolderPicker v-model="workspaceValue" />
+                            <NSpace class="room-workspace-actions" justify="end">
+                                <NButton @click="handleClearWorkspace">{{ t('workflow.workspace.clear') }}</NButton>
+                                <NButton type="primary" @click="handleSaveWorkspace">{{ t('common.save') }}</NButton>
+                            </NSpace>
+                        </section>
+                        <section ref="summarySettingsSectionRef" class="settings-section">
+                            <h4>{{ t('groupChat.summarySettings') }}</h4>
+                            <p v-if="currentRoomNeedsSummaryConfiguration" class="summary-config-required">
+                                {{ t('groupChat.summaryConfigurationRequired') }}
+                            </p>
+                            <p class="form-hint">{{ t('groupChat.summarySettingsDesc') }}</p>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.summaryProvider') }}</label>
+                                <NSelect
+                                    :value="summaryConfig.summaryProvider"
+                                    :options="summaryProviderOptions"
+                                    @update:value="handleSummaryProviderChange"
+                                />
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.summaryModel') }}</label>
+                                <NSelect
+                                    v-model:value="summaryConfig.summaryModel"
+                                    :options="summaryModelOptions"
+                                    :disabled="!summaryConfig.summaryProvider"
+                                />
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.summaryApiMode') }}</label>
+                                <NSelect v-model:value="summaryConfig.summaryApiMode" :options="summaryApiModeOptions" />
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.summaryEveryTurns') }}</label>
+                                <NInputNumber v-model:value="summaryConfig.summaryEveryTurns" :min="1" :max="1000" :step="1" style="width: 100%" />
+                                <p class="form-hint">{{ t('groupChat.summaryEveryTurnsDesc') }}</p>
+                            </div>
+                            <NButton
+                                type="primary"
+                                :disabled="!summaryConfig.summaryProvider || !summaryConfig.summaryModel || !summaryConfig.summaryApiMode"
+                                @click="handleSaveSummaryConfig"
+                            >
+                                {{ t('groupChat.saveSummaryConfig') }}
+                            </NButton>
+                        </section>
+                        <section class="settings-section">
+                            <h4>{{ t('groupChat.agentHandoffTitle') }}</h4>
+                            <div class="guest-agent-policy-row">
+                                <div>
+                                    <strong>{{ t('groupChat.agentHandoffEnabled') }}</strong>
+                                    <p class="form-hint">{{ t('groupChat.agentHandoffRecommendation', { count: agentHandoffRecommendation }) }}</p>
+                                </div>
+                                <NSwitch v-model:value="agentHandoffEnabledDraft" />
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.agentHandoffMaxDepth') }}</label>
+                                <NInputNumber
+                                    v-model:value="agentHandoffMaxDepthDraft"
+                                    :min="1"
+                                    :max="100"
+                                    :disabled="agentHandoffUnlimitedDraft || !agentHandoffEnabledDraft"
+                                    style="width: 100%"
+                                />
+                            </div>
+                            <div class="guest-agent-policy-row">
+                                <strong>{{ t('groupChat.agentHandoffUnlimited') }}</strong>
+                                <NSwitch v-model:value="agentHandoffUnlimitedDraft" :disabled="!agentHandoffEnabledDraft" />
+                            </div>
+                            <NButton type="primary" @click="handleSaveHandoffConfig">{{ t('common.save') }}</NButton>
+                        </section>
+                    <section class="settings-section summary-state-section">
+                        <div class="summary-state-heading">
+                            <h4>{{ t('groupChat.currentSummary') }}</h4>
+                            <span class="summary-status" :class="`is-${liveRoomSummaryState?.status || 'idle'}`">
+                                {{ roomSummaryStatusLabel(liveRoomSummaryState?.status) }}
+                            </span>
                         </div>
+                        <div v-if="isLoadingRoomSummary" class="summary-loading">{{ t('common.loading') }}</div>
+                        <template v-else>
+                            <div class="summary-meta">
+                                <span>
+                                    <span>{{ t('groupChat.summaryUpdatedAt') }}</span>
+                                    <strong>{{ formatSummaryTime(liveRoomSummaryState?.updatedAt) }}</strong>
+                                </span>
+                                <span>
+                                    <span>{{ t('groupChat.summarizedTurns') }}</span>
+                                    <strong>{{ liveRoomSummaryState?.summarizedTurnCount || 0 }}</strong>
+                                </span>
+                            </div>
+                            <div v-if="liveRoomSummaryState?.lastError" class="summary-error">
+                                {{ liveRoomSummaryState.lastError }}
+                            </div>
+                            <div class="summary-anchor">
+                                <div>
+                                    <strong>{{ t('groupChat.summaryAnchor') }}</strong>
+                                    <template v-if="roomSummaryAnchor">
+                                        <span>{{ roomSummaryAnchor.senderName }} · {{ formatSummaryTime(roomSummaryAnchor.timestamp) }}</span>
+                                        <p>{{ roomSummaryAnchor.content }}</p>
+                                    </template>
+                                    <span v-else>{{ liveRoomSummaryState?.summaryThroughMessageId || t('groupChat.summaryNoAnchor') }}</span>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">{{ t('groupChat.summaryContent') }}</label>
+                                <NInput
+                                    v-model:value="roomSummaryDraft"
+                                    type="textarea"
+                                    :rows="12"
+                                    :disabled="liveRoomSummaryState?.status === 'summarizing'"
+                                    :placeholder="t('groupChat.summaryEmpty')"
+                                />
+                                <p class="form-hint">{{ t('groupChat.summaryEditKeepsAnchor') }}</p>
+                            </div>
+                            <NButton
+                                type="primary"
+                                :loading="isSavingRoomSummary"
+                                :disabled="liveRoomSummaryState?.status === 'summarizing'"
+                                @click="handleSaveRoomSummary"
+                            >
+                                {{ t('groupChat.saveSummary') }}
+                            </NButton>
+                        </template>
                     </section>
-                    <section class="settings-section">
-                        <h4>{{ t('groupChat.compressionSettings') }}</h4>
-                        <div class="form-group">
-                            <label class="form-label">{{ t('groupChat.triggerTokens') }}</label>
-                            <NInputNumber v-model:value="compressionConfig.triggerTokens" :min="1000" :step="10000" style="width: 100%" />
-                            <p class="form-hint">{{ t('groupChat.triggerTokensDesc') }}</p>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">{{ t('groupChat.maxHistoryTokens') }}</label>
-                            <NInputNumber v-model:value="compressionConfig.maxHistoryTokens" :min="1000" :step="1000" style="width: 100%" />
-                            <p class="form-hint">{{ t('groupChat.maxHistoryTokensDesc') }}</p>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">{{ t('groupChat.tailMessageCount') }}</label>
-                            <NInputNumber v-model:value="compressionConfig.tailMessageCount" :min="1" :step="5" style="width: 100%" />
-                            <p class="form-hint">{{ t('groupChat.tailMessageCountDesc') }}</p>
-                        </div>
-                    </section>
-                    <div style="margin-top: 8px">
-                        <NButton
-                            block
-                            :disabled="isCompressing || store.contextStatuses.size > 0"
-                            :loading="isCompressing"
-                            @click="handleForceCompress"
-                        >
-                            {{ isCompressing ? t('groupChat.compressingInProgress') : t('groupChat.compressNow') }}
-                        </NButton>
                     </div>
-                    <div class="modal-actions">
-                        <NSpace justify="end">
-                            <NButton @click="showCompressionModal = false">{{ t('common.cancel') }}</NButton>
-                            <NButton type="primary" @click="handleSaveCompressionConfig">{{ t('groupChat.saveCompression') }}</NButton>
-                        </NSpace>
-                    </div>
-                </div>
-            </div>
+                </NDrawerContent>
+            </NDrawer>
         </Teleport>
 
     </div>
@@ -1277,6 +3519,15 @@ export default defineComponent({ components: { CreateRoomForm } })
     background-color: $bg-card;
 }
 
+.group-execution-queue-float-stack {
+    position: absolute;
+    right: 16px;
+    bottom: 82px;
+    z-index: 8;
+    width: min(380px, calc(100% - 32px));
+    pointer-events: none;
+}
+
 .sidebar-backdrop {
     display: none;
 }
@@ -1286,6 +3537,11 @@ export default defineComponent({ components: { CreateRoomForm } })
     flex: 1;
     min-height: 0;
     display: flex;
+}
+
+.group-chat-refactor-notice {
+    margin: 0;
+    line-height: 1.7;
 }
 
 @media (max-width: $breakpoint-mobile) {
@@ -1303,61 +3559,6 @@ export default defineComponent({ components: { CreateRoomForm } })
             opacity: 1;
             pointer-events: auto;
         }
-    }
-}
-
-// ─── Status Bar ──────────────────────────────────────────
-
-.status-bar {
-    flex-shrink: 0;
-    padding: 6px 20px;
-    overflow: hidden;
-}
-
-.context-status-list {
-    display: flex;
-    gap: 8px;
-    overflow-x: auto;
-    flex-wrap: nowrap;
-
-    &::-webkit-scrollbar {
-        height: 0;
-    }
-}
-
-.context-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    font-size: 12px;
-    color: $text-secondary;
-    background-color: $bg-card-hover;
-    border-radius: $radius-sm;
-
-    .dark & {
-        background-color: rgba(255, 255, 255, 0.06);
-    }
-}
-
-.context-stop-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    border: 1px solid rgba(var(--error-rgb), 0.18);
-    border-radius: $radius-sm;
-    background: rgba(var(--error-rgb), 0.06);
-    color: $error;
-    cursor: pointer;
-    padding: 0;
-    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
-
-    &:hover {
-        color: #ffffff;
-        background: $error;
-        border-color: $error;
     }
 }
 
@@ -1451,6 +3652,15 @@ export default defineComponent({ components: { CreateRoomForm } })
     border-top: 1px solid $border-color;
 }
 
+.clarify-float-input-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 10px 4px 0;
+    border-top: 1px solid $border-color;
+}
+
 @media (max-width: 640px) {
     .approval-float-panel {
         left: 8px;
@@ -1480,37 +3690,6 @@ export default defineComponent({ components: { CreateRoomForm } })
 .approval-float-leave-to {
     opacity: 0;
     transform: translateY(10px) scale(0.98);
-}
-
-.typing-indicator {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: $text-muted;
-}
-
-.typing-dots {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-
-    span {
-        display: block;
-        width: 4px;
-        height: 4px;
-        border-radius: 50%;
-        background-color: $text-muted;
-        animation: typing-bounce 1.2s infinite;
-
-        &:nth-child(2) { animation-delay: 0.2s; }
-        &:nth-child(3) { animation-delay: 0.4s; }
-    }
-}
-
-@keyframes typing-bounce {
-    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-    30% { transform: translateY(-3px); opacity: 1; }
 }
 
 // ─── Room Sidebar ────────────────────────────────────────
@@ -1609,10 +3788,68 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
+.manual-room-link-hint {
+    margin: 0 0 12px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.manual-room-link-input {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    padding: 9px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    outline: none;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font: inherit;
+}
+
+.manual-room-link-input:focus {
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-color) 18%, transparent);
+}
+
 .room-list {
     flex: 1;
     overflow-y: auto;
     padding: 8px;
+}
+
+.room-section + .room-section {
+    margin-top: 14px;
+}
+
+.room-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-sizing: border-box;
+    width: 100%;
+    padding: 4px 10px 6px;
+    border: 0;
+    background: transparent;
+    color: $text-muted;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-align: start;
+    text-transform: uppercase;
+    cursor: pointer;
+
+    &:hover {
+        color: $text-secondary;
+    }
+}
+
+.room-section-chevron {
+    transition: transform $transition-fast;
+
+    &.collapsed {
+        transform: rotate(-90deg);
+    }
 }
 
 .room-item {
@@ -1698,6 +3935,39 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
+.remote-room-item {
+    box-sizing: border-box;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: start;
+
+    &.unavailable {
+        opacity: 0.6;
+    }
+
+    .room-origin {
+        overflow: hidden;
+        color: $text-muted;
+        font-family: $font-code;
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+}
+
+.remote-room-state {
+    flex-shrink: 0;
+    color: $text-muted;
+    font-size: 11px;
+
+    &.online {
+        color: $success;
+    }
+}
+
 .empty-rooms {
     padding: 20px 12px;
     text-align: center;
@@ -1763,7 +4033,7 @@ export default defineComponent({ components: { CreateRoomForm } })
     position: relative;
 
     &--sidebar-collapsed {
-        margin-left: 10px;
+        margin-inline-start: 10px;
     }
 }
 
@@ -1777,6 +4047,270 @@ export default defineComponent({ components: { CreateRoomForm } })
     max-width: 100%;
 }
 
+.agent-avatar-rail {
+    flex: 0 0 72px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 72px;
+    min-height: 0;
+    padding: 12px 0;
+    overflow: hidden;
+    box-sizing: border-box;
+    border-inline-end: 1px solid $border-color;
+    background: rgba(var(--bg-main-surface-rgb), 0.55);
+}
+
+.agent-avatar-rail-trigger {
+    display: flex;
+    align-items: center;
+    flex-direction: column;
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    gap: 10px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;
+
+    &::-webkit-scrollbar {
+        display: none;
+    }
+}
+
+.agent-avatar-rail-item {
+    position: relative;
+    display: flex;
+    flex: 0 0 34px;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    overflow: visible;
+    box-sizing: border-box;
+    border: 1px solid rgba(var(--text-primary-rgb), 0.12);
+    border-radius: 50%;
+    background: $bg-secondary;
+    cursor: pointer;
+    transition: border-color $transition-fast, box-shadow $transition-fast;
+    -webkit-app-region: no-drag;
+
+    &:hover {
+        border-color: rgba(var(--accent-primary-rgb), 0.55);
+    }
+
+    &:focus-visible {
+        border-color: rgba(var(--accent-primary-rgb), 0.75);
+        box-shadow: 0 0 0 2px rgba(var(--accent-primary-rgb), 0.14);
+        outline: none;
+    }
+
+    &:disabled {
+        cursor: default;
+    }
+
+    .agent-avatar {
+        width: 32px;
+        height: 32px;
+    }
+}
+
+.agent-avatar-rail-agent .agent-avatar {
+    box-sizing: border-box;
+    border: 1px solid #fff;
+}
+
+.agent-owner-avatar-badge {
+    position: absolute;
+    z-index: 2;
+    inset-block-start: -5px;
+    inset-inline-end: -6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    overflow: hidden;
+    box-sizing: border-box;
+    border: 2px solid $bg-main-surface;
+    border-radius: 50%;
+    background: $bg-main-surface;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+    pointer-events: none;
+}
+
+.agent-avatar-rail-current-user {
+    border-color: rgba(var(--accent-primary-rgb), 0.28);
+}
+
+.agent-avatar-rail-typing {
+    border-color: rgba(var(--accent-primary-rgb), 0.72);
+    animation: member-avatar-typing-breathe 1.6s ease-in-out infinite;
+}
+
+.agent-avatar-rail-active {
+    border-color: transparent;
+    animation: agent-avatar-rainbow-glow 4s linear infinite;
+}
+
+.agent-avatar-rail-offline {
+    border-color: rgba(var(--text-primary-rgb), 0.08);
+
+    .agent-avatar {
+        filter: grayscale(1);
+        opacity: 0.42;
+    }
+}
+
+.agent-avatar-activity-popover {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 280px;
+}
+
+.agent-avatar-activity-text {
+    color: $text-secondary;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.agent-avatar-stop {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 9px;
+    border: 1px solid rgba(var(--error-rgb), 0.24);
+    border-radius: $radius-sm;
+    color: $error;
+    background: rgba(var(--error-rgb), 0.08);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    transition: color $transition-fast, border-color $transition-fast, background $transition-fast;
+
+    &:hover {
+        border-color: $error;
+        color: #ffffff;
+        background: $error;
+    }
+}
+
+@keyframes agent-avatar-rainbow-glow {
+    0% {
+        box-shadow:
+            0 0 0 2px #ff6b6b,
+            0 0 10px rgba(255, 107, 107, 0.4),
+            0 0 20px rgba(255, 107, 107, 0.2);
+    }
+
+    16.66% {
+        box-shadow:
+            0 0 0 2px #feca57,
+            0 0 10px rgba(254, 202, 87, 0.4),
+            0 0 20px rgba(254, 202, 87, 0.2);
+    }
+
+    33.33% {
+        box-shadow:
+            0 0 0 2px #48dbfb,
+            0 0 10px rgba(72, 219, 251, 0.4),
+            0 0 20px rgba(72, 219, 251, 0.2);
+    }
+
+    50% {
+        box-shadow:
+            0 0 0 2px #ff9ff3,
+            0 0 10px rgba(255, 159, 243, 0.4),
+            0 0 20px rgba(255, 159, 243, 0.2);
+    }
+
+    66.66% {
+        box-shadow:
+            0 0 0 2px #54a0ff,
+            0 0 10px rgba(84, 160, 255, 0.4),
+            0 0 20px rgba(84, 160, 255, 0.2);
+    }
+
+    83.33% {
+        box-shadow:
+            0 0 0 2px #5f27cd,
+            0 0 10px rgba(95, 39, 205, 0.4),
+            0 0 20px rgba(95, 39, 205, 0.2);
+    }
+
+    100% {
+        box-shadow:
+            0 0 0 2px #ff6b6b,
+            0 0 10px rgba(255, 107, 107, 0.4),
+            0 0 20px rgba(255, 107, 107, 0.2);
+    }
+}
+
+@keyframes member-avatar-typing-breathe {
+    0%,
+    100% {
+        box-shadow:
+            0 0 0 1px rgba(var(--accent-primary-rgb), 0.18),
+            0 0 5px rgba(var(--accent-primary-rgb), 0.12);
+    }
+
+    50% {
+        box-shadow:
+            0 0 0 3px rgba(var(--accent-primary-rgb), 0.28),
+            0 0 14px rgba(var(--accent-primary-rgb), 0.42);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .agent-avatar-rail-active {
+        animation: none;
+        box-shadow:
+            0 0 0 2px #ff6b6b,
+            0 0 10px rgba(255, 107, 107, 0.4),
+            0 0 20px rgba(255, 107, 107, 0.2);
+    }
+
+    .agent-avatar-rail-typing {
+        animation: none;
+        box-shadow: 0 0 0 2px rgba(var(--accent-primary-rgb), 0.24);
+    }
+}
+
+.agent-avatar-rail-divider {
+    flex: 0 0 1px;
+    width: 24px;
+    background: $border-color;
+}
+
+.agent-avatar-rail-add {
+    display: flex;
+    flex: 0 0 34px;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    margin-top: 10px;
+    padding: 0;
+    border: 1px dashed rgba(var(--accent-primary-rgb), 0.65);
+    border-radius: 50%;
+    color: var(--accent-primary);
+    background: rgba(var(--accent-primary-rgb), 0.08);
+    cursor: pointer;
+    transition: color $transition-fast, border-color $transition-fast, background $transition-fast;
+    -webkit-app-region: no-drag;
+
+    &:hover {
+        border-color: rgba(var(--accent-primary-rgb), 0.82);
+        color: var(--accent-primary);
+        background: rgba(var(--accent-primary-rgb), 0.13);
+    }
+}
+
 .group-chat-surface {
     flex: 1;
     min-height: 0;
@@ -1785,6 +4319,74 @@ export default defineComponent({ components: { CreateRoomForm } })
     flex-direction: column;
     background-color: $bg-main-surface;
     animation: group-chat-surface-fade-in 1.5s ease both;
+}
+
+.group-summary-inline-status {
+    display: flex;
+    align-items: center;
+    align-self: flex-start;
+    gap: 6px;
+    width: 520px;
+    max-width: calc(100% - 40px);
+    min-width: 0;
+    box-sizing: border-box;
+    margin: 0 20px;
+    padding: 3px 8px;
+    border-radius: $radius-sm;
+    color: $text-secondary;
+    background: rgba(0, 0, 0, 0.03);
+    font-size: 11px;
+
+    &.is-success {
+        color: #52c41a;
+    }
+
+    &.is-failed {
+        color: #ff4d4f;
+    }
+}
+
+.group-summary-inline-label {
+    flex: 0 1 auto;
+    min-width: 0;
+    color: $text-secondary;
+    font-family: $font-code;
+    white-space: nowrap;
+}
+
+.group-summary-inline-spinner {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    border: 1.5px solid $text-muted;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: group-summary-inline-spin 0.6s linear infinite;
+}
+
+.group-summary-inline-success-icon,
+.group-summary-inline-error-icon {
+    flex-shrink: 0;
+}
+
+.group-summary-inline-detail {
+    min-width: 0;
+    overflow: hidden;
+    color: $text-muted;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.summary-inline-enter-active,
+.summary-inline-leave-active {
+    transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.summary-inline-enter-from,
+.summary-inline-leave-to {
+    opacity: 0;
+    transform: translateY(3px);
 }
 
 .workspace-panel-toggle.active {
@@ -1801,12 +4403,32 @@ export default defineComponent({ components: { CreateRoomForm } })
     overflow: visible;
     display: flex;
     background: $bg-card;
-    border-left: 1px solid $border-color;
+    border-inline-start: 1px solid $border-color;
+}
+
+.tool-panel-enter-active,
+.tool-panel-leave-active {
+    overflow: hidden;
+    pointer-events: none;
+    will-change: width, min-width, opacity;
+    transition:
+        width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+        min-width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+        opacity 0.16s ease,
+        border-color 0.16s ease;
+}
+
+.tool-panel-enter-from,
+.tool-panel-leave-to {
+    width: 0 !important;
+    min-width: 0;
+    opacity: 0;
+    border-inline-start-color: transparent;
 }
 
 .group-workspace-resize-handle {
     position: absolute;
-    left: -7px;
+    inset-inline-start: -7px;
     top: 0;
     bottom: 0;
     width: 14px;
@@ -1816,7 +4438,7 @@ export default defineComponent({ components: { CreateRoomForm } })
     &::after {
         content: '';
         position: absolute;
-        left: 6px;
+        inset-inline-start: 6px;
         top: 0;
         bottom: 0;
         width: 1px;
@@ -1828,7 +4450,7 @@ export default defineComponent({ components: { CreateRoomForm } })
     &::before {
         content: '';
         position: absolute;
-        left: 1px;
+        inset-inline-start: 1px;
         top: 50%;
         width: 12px;
         height: 38px;
@@ -1854,95 +4476,108 @@ export default defineComponent({ components: { CreateRoomForm } })
 
 .group-workspace-panel-inner {
     display: flex;
+    flex-direction: row;
     flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: $bg-main-surface;
+}
+
+.group-tool-tabs {
+    display: flex;
     flex-direction: column;
-    min-width: 0;
-    min-height: 0;
-    overflow: hidden;
-}
-
-.group-workspace-panel-tabs {
-    height: 47px;
-    padding: 8px 12px;
-    border-bottom: 1px solid $border-color;
-    display: flex;
     align-items: center;
+    flex-shrink: 0;
+    order: 2;
+    width: 48px;
+    height: 100%;
     gap: 4px;
+    padding: 8px 6px;
+    border-inline-start: 1px solid $border-color;
+    background: $bg-sidebar-surface;
     box-sizing: border-box;
-
-    button {
-        height: 30px;
-        padding: 0 10px;
-        border: 0;
-        border-radius: $radius-sm;
-        color: $text-secondary;
-        background: transparent;
-        cursor: pointer;
-
-        &:hover,
-        &.active {
-            color: var(--accent-primary);
-            background: rgba(var(--accent-primary-rgb), 0.1);
-        }
-    }
-
-    .group-workspace-panel-close {
-        width: 30px;
-        padding: 0;
-        margin-left: auto;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-    }
 }
 
-.group-browser-panel {
-    flex: 1;
-    min-height: 0;
-}
+.group-tool-tab {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: none;
+    border-radius: $radius-sm;
+    background: transparent;
+    color: $text-secondary;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: all $transition-fast;
 
-.group-workspace-panel-header {
-    height: 47px;
-    padding: 8px 12px;
-    border-bottom: 1px solid $border-color;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    box-sizing: border-box;
-    color: $text-primary;
-    font-size: 13px;
-    font-weight: 500;
+    svg {
+        width: 18px;
+        height: 18px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+    }
 
-    button {
-        width: 28px;
-        height: 28px;
-        padding: 0;
-        border: 0;
-        border-radius: $radius-sm;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        color: $text-secondary;
-        background: transparent;
-        cursor: pointer;
+    &:hover {
+        color: $text-primary;
+        background: rgba(var(--accent-primary-rgb), 0.06);
+    }
 
-        &:hover {
-            color: $text-primary;
-            background: rgba(var(--accent-primary-rgb), 0.08);
+    &.active {
+        color: var(--accent-primary);
+        background: rgba(var(--accent-primary-rgb), 0.12);
+
+        &::after {
+            content: '';
+            position: absolute;
+            inset-inline-end: -6px;
+            top: 9px;
+            bottom: 9px;
+            width: 2px;
+            border-radius: 2px 0 0 2px;
+            background: var(--accent-primary);
         }
     }
 }
 
-.group-workspace-panel-content {
+.group-tool-content {
+    order: 1;
     flex: 1;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
+    background: $bg-main-surface;
 
     > * {
         height: 100%;
         min-height: 0;
     }
+}
+
+.group-workspace-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 24px;
+    color: $text-muted;
+    text-align: center;
+    font-size: 13px;
+
+    > svg {
+        color: $text-secondary;
+    }
+}
+
+.group-browser-panel,
+.group-terminal-panel {
+    min-height: 0;
 }
 
 @media (max-width: $breakpoint-mobile) {
@@ -1952,11 +4587,36 @@ export default defineComponent({ components: { CreateRoomForm } })
         z-index: 70;
         width: 100% !important;
         min-width: 0;
-        border-left: none;
+        border-inline-start: none;
     }
 
     .group-workspace-resize-handle {
         display: none;
+    }
+
+    .tool-panel-enter-active,
+    .tool-panel-leave-active {
+        transition:
+            transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+            opacity 0.16s ease;
+    }
+
+    .tool-panel-enter-from,
+    .tool-panel-leave-to {
+        width: 100% !important;
+        transform: translateX(100%);
+    }
+
+    .tool-panel-enter-from:dir(rtl),
+    .tool-panel-leave-to:dir(rtl) {
+        transform: translateX(-100%);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tool-panel-enter-active,
+    .tool-panel-leave-active {
+        transition-duration: 0.01ms;
     }
 }
 
@@ -1993,20 +4653,8 @@ export default defineComponent({ components: { CreateRoomForm } })
         height: 28px;
     }
 
-    .avatar-stack-item,
-    .avatar-stack-more {
-        width: 24px;
-        height: 24px;
-    }
-
-    .avatar-stack-item,
-    .avatar-stack-more,
     .icon-btn {
         box-sizing: content-box;
-    }
-
-    .avatar-stack-item {
-        margin-left: -10px;
     }
 
     .header-left {
@@ -2072,64 +4720,32 @@ export default defineComponent({ components: { CreateRoomForm } })
         font-size: 12px;
         color: $text-muted;
     }
-}
 
-// ─── Header Avatar Stack ──────────────────────────────
+    .member-count-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 3px 5px;
+        border: 0;
+        border-radius: $radius-sm;
+        background: transparent;
+        cursor: pointer;
+        transition: color $transition-fast, background-color $transition-fast;
+        -webkit-app-region: no-drag;
 
-.avatar-stack {
-    cursor: pointer;
-}
+        &:hover {
+            color: $text-secondary;
+            background: rgba(var(--accent-primary-rgb), 0.06);
+        }
 
-.avatar-stack-inner {
-    display: flex;
-    align-items: center;
-}
+        svg {
+            transition: transform $transition-fast;
 
-.avatar-stack-trigger {
-    padding: 0;
-    border: 0;
-    color: inherit;
-    background: transparent;
-    cursor: pointer;
-    -webkit-app-region: no-drag;
-}
-
-.avatar-stack-item {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    border: 2px solid $bg-card;
-    margin-left: -12px;
-    overflow: hidden;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background-color: $bg-secondary;
-    transition: transform $transition-fast;
-
-    &:first-child {
-        margin-left: 0;
+            &.collapsed {
+                transform: rotate(180deg);
+            }
+        }
     }
-
-    &:hover {
-        transform: translateY(-2px);
-        z-index: 100 !important;
-    }
-}
-
-.avatar-stack-more {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    border: 2px solid $bg-card;
-    margin-left: -12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background-color: $bg-secondary;
-    font-size: 11px;
-    font-weight: 600;
-    color: $text-secondary;
 }
 
 .agent-avatar {
@@ -2142,78 +4758,6 @@ export default defineComponent({ components: { CreateRoomForm } })
     :deep(svg) {
         width: 100%;
         height: 100%;
-    }
-}
-
-// ─── Agent Popover ─────────────────────────────────────
-
-.agent-popover {
-    max-height: 300px;
-    overflow-y: auto;
-}
-
-.agent-popover-title {
-    font-size: 12px;
-    font-weight: 600;
-    color: $text-muted;
-    padding: 0 0 8px;
-    border-bottom: 1px solid $border-color;
-    margin-bottom: 8px;
-}
-
-.agent-popover-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 4px;
-    border-radius: $radius-sm;
-    transition: background-color $transition-fast;
-
-    &:hover {
-        background-color: rgba(var(--accent-primary-rgb), 0.06);
-    }
-
-    .agent-popover-info {
-        flex: 1;
-        min-width: 0;
-    }
-
-    .agent-popover-name {
-        display: block;
-        font-size: 13px;
-        color: $text-primary;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    .agent-popover-profile {
-        display: block;
-        font-size: 11px;
-        color: $text-muted;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    .agent-popover-remove {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 24px;
-        height: 24px;
-        border: none;
-        background: none;
-        border-radius: $radius-sm;
-        color: $text-muted;
-        cursor: pointer;
-        flex-shrink: 0;
-        transition: all $transition-fast;
-
-        &:hover {
-            color: $error;
-            background-color: rgba(200, 50, 50, 0.08);
-        }
     }
 }
 
@@ -2274,6 +4818,9 @@ export default defineComponent({ components: { CreateRoomForm } })
     padding: 24px;
     width: 400px;
     max-width: 90vw;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    box-sizing: border-box;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
 
     h3 {
@@ -2284,8 +4831,106 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
-.room-settings-modal {
+.agent-preset-entry {
+    margin-bottom: 18px;
+}
+
+.agent-preset-dialog-backdrop {
+    z-index: 1010;
+}
+
+.agent-preset-dialog {
     width: 480px;
+}
+
+.agent-preset-dialog-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 320px;
+    margin-top: 12px;
+    overflow-y: auto;
+}
+
+.agent-preset-dialog-row {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 3px;
+    width: 100%;
+    padding: 11px 12px;
+    border: 1px solid $border-color;
+    border-radius: $radius-md;
+    color: $text-primary;
+    background: $bg-main-surface;
+    text-align: start;
+    cursor: pointer;
+    transition:
+        border-color $transition-fast,
+        background-color $transition-fast;
+
+    &:hover:not(:disabled) {
+        border-color: rgba(var(--accent-primary-rgb), 0.55);
+        background: rgba(var(--accent-primary-rgb), 0.05);
+    }
+
+    &.selected {
+        border-color: var(--accent-primary);
+        background: rgba(var(--accent-primary-rgb), 0.09);
+    }
+
+    &.unavailable {
+        cursor: not-allowed;
+        opacity: 0.72;
+    }
+}
+
+.agent-preset-dialog-row-name {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.agent-preset-dialog-row-config,
+.agent-preset-dialog-row-error {
+    font-size: 11px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.agent-preset-dialog-row-config {
+    color: $text-secondary;
+}
+
+.agent-preset-dialog-row-error {
+    color: $error;
+}
+
+.agent-preset-dialog-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+    padding: 28px 16px;
+    border: 1px dashed $border-color;
+    border-radius: $radius-md;
+    color: $text-muted;
+    text-align: center;
+
+    &.is-error {
+        color: $error;
+    }
+}
+
+.agent-preset-management-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.room-settings-drawer {
+    min-width: 0;
 }
 
 .settings-section {
@@ -2299,8 +4944,244 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
+.pending-agent-pairings-section {
+    padding: 12px;
+    border: 1px solid rgba(var(--accent-primary-rgb), 0.3);
+    border-radius: 12px;
+    background: rgba(var(--accent-primary-rgb), 0.06);
+}
+
+.pending-agent-pairing-card {
+    padding: 10px;
+    border: 1px solid $border-color;
+    border-radius: 10px;
+    background: $bg-main-surface;
+
+    & + & {
+        margin-top: 10px;
+    }
+
+    strong {
+        color: $text-primary;
+    }
+
+    p {
+        margin: 6px 0 10px;
+        color: $text-secondary;
+        font-size: 12px;
+        line-height: 1.5;
+        overflow-wrap: anywhere;
+    }
+}
+
+.agent-pairing-header-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: 0 9px;
+    border: 1px solid rgba(var(--accent-primary-rgb), 0.32);
+    border-radius: 999px;
+    color: var(--accent-primary);
+    background: rgba(var(--accent-primary-rgb), 0.08);
+    font-size: 12px;
+    cursor: pointer;
+
+    strong {
+        min-width: 18px;
+        padding: 1px 5px;
+        border-radius: 999px;
+        color: #fff;
+        background: var(--accent-primary);
+        text-align: center;
+    }
+}
+
+.agent-pairing-header-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent-primary);
+    box-shadow: 0 0 0 4px rgba(var(--accent-primary-rgb), 0.12);
+}
+
+.guest-agent-policy-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 14px;
+
+    strong {
+        color: $text-primary;
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    .form-hint {
+        margin: 5px 0 0;
+    }
+}
+
+.agent-pairing-float-panel {
+    border-color: rgba(var(--accent-primary-rgb), 0.28);
+}
+
+.summary-state-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+
+    h4 {
+        margin-bottom: 0;
+    }
+}
+
+.summary-config-required {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    border-radius: $radius-sm;
+    color: #d97706;
+    background: rgba(217, 119, 6, 0.1);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.summary-status {
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    color: $text-muted;
+    background: rgba(var(--text-primary-rgb), 0.06);
+
+    &.is-summarizing {
+        color: var(--accent-primary);
+        background: rgba(var(--accent-primary-rgb), 0.12);
+    }
+
+    &.is-success {
+        color: #36ad6a;
+        background: rgba(54, 173, 106, 0.12);
+    }
+
+    &.is-failed {
+        color: #d03050;
+        background: rgba(208, 48, 80, 0.12);
+    }
+}
+
+.summary-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    margin: 10px 0;
+    color: $text-muted;
+    font-size: 11px;
+
+    > span {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 4px;
+    }
+
+    strong {
+        color: $text-secondary;
+        font-weight: 500;
+    }
+}
+
+.room-workspace-actions {
+    margin-top: 12px;
+}
+
+.summary-error {
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border-radius: $radius-sm;
+    color: #d03050;
+    background: rgba(208, 48, 80, 0.08);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.summary-anchor {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 14px;
+    padding: 10px;
+    border: 1px solid $border-color;
+    border-radius: $radius-sm;
+    color: $text-secondary;
+    font-size: 12px;
+
+    strong,
+    span {
+        display: block;
+    }
+
+    span {
+        margin-top: 3px;
+        color: $text-muted;
+    }
+
+    p {
+        margin: 6px 0 0;
+        display: -webkit-box;
+        overflow: hidden;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        overflow-wrap: anywhere;
+    }
+}
+
+.summary-loading {
+    padding: 20px 0;
+    color: $text-muted;
+    text-align: center;
+}
+
 .form-group {
     margin-bottom: 16px;
+}
+
+.group-agent-avatar-editor {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 18px;
+    padding: 12px;
+    border: 1px solid $border-color;
+    border-radius: $radius-md;
+    background: rgba(var(--text-primary-rgb), 0.02);
+}
+
+.group-agent-avatar-controls {
+    min-width: 0;
+    flex: 1;
+
+    .form-label {
+        margin-bottom: 7px;
+    }
+}
+
+.group-agent-avatar-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.group-agent-avatar-hint {
+    display: block;
+    margin-top: 6px;
+    color: $text-muted;
+    font-size: 11px;
+}
+
+.group-agent-avatar-file {
+    display: none;
 }
 
 .form-label {
@@ -2328,10 +5209,25 @@ export default defineComponent({ components: { CreateRoomForm } })
     gap: 8px;
 }
 
+.agent-drawer-actions {
+    display: flex;
+    width: 100%;
+    justify-content: flex-end;
+    gap: 8px;
+
+    &.is-editing {
+        justify-content: space-between;
+    }
+}
+
 .form-hint {
     font-size: 11px;
     color: $text-muted;
     margin: 4px 0 0;
+}
+
+.share-link-button {
+    margin-top: 12px;
 }
 
 // ─── Connection Dot ──────────────────────────────────────
@@ -2349,6 +5245,12 @@ export default defineComponent({ components: { CreateRoomForm } })
 
     &.disconnected {
         background-color: $error;
+    }
+}
+
+@keyframes group-summary-inline-spin {
+    to {
+        transform: rotate(360deg);
     }
 }
 
@@ -2374,6 +5276,33 @@ export default defineComponent({ components: { CreateRoomForm } })
 
     .chat-header {
         padding: 16px 12px 16px 52px;
+    }
+
+    .group-summary-inline-status {
+        max-width: calc(100% - 24px);
+        margin: 0 12px;
+    }
+
+    .agent-avatar-rail {
+        flex-basis: 68px;
+        width: 68px;
+        padding: 10px 0;
+    }
+
+    .agent-avatar-rail-item {
+        width: 32px;
+        height: 32px;
+
+        .agent-avatar {
+            width: 30px;
+            height: 30px;
+        }
+    }
+
+    .agent-avatar-rail-add {
+        width: 32px;
+        height: 32px;
+        flex-basis: 32px;
     }
 
     .header-sidebar-toggle {

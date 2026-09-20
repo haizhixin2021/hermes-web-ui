@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MCU_VOICE_SYSTEM_INSTRUCTIONS } from '../../packages/server/src/modules/studio/services/global-agent/mcu-voice-instructions'
 
 const { mockIo, mockSocket, sockets, socketHandlers, mockWebSockets, MockWebSocket, resetMockSockets } = vi.hoisted(() => {
   function createMockSocket(id: string, url = '') {
@@ -87,7 +88,7 @@ vi.mock('ws', () => ({
 
 describe('outbound relay client', () => {
   beforeEach(async () => {
-    const { stopOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { stopOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     stopOutboundRelayClient()
     resetMockSockets()
     vi.clearAllMocks()
@@ -123,6 +124,29 @@ describe('outbound relay client', () => {
     const runCall = socket.emit.mock.calls
       .filter(([event]: [string]) => event === 'run')
       .at(-1)
+    expect(runCall?.[1]).toMatchObject({
+      source: 'coding_agent',
+      session_source: 'global_agent',
+      coding_agent_id: 'ekko-agent',
+      instructions: MCU_VOICE_SYSTEM_INSTRUCTIONS,
+    })
+    const queueId = runCall?.[1]?.queue_id
+    expect(queueId).toMatch(/^mcu_/)
+    socket.__handlers.get('run.started')?.({ run_id: runId, queue_id: queueId })
+    return queueId
+  }
+
+  function startHermesPrimaryMockRun(socket: any, runId = 'run-primary'): string {
+    const runCall = socket.emit.mock.calls
+      .filter(([event]: [string]) => event === 'run')
+      .at(-1)
+    expect(runCall?.[1]).toMatchObject({
+      session_id: 'mcu-device-research-hermes',
+      source: 'global_agent',
+      session_source: 'global_agent',
+      instructions: MCU_VOICE_SYSTEM_INSTRUCTIONS,
+    })
+    expect(runCall?.[1]).not.toHaveProperty('coding_agent_id')
     const queueId = runCall?.[1]?.queue_id
     expect(queueId).toMatch(/^mcu_/)
     socket.__handlers.get('run.started')?.({ run_id: runId, queue_id: queueId })
@@ -130,7 +154,7 @@ describe('outbound relay client', () => {
   }
 
   it('stays disabled when no relay url is passed explicitly', async () => {
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     const client = startOutboundRelayClient({ relayUrl: '' })
 
@@ -139,7 +163,7 @@ describe('outbound relay client', () => {
   })
 
   it('connects to the configured remote relay as a socket client', async () => {
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     const client = startOutboundRelayClient({
       relayUrl: 'https://user:pass@relay.example.com/hermes',
@@ -182,7 +206,7 @@ describe('outbound relay client', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     }))
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787/',
@@ -240,7 +264,7 @@ describe('outbound relay client', () => {
   it('does not reconnect the Socket.IO relay client after it is replaced remotely', async () => {
     vi.useFakeTimers()
     try {
-      const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+      const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
       startOutboundRelayClient({
         relayUrl: 'http://relay.example.com',
@@ -272,7 +296,7 @@ describe('outbound relay client', () => {
   it('does not reconnect the Socket.IO relay client after device-code auth is rejected', async () => {
     vi.useFakeTimers()
     try {
-      const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+      const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
       startOutboundRelayClient({
         relayUrl: 'http://relay.example.com',
@@ -294,7 +318,7 @@ describe('outbound relay client', () => {
 
   it('bridges Socket.IO MCU voice streams to the local global-agent server without completing early', async () => {
     const fetchImpl = vi.fn()
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787',
@@ -319,6 +343,7 @@ describe('outbound relay client', () => {
     emitRemote(remoteSocket, 'voice.stream.start', {
       type: 'voice.stream.start',
       interactionId: 'voice-stream-1',
+      agentRuntime: 'hermes',
       mimeType: 'audio/x-ima-adpcm',
       frameFormat: 'hadp-chunk-v1',
       sampleRate: 24000,
@@ -342,6 +367,7 @@ describe('outbound relay client', () => {
       mimeType: 'audio/x-ima-adpcm',
       frameFormat: 'hadp-chunk-v1',
       profile: 'default',
+      agentRuntime: 'hermes',
     }))
     expect(localGlobalAgentSocket.emit).toHaveBeenCalledWith('voice.stream.chunk', expect.objectContaining({
       interactionId: 'voice-stream-1',
@@ -354,7 +380,7 @@ describe('outbound relay client', () => {
       interactionId: 'voice-stream-1',
       bytes: 4,
     }))
-    expect(fetchImpl).not.toHaveBeenCalledWith(expect.stringContaining('/api/hermes/mcu/voice-turn'), expect.any(Object))
+    expect(fetchImpl).not.toHaveBeenCalledWith(expect.stringContaining('/api/studio/mcu/voice-turn'), expect.any(Object))
     expect(remoteSocket.emit).not.toHaveBeenCalledWith('interaction.status', expect.objectContaining({ status: 'completed' }))
 
     localGlobalAgentSocket.__anyHandlers[0]('interaction.status', {
@@ -375,13 +401,13 @@ describe('outbound relay client', () => {
     let releaseFirstUpload: (() => void) | undefined
     const firstUploadStarted = new Promise<void>((resolve) => {
       const fetchImpl = vi.fn(async (url: string) => {
-        if (url.includes('/api/hermes/mcu/audio/slow.pcm')) {
+        if (url.includes('/api/studio/mcu/audio/slow.pcm')) {
           return new Response(new Uint8Array([1, 2, 3]), {
             status: 200,
             headers: { 'content-type': 'audio/x-pcm' },
           })
         }
-        if (url.includes('/api/hermes/mcu/audio/fast.pcm')) {
+        if (url.includes('/api/studio/mcu/audio/fast.pcm')) {
           return new Response(new Uint8Array([4, 5, 6]), {
             status: 200,
             headers: { 'content-type': 'audio/x-pcm' },
@@ -407,7 +433,7 @@ describe('outbound relay client', () => {
         return new Response('not found', { status: 404 })
       })
 
-      void import('../../packages/server/src/services/global-agent/outbound-relay-client').then(({ startOutboundRelayClient }) => {
+      void import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client').then(({ startOutboundRelayClient }) => {
         startOutboundRelayClient({
           relayUrl: 'http://device.local:8787',
           relayProtocol: 'mcu-socket.io',
@@ -442,13 +468,13 @@ describe('outbound relay client', () => {
       type: 'audio.enqueue',
       interactionId: 'voice-order',
       segmentId: 'voice-order-tts-1',
-      url: '/api/hermes/mcu/audio/slow.pcm',
+      url: '/api/studio/mcu/audio/slow.pcm',
     })
     localGlobalAgentSocket.__anyHandlers[0]('audio.enqueue', {
       type: 'audio.enqueue',
       interactionId: 'voice-order',
       segmentId: 'voice-order-tts-2',
-      url: '/api/hermes/mcu/audio/fast.pcm',
+      url: '/api/studio/mcu/audio/fast.pcm',
     })
 
     await firstUploadStarted
@@ -468,13 +494,13 @@ describe('outbound relay client', () => {
   it('uploads Socket.IO MCU TTS audio to the remote relay before enqueueing playback', async () => {
     const pcm = Buffer.from('pcm-audio')
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.includes('/api/hermes/mcu/voice-turn')) {
+      if (url.includes('/api/studio/mcu/voice-turn')) {
         return new Response(JSON.stringify({ ok: true, transcript: '你好' }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         })
       }
-      if (url.includes('/api/hermes/tts/synthesize')) {
+      if (url.includes('/api/studio/tts/synthesize')) {
         return new Response(pcm, {
           status: 200,
           headers: { 'content-type': 'audio/x-pcm' },
@@ -494,7 +520,7 @@ describe('outbound relay client', () => {
         headers: { 'content-type': 'application/json' },
       })
     })
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787',
@@ -518,6 +544,7 @@ describe('outbound relay client', () => {
       interactionId: 'voice-tts-ok',
       mimeType: 'audio/wav',
       profile: 'research',
+      agentRuntime: 'hermes',
     })
     emitRemote(remoteSocket, 'voice.stream.chunk', {
       type: 'voice.stream.chunk',
@@ -529,13 +556,48 @@ describe('outbound relay client', () => {
     })
     const localSocket = socketForUrl('http://127.0.0.1:8648/chat-run')
     localSocket.__handlers.get('connect')?.()
-    startPrimaryMockRun(localSocket)
-    localSocket.__handlers.get('message.delta')?.({ delta: '你好' })
-    localSocket.__handlers.get('run.completed')?.({})
+    startHermesPrimaryMockRun(localSocket)
+    expect(fetchImpl.mock.calls[0]?.[1]?.headers).toMatchObject({
+      'X-Hermes-Mcu-Agent-Runtime': 'hermes',
+    })
+    localSocket.__handlers.get('message.delta')?.({ delta: '我来查一下。\n' })
+    localSocket.__handlers.get('tool.started')?.({
+      tool: 'weather',
+      preview: 'tool arguments must stay local'.repeat(1_000),
+    })
+    localSocket.__handlers.get('tool.completed')?.({
+      tool: 'weather',
+      preview: 'tool result must stay local'.repeat(1_000),
+    })
+    expect(remoteSocket.emit).toHaveBeenCalledWith('tool.started', {
+      type: 'tool.started',
+      interactionId: 'voice-tts-ok',
+      tool: 'weather',
+    })
+    expect(remoteSocket.emit).toHaveBeenCalledWith('tool.completed', {
+      type: 'tool.completed',
+      interactionId: 'voice-tts-ok',
+      tool: 'weather',
+      error: undefined,
+    })
+    localSocket.__handlers.get('run.completed')?.({ output: '厦门今天晴。' })
 
     await vi.waitFor(() => {
       expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+        text: '我来查一下。',
         url: 'http://device.local:8787/global-agent/audio/audio-1?token=download-token',
+      }))
+    })
+    emitRemote(remoteSocket, 'audio.done', {
+      type: 'audio.done',
+      interactionId: 'voice-tts-ok',
+      segmentId: 'voice-tts-ok-tts-1',
+    })
+    await vi.waitFor(() => {
+      expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
+        interactionId: 'voice-tts-ok',
+        segmentId: 'voice-tts-ok-tts-2',
+        text: '厦门今天晴。',
       }))
     })
     const uploadCall = fetchImpl.mock.calls.find(([url]: [string]) => url === 'http://device.local:8787/global-agent/audio')
@@ -553,13 +615,13 @@ describe('outbound relay client', () => {
 
   it('keeps direct relay background work non-blocking and sends only the final autonomous agent response', async () => {
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.includes('/api/hermes/mcu/voice-turn')) {
+      if (url.includes('/api/studio/mcu/voice-turn')) {
         return new Response(JSON.stringify({ ok: true, transcript: '后台查询天气' }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         })
       }
-      if (url.includes('/api/hermes/tts/synthesize')) {
+      if (url.includes('/api/studio/tts/synthesize')) {
         return new Response(Buffer.from('pcm-audio'), {
           status: 200,
           headers: { 'content-type': 'audio/x-pcm' },
@@ -567,7 +629,7 @@ describe('outbound relay client', () => {
       }
       return new Response('not found', { status: 404 })
     })
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787',
@@ -614,7 +676,7 @@ describe('outbound relay client', () => {
       }))
     })
     expect(localSocket.disconnect).not.toHaveBeenCalled()
-    expect(fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/hermes/tts/synthesize'))).toHaveLength(0)
+    expect(fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/studio/tts/synthesize'))).toHaveLength(0)
 
     remoteSocket.emit.mockClear()
     localSocket.__handlers.get('run.started')?.({
@@ -638,7 +700,7 @@ describe('outbound relay client', () => {
     })
 
     await vi.waitFor(() => {
-      const ttsCalls = fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/hermes/tts/synthesize'))
+      const ttsCalls = fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/studio/tts/synthesize'))
       expect(ttsCalls).toHaveLength(1)
       expect(JSON.parse(String(ttsCalls[0][1]?.body))).toMatchObject({
         text: '厦门明天晴，最高温度 30 度。',
@@ -648,6 +710,7 @@ describe('outbound relay client', () => {
       expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
         interactionId: 'mcu-background-delegation-1',
         segmentId: 'mcu-background-delegation-1-tts-1',
+        text: '厦门明天晴，最高温度 30 度。',
         completionManagedByServer: true,
       }))
     })
@@ -668,7 +731,7 @@ describe('outbound relay client', () => {
 
   it('queues the hosted TTS-failed prompt when Socket.IO MCU speech synthesis fails', async () => {
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.includes('/api/hermes/mcu/voice-turn')) {
+      if (url.includes('/api/studio/mcu/voice-turn')) {
         return new Response(JSON.stringify({ ok: true, transcript: '你好' }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -679,7 +742,7 @@ describe('outbound relay client', () => {
         headers: { 'content-type': 'application/json' },
       })
     })
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787/',
@@ -712,10 +775,10 @@ describe('outbound relay client', () => {
 
     await vi.waitFor(() => {
       expect(remoteSocket.emit).toHaveBeenCalledWith('audio.enqueue', expect.objectContaining({
-        url: '/api/hermes/mcu/audio/tts-failed-24k.s16le.pcm',
+        url: '/api/studio/mcu/audio/tts-failed-24k.s16le.pcm',
       }))
     })
-    const ttsCalls = fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/hermes/tts/synthesize'))
+    const ttsCalls = fetchImpl.mock.calls.filter(([url]: [string]) => url.includes('/api/studio/tts/synthesize'))
     expect(ttsCalls).toHaveLength(2)
     expect(ttsCalls[0][1].headers).toMatchObject({
       'X-Hermes-Profile': 'research',
@@ -723,13 +786,13 @@ describe('outbound relay client', () => {
     expect(ttsCalls[1][1].headers).toMatchObject({
       'X-Hermes-Profile': 'research',
     })
-    const enqueuePayload = findEmittedPayload(remoteSocket, 'audio.enqueue', payload => payload.url === '/api/hermes/mcu/audio/tts-failed-24k.s16le.pcm')
+    const enqueuePayload = findEmittedPayload(remoteSocket, 'audio.enqueue', payload => payload.url === '/api/studio/mcu/audio/tts-failed-24k.s16le.pcm')
     expect(enqueuePayload).toMatchObject({
       type: 'audio.enqueue',
       interactionId: 'voice-tts-fail',
       segmentId: 'voice-tts-fail-tts-1-failed-prompt',
       text: '当前文字转语音失败了，请配置下文字转语音再使用哦',
-      url: '/api/hermes/mcu/audio/tts-failed-24k.s16le.pcm',
+      url: '/api/studio/mcu/audio/tts-failed-24k.s16le.pcm',
       mimeType: 'audio/x-pcm',
       format: 's16le',
       channels: 1,
@@ -741,7 +804,7 @@ describe('outbound relay client', () => {
   it('aborts in-flight Socket.IO MCU TTS synthesis when playback is interrupted', async () => {
     let ttsSignal: AbortSignal | undefined
     const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-      if (url.includes('/api/hermes/mcu/voice-turn')) {
+      if (url.includes('/api/studio/mcu/voice-turn')) {
         return new Response(JSON.stringify({ ok: true, transcript: '你好' }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -752,7 +815,7 @@ describe('outbound relay client', () => {
         ttsSignal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
       })
     })
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     startOutboundRelayClient({
       relayUrl: 'http://device.local:8787/',
@@ -796,7 +859,7 @@ describe('outbound relay client', () => {
     await vi.waitFor(() => {
       expect(ttsSignal?.aborted).toBe(true)
     })
-    expect(localSocket.emit).toHaveBeenCalledWith('abort', { session_id: 'mcu-device-research' })
+    expect(localSocket.emit).toHaveBeenCalledWith('abort', { session_id: 'mcu-device-research-ekko' })
     expect(remoteSocket.emit).not.toHaveBeenCalledWith('audio.enqueue', expect.any(Object))
   })
 
@@ -809,7 +872,7 @@ describe('outbound relay client', () => {
         'transfer-encoding': 'chunked',
       },
     }))
-    const { OutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { OutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     const client = new OutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       relayToken: '',
@@ -821,7 +884,7 @@ describe('outbound relay client', () => {
     const response = await client.handleHttpRequest({
       id: 'req-1',
       method: 'POST',
-      path: '/api/hermes/sessions?profile=default',
+      path: '/api/studio/sessions?profile=default',
       headers: {
         authorization: 'Bearer user-jwt',
         'content-type': 'application/json',
@@ -832,7 +895,7 @@ describe('outbound relay client', () => {
       body: { message: 'hello' },
     })
 
-    expect(fetchImpl).toHaveBeenCalledWith('http://127.0.0.1:8648/api/hermes/sessions?profile=default', expect.objectContaining({
+    expect(fetchImpl).toHaveBeenCalledWith('http://127.0.0.1:8648/api/studio/sessions?profile=default', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({ message: 'hello' }),
     }))
@@ -859,7 +922,7 @@ describe('outbound relay client', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     }))
-    const { OutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { OutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     const client = new OutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       relayToken: '',
@@ -890,7 +953,7 @@ describe('outbound relay client', () => {
 
   it('rejects /v1 paths without calling local fetch', async () => {
     const fetchImpl = vi.fn()
-    const { OutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { OutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     const client = new OutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       relayToken: '',
@@ -917,7 +980,7 @@ describe('outbound relay client', () => {
   })
 
   it('opens a local /chat-run socket and relays chat events both ways', async () => {
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     const client = startOutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       localBaseUrl: 'http://127.0.0.1:8648',
@@ -960,7 +1023,7 @@ describe('outbound relay client', () => {
   })
 
   it('supports non-streaming chat-run mode by suppressing deltas and returning final output', async () => {
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     startOutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       localBaseUrl: 'http://127.0.0.1:8648',
@@ -1006,7 +1069,7 @@ describe('outbound relay client', () => {
   })
 
   it('rejects socket namespaces and events outside the chat-run allowlist', async () => {
-    const { startOutboundRelayClient } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    const { startOutboundRelayClient } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
     startOutboundRelayClient({
       relayUrl: 'https://relay.example.com',
       localBaseUrl: 'http://127.0.0.1:8648',
@@ -1042,7 +1105,7 @@ describe('outbound relay client', () => {
       getOutboundRelayClients,
       startOutboundRelayClient,
       stopOutboundRelayClient,
-    } = await import('../../packages/server/src/services/global-agent/outbound-relay-client')
+    } = await import('../../packages/server/src/modules/studio/services/global-agent/outbound-relay-client')
 
     const first = startOutboundRelayClient({
       connectionId: 'primary',

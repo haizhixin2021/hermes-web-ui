@@ -3,16 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createTestingPinia } from '@pinia/testing'
 import { defineComponent } from 'vue'
-import type { FileEntry } from '@/api/hermes/files'
+import type { FileEntry } from '@/api/studio/files'
 
 const fetchSessionAttachment = vi.hoisted(() => vi.fn())
 const fetchGroupAttachment = vi.hoisted(() => vi.fn())
 const message = vi.hoisted(() => ({ error: vi.fn() }))
 
-vi.mock('@/api/hermes/sessions', () => ({
+vi.mock('@/api/studio/sessions', () => ({
   fetchSessionWorkspaceAttachmentBlob: fetchSessionAttachment,
 }))
-vi.mock('@/api/hermes/group-chat', () => ({
+vi.mock('@/api/studio/group-chat', () => ({
   fetchGroupWorkspaceAttachmentBlob: fetchGroupAttachment,
 }))
 vi.mock('vue-i18n', () => ({
@@ -22,13 +22,40 @@ vi.mock('naive-ui', () => ({
   NButton: defineComponent({ template: '<button><slot /><slot name="icon" /></button>' }),
   useMessage: () => message,
 }))
-vi.mock('@/components/hermes/files/FileTree.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
+vi.mock('@/components/hermes/files/FileTree.vue', () => ({
+  default: defineComponent({
+    name: 'FileTreeStub',
+    emits: ['open-entry', 'contextmenu-entry'],
+    template: '<div class="file-tree-stub" />',
+  }),
+}))
 vi.mock('@/components/hermes/files/FileBreadcrumb.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
 vi.mock('@/components/hermes/files/FileToolbar.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
 vi.mock('@/components/hermes/files/FileList.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
 vi.mock('@/components/hermes/files/FileUploadModal.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
 vi.mock('@/components/hermes/files/FileRenameModal.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
 vi.mock('@/components/hermes/files/FileEditor.vue', () => ({ default: defineComponent({ template: '<div />' }) }))
+vi.mock('@/components/hermes/files/WorkspaceFileDiff.vue', () => ({
+  default: defineComponent({
+    name: 'WorkspaceFileDiffStub',
+    props: {
+      showTreeToggle: Boolean,
+      treeCollapsed: Boolean,
+    },
+    emits: ['toggle-tree'],
+    template: `
+      <div class="workspace-file-diff-stub">
+        <button
+          v-if="showTreeToggle"
+          class="file-tree-toggle"
+          :aria-expanded="!treeCollapsed"
+          :aria-label="treeCollapsed ? 'files.expandTree' : 'files.collapseTree'"
+          @click="$emit('toggle-tree')"
+        />
+      </div>
+    `,
+  }),
+}))
 vi.mock('@/components/hermes/files/FileContextMenu.vue', () => ({
   default: defineComponent({
     name: 'FileContextMenuStub',
@@ -50,6 +77,16 @@ const entry: FileEntry = {
 describe('FilesPanel workspace attachments', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(window.matchMedia).mockReturnValue({
+      matches: false,
+      media: '(max-width: 768px)',
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })
   })
 
   it('loads a session workspace file and emits it as a browser File', async () => {
@@ -80,5 +117,64 @@ describe('FilesPanel workspace attachments', () => {
 
     expect(fetchGroupAttachment).toHaveBeenCalledWith('room-1', 'reports/report.pdf')
     expect(wrapper.emitted('attach')).toHaveLength(1)
+  })
+
+  it('replaces the mobile tree with a selected file and returns to the same tree', async () => {
+    vi.mocked(window.matchMedia).mockReturnValue({
+      matches: true,
+      media: '(max-width: 768px)',
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })
+    const wrapper = mount(FilesPanel, {
+      props: { workspaceSessionId: 'session-1', workspace: '/tmp/workspace' },
+      global: { plugins: [createTestingPinia({ createSpy: vi.fn })] },
+    })
+
+    wrapper.getComponent({ name: 'FileTreeStub' }).vm.$emit('open-entry', entry)
+    await flushPromises()
+    expect(wrapper.classes()).toContain('mobile-file-open')
+
+    await wrapper.get('.sidebar-toggle').trigger('click')
+    expect(wrapper.classes()).not.toContain('mobile-file-open')
+    expect(wrapper.findComponent({ name: 'FileTreeStub' }).exists()).toBe(true)
+  })
+
+  it('collapses the desktop tree to a rail while keeping the file panel open', async () => {
+    const wrapper = mount(FilesPanel, {
+      props: { workspaceSessionId: 'session-1', workspace: '/tmp/workspace' },
+      global: { plugins: [createTestingPinia({ createSpy: vi.fn })] },
+    })
+    const treePanel = wrapper.get('.files-tree-panel')
+    wrapper.getComponent({ name: 'FileTreeStub' }).vm.$emit('open-entry', {
+      ...entry,
+      name: 'notes.txt',
+      path: 'notes.txt',
+    })
+    await flushPromises()
+    const toggle = wrapper.get('.file-tree-toggle')
+
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(wrapper.findComponent({ name: 'FileTreeStub' }).exists()).toBe(true)
+
+    await toggle.trigger('click')
+
+    expect(treePanel.classes()).toContain('tree-collapsed')
+    expect(treePanel.attributes('style')).toContain('width: 0px')
+    expect(toggle.attributes('aria-expanded')).toBe('false')
+    expect(toggle.attributes('aria-label')).toBe('files.expandTree')
+    expect(wrapper.find('.files-main-panel').exists()).toBe(true)
+    expect(wrapper.get('.file-tree-stub').attributes('style')).toContain('display: none')
+
+    await toggle.trigger('click')
+
+    expect(treePanel.classes()).not.toContain('tree-collapsed')
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(toggle.attributes('aria-label')).toBe('files.collapseTree')
+    expect(wrapper.get('.file-tree-stub').attributes('style') || '').not.toContain('display: none')
   })
 })

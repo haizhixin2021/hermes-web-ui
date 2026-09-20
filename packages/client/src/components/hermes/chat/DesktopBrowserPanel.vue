@@ -3,10 +3,14 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NInput, NPopover, NSelect, useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { desktopBridge, type DesktopBrowserDownload, type DesktopBrowserSelection, type DesktopBrowserState } from '@/utils/desktop-bridge'
+import type { BrowserAnnotationSubmission } from '@/utils/browser-annotation-submit'
 
-const emit = defineEmits<{
-  attach: [payload: { file: File; context: string }]
-}>()
+const props = withDefaults(defineProps<{
+  visible?: boolean
+  submit: (submission: BrowserAnnotationSubmission) => boolean | void | Promise<boolean | void>
+}>(), {
+  visible: true,
+})
 
 const { t } = useI18n()
 const message = useMessage()
@@ -61,6 +65,8 @@ const annotationCapture = ref<{
   viewport: DesktopBrowserSelection['viewport']
 } | null>(null)
 const annotationTabId = ref<string | null>(null)
+const annotationSubmitting = ref(false)
+const annotationRemoving = ref(false)
 const pendingAnnotation = ref<{
   marker: number
   mode: 'element' | 'region'
@@ -86,6 +92,11 @@ const activeProfileDownloads = computed(() => state.value?.downloads
 const activeDownloadCount = computed(() => activeProfileDownloads.value.filter(item => item.state === 'progressing').length)
 const annotationCount = computed(() => annotations.value.length + (pendingAnnotation.value ? 1 : 0))
 const hasAnnotationSession = computed(() => annotationCount.value > 0)
+const annotationItems = computed(() => [
+  ...annotations.value,
+  ...(pendingAnnotation.value ? [{ ...pendingAnnotation.value, note: annotationNote.value }] : []),
+])
+const annotationLocked = computed(() => busy.value || annotationSubmitting.value || annotationRemoving.value)
 const annotationAbove = computed(() => {
   const pending = pendingAnnotation.value
   if (!pending) return false
@@ -109,6 +120,7 @@ const annotationAnchorStyle = computed(() => {
 
 watch(() => activeTab.value?.url, value => { address.value = value || '' }, { immediate: true })
 watch(externalOverlayOpen, () => { void nextTick(syncViewport) })
+watch(() => props.visible, () => { void nextTick(syncViewport) })
 
 function applyState(next: DesktopBrowserState): void {
   state.value = next
@@ -117,7 +129,7 @@ function applyState(next: DesktopBrowserState): void {
 async function syncViewport(): Promise<void> {
   if (!bridge || !viewport.value) return
   const rect = viewport.value.getBoundingClientRect()
-  const visible = !externalOverlayOpen.value && !pendingAnnotation.value
+  const visible = props.visible && !externalOverlayOpen.value && !pendingAnnotation.value
     && rect.width > 0 && rect.height > 0 && document.visibilityState === 'visible'
   await bridge.setViewport({ x: rect.left, y: rect.top, width: rect.width, height: rect.height }, visible).catch(() => undefined)
 }
@@ -230,6 +242,7 @@ function takeOver(): void {
 }
 
 function annotate(mode: 'element' | 'region', tabId?: string): void {
+  if (annotationLocked.value || pendingAnnotation.value) return
   const tab = tabId ? state.value?.tabs.find(item => item.id === tabId) : activeTab.value
   if (!tab) return
   if (annotationTabId.value && annotationTabId.value !== tab.id) return
@@ -290,50 +303,83 @@ async function commitPendingAnnotation(restoreViewport = true): Promise<void> {
 }
 
 async function clearAnnotationSession(): Promise<void> {
+  if (annotationLocked.value) return
   const tabId = annotationTabId.value
   resetAnnotationSession()
   if (bridge && tabId) await bridge.clearAnnotations(tabId).catch(() => undefined)
   await nextTick(syncViewport)
 }
 
-async function sendAnnotations(): Promise<void> {
-  await commitPendingAnnotation(false)
-  await annotationNoteUpdate
-  const capture = annotationCapture.value
+async function removeAnnotation(marker: number): Promise<void> {
   const tabId = annotationTabId.value
-  if (!capture || annotations.value.length === 0) return
-  let file = capture.file
-  if (bridge && tabId) {
-    const screenshot = await bridge.captureAnnotations(tabId).catch(() => null)
-    if (screenshot) {
+  if (!bridge?.removeAnnotation || !tabId || annotationLocked.value) return
+  annotationRemoving.value = true
+  try {
+    // Save a different pending note before restoring the live page.
+    if (pendingAnnotation.value && pendingAnnotation.value.marker !== marker) await commitPendingAnnotation(false)
+    await annotationNoteUpdate
+    if (!await bridge.removeAnnotation(tabId, marker)) return
+    annotations.value = annotations.value.filter(item => item.marker !== marker)
+    if (pendingAnnotation.value?.marker === marker) {
+      pendingAnnotation.value = null
+      annotationNote.value = ''
+    }
+    if (!annotationCount.value) resetAnnotationSession()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    annotationRemoving.value = false
+    await nextTick(syncViewport)
+  }
+}
+
+function undoAnnotation(): void {
+  const last = annotationItems.value.at(-1)
+  if (last) void removeAnnotation(last.marker)
+}
+
+async function sendAnnotations(): Promise<void> {
+  if (annotationLocked.value) return
+  annotationSubmitting.value = true
+  try {
+    await commitPendingAnnotation(false)
+    await annotationNoteUpdate
+    const capture = annotationCapture.value
+    const tabId = annotationTabId.value
+    if (!capture || annotations.value.length === 0) return
+    let file = capture.file
+    if (bridge && tabId) {
+      const screenshot = await bridge.captureAnnotations(tabId)
       const bytes = Uint8Array.from(atob(screenshot.data), character => character.charCodeAt(0))
       file = new File([bytes], `browser-annotations-${Date.now()}.png`, { type: screenshot.mediaType })
     }
-  }
-  emit('attach', {
-    file,
-    context: JSON.stringify({
-      browser_selection: {
-        tab_id: capture.tabId,
-        url: capture.url,
-        title: capture.title,
-        viewport: capture.viewport,
-        annotations: annotations.value,
-      },
-    }, null, 2),
-  })
-  annotations.value = []
-  annotationCapture.value = null
-  annotationTabId.value = null
-  annotationNote.value = ''
-  message.success(t('browser.annotationAdded'))
-  void (async () => {
+    const submission: BrowserAnnotationSubmission = {
+      file,
+      context: JSON.stringify({
+        browser_selection: {
+          tab_id: capture.tabId,
+          url: capture.url,
+          title: capture.title,
+          viewport: capture.viewport,
+          annotations: annotations.value,
+        },
+      }, null, 2),
+    }
+    const submitted = await props.submit(submission)
+    if (submitted === false) return
+    resetAnnotationSession()
     if (bridge && tabId) await bridge.clearAnnotations(tabId).catch(() => undefined)
     await nextTick(syncViewport)
-  })()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    annotationSubmitting.value = false
+    await nextTick(syncViewport)
+  }
 }
 
 function handleAnnotationFocusout(event: FocusEvent): void {
+  if (annotationLocked.value) return
   const container = event.currentTarget
   const next = event.relatedTarget
   if (container instanceof HTMLElement && next instanceof Node && container.contains(next)) return
@@ -524,9 +570,17 @@ onUnmounted(() => {
       <div v-if="hasAnnotationSession" class="annotation-session-bar">
         <span>{{ t('browser.annotationCount', { count: annotationCount }) }}</span>
         <div>
-          <NButton size="tiny" @mousedown.prevent @click="clearAnnotationSession">{{ t('browser.clearAnnotations') }}</NButton>
-          <NButton size="tiny" type="primary" @mousedown.prevent @click="sendAnnotations">{{ t('chat.send') }}</NButton>
+          <NButton v-if="bridge?.removeAnnotation" size="tiny" :disabled="annotationLocked" @mousedown.prevent @click="undoAnnotation">{{ t('browser.undoAnnotation') }}</NButton>
+          <NButton size="tiny" :disabled="annotationLocked" @mousedown.prevent @click="clearAnnotationSession">{{ t('browser.clearAnnotations') }}</NButton>
+          <NButton size="tiny" type="primary" :disabled="annotationLocked" :loading="annotationSubmitting" @mousedown.prevent @click="sendAnnotations">{{ t('chat.send') }}</NButton>
         </div>
+      </div>
+
+      <div v-if="hasAnnotationSession && bridge?.removeAnnotation" class="annotation-list">
+        <span v-for="item in annotationItems" :key="item.marker" class="annotation-item" :title="item.note" :data-annotation-marker="item.marker">
+          <span>{{ t('browser.annotationLabel', { index: item.marker }) }}<template v-if="item.note"> · {{ item.note }}</template></span>
+          <button :disabled="annotationLocked" :aria-label="t('browser.deleteAnnotation', { index: item.marker })" :title="t('browser.deleteAnnotation', { index: item.marker })" @mousedown.prevent @click="removeAnnotation(item.marker)">×</button>
+        </span>
       </div>
 
       <div v-if="pendingAnnotation" class="annotation-editor">
@@ -544,8 +598,9 @@ onUnmounted(() => {
               @keydown="handleAnnotationKeydown"
             />
             <div class="annotation-actions">
-              <NButton size="small" @mousedown.prevent @click="clearAnnotationSession">{{ t('browser.clearAnnotations') }}</NButton>
-              <NButton size="small" type="primary" @mousedown.prevent @click="commitPendingAnnotation()">{{ t('browser.finishAnnotation') }}</NButton>
+              <NButton v-if="bridge?.removeAnnotation" size="small" :disabled="annotationLocked" @mousedown.prevent @click="removeAnnotation(pendingAnnotation.marker)">{{ t('browser.deleteAnnotation', { index: pendingAnnotation.marker }) }}</NButton>
+              <NButton v-else size="small" :disabled="annotationLocked" @mousedown.prevent @click="clearAnnotationSession">{{ t('browser.clearAnnotations') }}</NButton>
+              <NButton size="small" type="primary" :disabled="annotationLocked" @mousedown.prevent @click="commitPendingAnnotation()">{{ t('browser.finishAnnotation') }}</NButton>
             </div>
           </div>
         </div>
@@ -564,7 +619,7 @@ onUnmounted(() => {
 .tab-strip { height: 38px; flex: 0 0 38px; display: flex; align-items: flex-end; gap: 2px; padding: 4px 8px 0; overflow-x: auto; background: rgba(127,127,127,.06); }
 .tab { width: 190px; min-width: 100px; height: 34px; border: 0; border-radius: 8px 8px 0 0; background: transparent; color: inherit; display: flex; align-items: center; gap: 7px; padding: 0 9px; cursor: pointer; }
 .tab.active { color: var(--text-primary, #1a1a1a); background: var(--bg-card, #fff); box-shadow: inset 0 0 0 1px var(--border-color, #e0e0e0); }
-.tab img { width: 16px; height: 16px; }.tab span { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; }.tab i { color: #3b82f6; font-size: 9px; }.tab b { font: 18px/1 sans-serif; font-weight: 400; }
+.tab img { width: 16px; height: 16px; }.tab span { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: start; }.tab i { color: #3b82f6; font-size: 9px; }.tab b { font: 18px/1 sans-serif; font-weight: 400; }
 .new-tab, .toolbar > button, .download-trigger { border: 0; background: transparent; color: inherit; cursor: pointer; border-radius: 6px; }.new-tab { width: 34px; height: 34px; font-size: 20px; }.toolbar > button, .download-trigger { width: 30px; height: 30px; font-size: 18px; }.toolbar > button { display: inline-grid; place-items: center; padding: 0; }.toolbar > button:hover, .download-trigger:hover, .new-tab:hover { background: rgba(127,127,127,.15); }.toolbar > button:disabled { opacity: .35; }
 .toolbar { height: 46px; flex: 0 0 46px; padding: 7px 10px; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; gap: 8px; }
 .toolbar-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -583,8 +638,14 @@ onUnmounted(() => {
 .download-empty { padding: 24px 8px; text-align: center; }
 .agent-banner, .crash-banner { min-height: 34px; display: flex; align-items: center; justify-content: space-between; padding: 4px 12px; font-size: 12px; }
 .agent-banner { background: rgba(59,130,246,.12); color: #3b82f6; }.crash-banner { background: rgba(239,68,68,.12); color: #dc2626; }
-.annotation-session-bar { min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 10px; color: #2563eb; background: rgba(59,130,246,.1); font-size: 12px; }
+.annotation-session-bar { min-height: 38px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 10px; color: #2563eb; background: rgba(59,130,246,.1); font-size: 12px; }
 .annotation-session-bar > div { display: flex; gap: 6px; }
+.annotation-list { display: flex; flex-wrap: wrap; flex-shrink: 0; gap: 6px; max-height: 90px; overflow-y: auto; padding: 6px 10px; border-bottom: 1px solid var(--border-color); }
+.annotation-item { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding-inline-start: 8px; border-radius: 6px; background: rgba(59,130,246,.1); color: inherit; font-size: 12px; }
+.annotation-item > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-item > button { flex-shrink: 0; width: 28px; height: 28px; border: 0; border-radius: 6px; color: inherit; background: transparent; cursor: pointer; font-size: 18px; }
+.annotation-item > button:hover { background: rgba(59,130,246,.15); }
+.annotation-item > button:disabled { cursor: default; opacity: .5; }
 .native-viewport { flex: 1; min-height: 100px; position: relative; display: grid; place-items: center; background: #fff; color: #777; }
 .annotation-editor { flex: 1; min-height: 0; overflow: auto; padding: 12px; background: var(--card-color, #fff); }
 .annotation-preview { position: relative; width: 100%; margin-bottom: 168px; line-height: 0; }

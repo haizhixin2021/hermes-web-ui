@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { bridgeTerminalError } from '../../packages/server/src/services/hermes/run-chat/handle-bridge-run'
+import { bridgeTerminalError } from '../../packages/server/src/modules/studio/services/chat-run/handle-bridge-run'
 
 describe('bridge terminal error detection', () => {
   it('uses bridge status errors directly', () => {
@@ -89,7 +89,7 @@ describe('bridge terminal error detection', () => {
       result: {
         completed: true,
         final_response: [
-          '# Hermes Studio 项目整体理解',
+          '# Ekko Studio 项目整体理解',
           '服务启动流程：',
           '- 创建数据目录',
           '- 初始化登录限流',

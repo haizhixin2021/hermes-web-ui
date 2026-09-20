@@ -11,14 +11,19 @@ const { t } = useI18n()
 const message = useMessage()
 const dialog = useDialog()
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
     categories: SkillCategory[]
     archived: SkillInfo[]
     selectedSkill: string | null
     searchQuery: string
     sourceFilter: SourceFilter | null
     readonly?: boolean
-}>()
+    toggleable?: boolean
+    toggleHandler?: (category: string, skill: string, enabled: boolean) => Promise<void>
+    deleteHandler?: (category: string, skill: string) => Promise<void>
+}>(), {
+    toggleable: true,
+})
 
 const emit = defineEmits<{
     select: [category: string, skill: string]
@@ -154,7 +159,8 @@ async function handleToggle(category: string, skillName: string, newEnabled: boo
     togglingSkills.value.add(skillName)
 
     try {
-        await toggleSkill(skillName, newEnabled)
+        if (props.toggleHandler) await props.toggleHandler(category, skillName, newEnabled)
+        else await toggleSkill(skillName, newEnabled)
         // Update local state
         const cat = props.categories.find(c => c.name === category)
         const skill = cat?.skills.find(s => s.name === skillName)
@@ -176,7 +182,8 @@ function confirmDelete(category: string, skillName: string) {
         onPositiveClick: async () => {
             deletingSkills.value.add(skillName)
             try {
-                await deleteSkillApi(category, skillName)
+                if (props.deleteHandler) await props.deleteHandler(category, skillName)
+                else await deleteSkillApi(category, skillName)
                 message.success(t('skills.deleteSuccess'))
                 message.info(t('skills.reloadHint'), { duration: 6000 })
                 emit('deleted', category, skillName)
@@ -241,7 +248,7 @@ function confirmDelete(category: string, skillName: string) {
                                     </span>
                                     <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
                                 </div>
-                                <NSwitch v-if="!readonly" size="small" :value="skill.enabled !== false"
+                                <NSwitch v-if="!readonly && !skill.readonly && toggleable !== false" size="small" :value="skill.enabled !== false"
                                     :loading="togglingSkills.has(skill.name)"
                                     @update:value="handleToggle(cat.name, skill.name, $event)" @click.stop />
                             </button>
@@ -277,7 +284,7 @@ function confirmDelete(category: string, skillName: string) {
                             </span>
                             <span v-if="skill.description" class="skill-desc">{{ skill.description }}</span>
                         </div>
-                        <button v-if="!readonly && (skill.source ?? 'local') === 'local'" class="skill-action-btn"
+                        <button v-if="!readonly && !skill.readonly && (skill.source ?? 'local') === 'local'" class="skill-action-btn"
                             :title="t('skills.delete')" :disabled="deletingSkills.has(skill.name)"
                             @click.stop="confirmDelete(cat.name, skill.name)">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -289,7 +296,7 @@ function confirmDelete(category: string, skillName: string) {
                                 <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
                             </svg>
                         </button>
-                        <NSwitch v-if="!readonly" size="small" :value="skill.enabled !== false"
+                        <NSwitch v-if="!readonly && !skill.readonly && toggleable !== false" size="small" :value="skill.enabled !== false"
                             :loading="togglingSkills.has(skill.name)"
                             @update:value="handleToggle(cat.name, skill.name, $event)" @click.stop />
                     </button>
@@ -366,7 +373,7 @@ function confirmDelete(category: string, skillName: string) {
     }
 
     &.sub {
-        padding-left: 22px;
+        padding-inline-start: 22px;
         font-size: 11px;
         text-transform: none;
         letter-spacing: 0;
@@ -391,7 +398,7 @@ function confirmDelete(category: string, skillName: string) {
     font-weight: 600;
     cursor: pointer;
     border-radius: $radius-sm;
-    text-align: left;
+    text-align: start;
 
     &:hover {
         background: rgba(245, 158, 11, 0.08);
@@ -412,11 +419,11 @@ function confirmDelete(category: string, skillName: string) {
     white-space: nowrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     direction: rtl;
-    text-align: left;
+    text-align: end;
 }
 
 .path-group-body {
-    padding-left: 4px;
+    padding-inline-start: 4px;
 }
 
 .category-arrow {
@@ -430,7 +437,7 @@ function confirmDelete(category: string, skillName: string) {
 
 .category-name {
     flex: 1;
-    text-align: left;
+    text-align: start;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -458,7 +465,7 @@ function confirmDelete(category: string, skillName: string) {
     background: none;
     color: $text-secondary;
     font-size: 13px;
-    text-align: left;
+    text-align: start;
     cursor: pointer;
     border-radius: $radius-sm;
     transition: all $transition-fast;
@@ -482,7 +489,7 @@ function confirmDelete(category: string, skillName: string) {
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    margin-right: 6px;
+    margin-inline-end: 6px;
     flex-shrink: 0;
     vertical-align: middle;
 }
@@ -519,7 +526,7 @@ function confirmDelete(category: string, skillName: string) {
 .modified-badge {
     font-size: 11px;
     color: $warning;
-    margin-left: 2px;
+    margin-inline-start: 2px;
     opacity: 0.7;
 }
 
@@ -544,7 +551,7 @@ function confirmDelete(category: string, skillName: string) {
 
 .skill-archived {
     opacity: 0.6;
-    padding-left: 28px;
+    padding-inline-start: 28px;
 }
 
 .skill-action-btn {

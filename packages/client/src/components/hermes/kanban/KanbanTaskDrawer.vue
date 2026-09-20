@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { NDrawer, NDrawerContent, NButton, NSelect, NInput, NSpin, NModal, useMessage } from 'naive-ui'
+import { NDrawer, NDrawerContent, NButton, NSelect, NInput, NSpin, NModal, useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { request } from '@/api/client'
@@ -10,7 +10,7 @@ import { useFilesStore } from '@/stores/hermes/files'
 import { withDefaultAssignee } from '@/utils/hermes/kanban-assignees'
 import HistoryMessageList from '@/components/hermes/chat/HistoryMessageList.vue'
 import FilePreview from '@/components/hermes/files/FilePreview.vue'
-import { fetchAuthenticatedBlob, saveBlob } from '@/api/hermes/binary-content'
+import { fetchAuthenticatedBlob, saveBlob } from '@/api/studio/binary-content'
 import type { Session, Message } from '@/stores/hermes/chat'
 import type { KanbanAttachment, KanbanTaskDetail } from '@/api/hermes/kanban'
 
@@ -29,6 +29,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 const kanbanStore = useKanbanStore()
 const filesStore = useFilesStore()
 
@@ -67,6 +68,7 @@ const canMutateTask = computed(() => {
 const canCompleteTask = computed(() => ['running', 'ready', 'blocked'].includes(detail.value?.task.status || ''))
 const canBlockTask = computed(() => ['running', 'ready'].includes(detail.value?.task.status || ''))
 const canUnblockTask = computed(() => ['blocked', 'scheduled'].includes(detail.value?.task.status || ''))
+const canArchiveTask = computed(() => detail.value?.task.status === 'done')
 const canAssignTask = computed(() => canMutateTask.value && detail.value?.task.status !== 'running')
 const canReclaimTask = computed(() => detail.value?.task.status === 'running')
 const canReassignTask = computed(() => canMutateTask.value)
@@ -292,6 +294,30 @@ async function handleUnblock() {
   }
 }
 
+function handleArchive() {
+  if (!props.taskId) return
+  const taskId = props.taskId
+  const board = kanbanStore.selectedBoard
+  dialog.warning({
+    title: t('kanban.action.archive'),
+    content: t('kanban.action.archiveConfirm'),
+    positiveText: t('kanban.action.archive'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: async () => {
+      if (!isActiveTask(taskId, board)) return
+      try {
+        await kanbanStore.archiveTasks([taskId])
+        if (!isActiveTask(taskId, board)) return
+        message.success(t('kanban.message.taskArchived'))
+        emit('updated')
+        emit('close')
+      } catch (err: any) {
+        if (isActiveTask(taskId, board)) message.error(err.message)
+      }
+    },
+  })
+}
+
 async function handleAssign() {
   if (!props.taskId || !assignProfile.value) return
   const taskId = props.taskId
@@ -470,19 +496,22 @@ function handleNavigateTask(taskId: string) {
           <!-- Body -->
           <div v-if="detail.task.body" class="detail-section">
             <div class="section-title">{{ t('kanban.form.body') }}</div>
-            <div class="detail-body">{{ detail.task.body }}</div>
+            <div class="detail-body" dir="auto">{{ detail.task.body }}</div>
           </div>
 
           <!-- Result / Summary -->
           <div v-if="completionSummary" class="detail-section">
             <div class="section-title">{{ t('kanban.detail.result') }}</div>
-            <div class="result-summary" @click="openResultDetail">{{ completionSummary }}</div>
+            <div class="result-summary" dir="auto" @click="openResultDetail">{{ completionSummary }}</div>
           </div>
 
-          <!-- Actions (only for active, mutable tasks) -->
-          <div v-if="canMutateTask" class="detail-section">
+          <!-- Actions for active tasks and the terminal done-to-archived transition -->
+          <div v-if="canMutateTask || canArchiveTask" class="detail-section">
             <div class="section-title">{{ t('kanban.action.title') }}</div>
             <div class="action-group">
+              <NButton v-if="canArchiveTask" size="small" secondary type="warning" @click="handleArchive">
+                {{ t('kanban.action.archive') }}
+              </NButton>
               <template v-if="canCompleteTask && !showCompleteInput">
                 <NButton size="small" @click="showCompleteInput = true">
                   {{ t('kanban.action.complete') }}
@@ -535,11 +564,11 @@ function handleNavigateTask(taskId: string) {
           <div v-if="detail.runs.length > 0" class="detail-section">
             <div class="section-title" style="cursor: pointer;" @click="searchTaskSessions">
               {{ t('kanban.detail.sessions') }}
-              <NSpin v-if="sessionLoading" :size="12" style="margin-left: 6px;" />
+              <NSpin v-if="sessionLoading" :size="12" style="margin-inline-start: 6px;" />
             </div>
             <div v-if="showSessions && sessionResults.length > 0" class="session-list">
               <div v-for="session in sessionResults" :key="session.id" class="session-item" @click="router.push({ name: 'hermes.chat', query: { session: session.id } })">
-                <div class="session-title">{{ session.title || session.id }}</div>
+                <div class="session-title" dir="auto">{{ session.title || session.id }}</div>
                 <div class="session-meta">
                   <span>{{ session.source }}</span>
                   <span>{{ session.model }}</span>
@@ -616,7 +645,7 @@ function handleNavigateTask(taskId: string) {
   <!-- Session messages modal (click result summary) -->
   <NModal v-if="historySession" :show="showMessagesModal" preset="card" :title="detail?.task.title || ''" :style="{ width: '900px', maxWidth: 'calc(100vw - 48px)' }" @close="showMessagesModal = false">
     <div class="messages-modal-body">
-      <HistoryMessageList :session="historySession" />
+      <HistoryMessageList :session="historySession" scroll-scope="kanban" />
     </div>
   </NModal>
 
@@ -652,7 +681,7 @@ function handleNavigateTask(taskId: string) {
   color: $text-primary;
   background: $bg-secondary;
   cursor: pointer;
-  text-align: left;
+  text-align: start;
 
   &:hover {
     border-color: $accent-primary;
@@ -692,7 +721,7 @@ function handleNavigateTask(taskId: string) {
   font-family: $font-code;
   font-size: 11px;
   font-weight: 500;
-  margin-left: auto;
+  margin-inline-start: auto;
   text-transform: none;
 }
 
@@ -842,7 +871,7 @@ function handleNavigateTask(taskId: string) {
   }
 
   &:not(:last-child) {
-    margin-right: 4px;
+    margin-inline-end: 4px;
   }
 }
 
@@ -965,7 +994,7 @@ function handleNavigateTask(taskId: string) {
 .comment-time {
   font-size: 11px;
   color: $text-muted;
-  margin-left: auto;
+  margin-inline-start: auto;
 }
 
 .run-summary,
@@ -996,7 +1025,7 @@ function handleNavigateTask(taskId: string) {
 .event-time {
   font-size: 11px;
   color: $text-muted;
-  margin-left: auto;
+  margin-inline-start: auto;
 }
 
 .session-list {

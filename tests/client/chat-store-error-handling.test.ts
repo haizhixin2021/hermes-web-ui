@@ -6,10 +6,16 @@ const chatApi = vi.hoisted(() => ({
   startRunViaSocket: vi.fn(),
   resumeSession: vi.fn(),
   registerSessionHandlers: vi.fn(),
+  globalPendingHandler: undefined as undefined | ((event: any) => void),
   unregisterSessionHandlers: vi.fn(),
 }))
 
-vi.mock('@/api/hermes/chat', () => ({
+const completionSoundMock = vi.hoisted(() => ({
+  primeCompletionSound: vi.fn(),
+  playCompletionSound: vi.fn(),
+}))
+
+vi.mock('@/api/studio/chat', () => ({
   startRunViaSocket: chatApi.startRunViaSocket,
   resumeSession: chatApi.resumeSession,
   registerSessionHandlers: chatApi.registerSessionHandlers,
@@ -17,10 +23,15 @@ vi.mock('@/api/hermes/chat', () => ({
   getChatRunSocket: vi.fn(() => ({ emit: vi.fn() })),
   respondToolApproval: vi.fn(),
   respondClarify: vi.fn(),
-  onPeerUserMessage: vi.fn(() => vi.fn()),
+  onPeerUserMessage: vi.fn((handler: (event: any) => void) => { chatApi.globalPendingHandler = handler; return vi.fn() }),
+  onApprovalRequested: vi.fn(() => vi.fn()),
+  onApprovalResolved: vi.fn(() => vi.fn()),
+  onClarifyRequested: vi.fn(() => vi.fn()),
+  onClarifyResolved: vi.fn(() => vi.fn()),
   onSessionCommand: vi.fn(() => vi.fn()),
   onSessionTitleUpdated: vi.fn(() => vi.fn()),
   onSessionWorkspaceUpdated: vi.fn(() => vi.fn()),
+  onSessionSettingsUpdated: vi.fn(() => vi.fn()),
 }))
 
 vi.mock('@/api/client', () => ({
@@ -28,7 +39,7 @@ vi.mock('@/api/client', () => ({
   hasApiKey: () => false,
 }))
 
-vi.mock('@/api/hermes/sessions', () => ({
+vi.mock('@/api/studio/sessions', () => ({
   archiveSession: vi.fn(),
   deleteSession: vi.fn(),
   fetchSession: vi.fn(),
@@ -38,7 +49,7 @@ vi.mock('@/api/hermes/sessions', () => ({
   setSessionModel: vi.fn(),
 }))
 
-vi.mock('@/api/hermes/download', () => ({
+vi.mock('@/api/studio/download', () => ({
   getDownloadUrl: (_path: string, name: string) => `/download/${name}`,
 }))
 
@@ -53,11 +64,12 @@ vi.mock('@/api/hermes/system', () => ({
 }))
 
 vi.mock('@/utils/completion-sound', () => ({
-  primeCompletionSound: vi.fn(),
-  playCompletionSound: vi.fn(),
+  primeCompletionSound: completionSoundMock.primeCompletionSound,
+  playCompletionSound: completionSoundMock.playCompletionSound,
 }))
 
 import { useChatStore, type Message, type Session } from '@/stores/hermes/chat'
+import { useSettingsStore } from '@/stores/hermes/settings'
 
 function makeSession(id: string): Session {
   return {
@@ -74,6 +86,7 @@ describe('chat store error handling - #1644', () => {
 
   beforeEach(() => {
     handlers = undefined
+    chatApi.globalPendingHandler = undefined
     vi.resetAllMocks()
     setActivePinia(createPinia())
     chatApi.startRunViaSocket.mockReturnValue({ abort: vi.fn() })
@@ -90,6 +103,148 @@ describe('chat store error handling - #1644', () => {
       handlers = registeredHandlers
       return vi.fn()
     })
+  })
+
+  it('primes approval sound on direct send when completion sound is disabled', async () => {
+    const store = useChatStore()
+    const settingsStore = useSettingsStore()
+    const session = makeSession('session-1')
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+    settingsStore.display.bell_on_complete = false
+    settingsStore.display.approval_bell = true
+
+    await store.sendMessage('request approval')
+
+    expect(completionSoundMock.primeCompletionSound).toHaveBeenCalledOnce()
+  })
+
+  it('does not prime notification sound on direct send when both sound settings are disabled', async () => {
+    const store = useChatStore()
+    const settingsStore = useSettingsStore()
+    const session = makeSession('session-1')
+    store.sessions = [session]
+    store.activeSessionId = 'session-1'
+    store.activeSession = session
+    settingsStore.display.bell_on_complete = false
+    settingsStore.display.approval_bell = false
+
+    await store.sendMessage('silent request')
+
+    expect(completionSoundMock.primeCompletionSound).not.toHaveBeenCalled()
+  })
+
+  it('tracks an approval request from an inactive session through the global socket listener', () => {
+    const store = useChatStore()
+    const sessionA = makeSession('session-a')
+    store.sessions = [sessionA, makeSession('session-b')]
+    store.activeSessionId = 'session-a'
+    store.activeSession = sessionA
+
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested',
+      session_id: 'session-b',
+      approval_id: 'approval-b',
+      command: 'pwd',
+      description: 'Run command',
+      choices: ['once', 'deny'],
+    })
+
+    expect(store.pendingApprovals.get('session-b')).toMatchObject({ approvalId: 'approval-b', command: 'pwd' })
+    expect(store.activePendingApproval).toBeNull()
+  })
+
+  it('anchors approval and clarification countdowns to server-provided remaining time', () => {
+    const store = useChatStore()
+    store.sessions = [makeSession('session-b')]
+    const now = performance.now()
+
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested', session_id: 'session-b', approval_id: 'approval-b',
+      choices: ['once', 'deny'], timeout_ms: 300_000, remaining_timeout_ms: 42_000,
+    })
+    chatApi.globalPendingHandler?.({
+      event: 'clarify.requested', session_id: 'session-b', clarify_id: 'clarify-b',
+      question: 'Continue?', timeout_ms: 300_000, remaining_timeout_ms: 17_000,
+    })
+
+    expect(store.pendingApprovals.get('session-b')!.countdownDeadline - now).toBeGreaterThanOrEqual(41_900)
+    expect(store.pendingApprovals.get('session-b')!.countdownDeadline - now).toBeLessThanOrEqual(42_100)
+    expect(store.pendingClarifies.get('session-b')!.countdownDeadline - now).toBeGreaterThanOrEqual(16_900)
+    expect(store.pendingClarifies.get('session-b')!.countdownDeadline - now).toBeLessThanOrEqual(17_100)
+  })
+
+  it('keeps a pending approval when the authoritative response is unresolved', () => {
+    const store = useChatStore()
+    store.sessions = [makeSession('session-a'), makeSession('session-b')]
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested', session_id: 'session-b', approval_id: 'approval-b', choices: ['once', 'deny'],
+    })
+
+    chatApi.globalPendingHandler?.({
+      event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false, error: 'stale',
+    })
+
+    expect(store.pendingApprovals.get('session-b')).toMatchObject({ approvalId: 'approval-b' })
+  })
+
+  it('waits for the server to decide whether old approval and clarification prompts expired', () => {
+    const store = useChatStore()
+    const expired = vi.fn()
+    window.addEventListener('hermes:pending-interaction-expired', expired)
+    store.sessions = [makeSession('session-b')]
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested', session_id: 'session-b', approval_id: 'approval-b', choices: ['once', 'deny'], timeout_ms: 1,
+    })
+    chatApi.globalPendingHandler?.({
+      event: 'clarify.requested', session_id: 'session-b', clarify_id: 'clarify-b', question: 'Continue?', timeout_ms: 1,
+    })
+    store.pendingApprovals.get('session-b')!.requestedAt = Date.now() - 10
+    store.pendingClarifies.get('session-b')!.requestedAt = Date.now() - 10
+
+    expect(store.respondApprovalFor('session-b', 'approval-b', 'once')).toBe('submitted')
+    expect(store.respondToClarifyFor('session-b', 'clarify-b', 'Continue')).toBe('submitted')
+    expect(store.pendingApprovals.has('session-b')).toBe(true)
+    expect(store.pendingClarifies.has('session-b')).toBe(true)
+    expect(expired).not.toHaveBeenCalled()
+
+    chatApi.globalPendingHandler?.({
+      event: 'approval.resolved', session_id: 'session-b', approval_id: 'approval-b', resolved: false,
+      stale: true, error: 'Approval is no longer pending.',
+    })
+    chatApi.globalPendingHandler?.({
+      event: 'clarify.resolved', session_id: 'session-b', clarify_id: 'clarify-b', resolved: false,
+      stale: true, error: 'Clarification is no longer pending.',
+    })
+
+    expect(store.pendingApprovals.has('session-b')).toBe(false)
+    expect(store.pendingClarifies.has('session-b')).toBe(false)
+    expect(expired).toHaveBeenCalledTimes(2)
+    window.removeEventListener('hermes:pending-interaction-expired', expired)
+  })
+
+  it('reports a server-confirmed stale response after optimistic local removal', () => {
+    const store = useChatStore()
+    const session = makeSession('session-b')
+    const expired = vi.fn()
+    window.addEventListener('hermes:pending-interaction-expired', expired)
+    store.sessions = [session]
+    store.activeSessionId = session.id
+    store.activeSession = session
+    chatApi.globalPendingHandler?.({
+      event: 'approval.requested', session_id: session.id, approval_id: 'approval-b', choices: ['once', 'deny'], timeout_ms: 300_000,
+    })
+
+    expect(store.respondApproval('once')).toBe('submitted')
+    expect(store.pendingApprovals.has(session.id)).toBe(false)
+    chatApi.globalPendingHandler?.({
+      event: 'approval.resolved', session_id: session.id, approval_id: 'approval-b', resolved: false,
+      stale: true, error: 'Approval is no longer pending.',
+    })
+
+    expect(expired).toHaveBeenCalledOnce()
+    window.removeEventListener('hermes:pending-interaction-expired', expired)
   })
 
   it('preserves assistant content when run.failed fires during streaming with substantial content', async () => {

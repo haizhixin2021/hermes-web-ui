@@ -12,7 +12,7 @@ import { useSettingsStore } from '@/stores/hermes/settings'
 vi.mock('@/components/hermes/chat/ChatPanel.vue', () => ({
   default: {
     name: 'ChatPanel',
-    props: { standalone: Boolean },
+    props: { standalone: Boolean, contentMode: String },
     template: '<div data-testid="chat-panel" />',
   },
 }))
@@ -29,7 +29,7 @@ vi.mock('vue-router', () => ({
   useRouter: () => ({ replace: vi.fn() }),
 }))
 
-vi.mock('@/api/hermes/chat', () => ({
+vi.mock('@/api/studio/chat', () => ({
   startRunViaSocket: vi.fn(),
   resumeSession: vi.fn(),
   registerSessionHandlers: vi.fn(),
@@ -41,9 +41,10 @@ vi.mock('@/api/hermes/chat', () => ({
   onSessionCommand: vi.fn(() => vi.fn()),
   onSessionTitleUpdated: vi.fn(() => vi.fn()),
   onSessionWorkspaceUpdated: vi.fn(() => vi.fn()),
+  onSessionSettingsUpdated: vi.fn(() => vi.fn()),
 }))
 
-vi.mock('@/api/hermes/sessions', () => ({
+vi.mock('@/api/studio/sessions', () => ({
   archiveSession: vi.fn(),
   fetchSessions: vi.fn(),
   fetchSessionMessagesPage: vi.fn(),
@@ -57,7 +58,7 @@ vi.mock('@/api/client', () => ({
   getActiveProfileName: () => 'default',
 }))
 
-vi.mock('@/api/hermes/download', () => ({
+vi.mock('@/api/studio/download', () => ({
   getDownloadUrl: (_path: string, name: string) => `/download/${name}`,
 }))
 
@@ -85,7 +86,7 @@ function makeSession(title: string): Session {
 describe('ChatView tab title', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    document.title = 'Hermes Studio'
+    document.title = 'Ekko Studio'
     mockRoute.name = 'hermes.session'
     mockRoute.params = {}
     mockRoute.query = {}
@@ -116,7 +117,7 @@ describe('ChatView tab title', () => {
     expect(document.title).toBe('Implementation Notes')
 
     wrapper.unmount()
-    expect(document.title).toBe('Hermes Studio')
+    expect(document.title).toBe('Ekko Studio')
   })
 
   it('falls back to the product title when the session title is blank', () => {
@@ -125,7 +126,7 @@ describe('ChatView tab title', () => {
 
     const wrapper = mount(ChatView)
 
-    expect(document.title).toBe('Hermes Studio')
+    expect(document.title).toBe('Ekko Studio')
     wrapper.unmount()
   })
 
@@ -142,6 +143,15 @@ describe('ChatView tab title', () => {
     expect(wrapper.getComponent({ name: 'ChatPanel' }).props('standalone')).toBe(true)
     expect(wrapper.get('.chat-view').classes()).toContain('chat-view--standalone')
     expect(document.title).toBe('Desktop Chat')
+    wrapper.unmount()
+  })
+
+  it('renders Agent management inside the shared single-chat shell', () => {
+    mockRoute.name = 'hermes.agentManager'
+
+    const wrapper = mount(ChatView)
+
+    expect(wrapper.getComponent({ name: 'ChatPanel' }).props('contentMode')).toBe('agents')
     wrapper.unmount()
   })
 })

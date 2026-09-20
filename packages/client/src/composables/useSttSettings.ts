@@ -1,10 +1,10 @@
 import { ref, watch } from 'vue'
-import { fetchSttSettings } from '@/api/hermes/stt-settings'
+import { fetchSttSettings } from '@/api/studio/stt-settings'
 import type {
   FetchSttSettingsResponse,
   SttProvider,
   SttProviderSettingsResponse,
-} from '@/api/hermes/stt-settings'
+} from '@/api/studio/stt-settings'
 
 interface SttSettingsData {
   provider: SttProvider
@@ -46,6 +46,7 @@ const DEFAULT: SttSettingsData = {
 
 function sanitize(data: Partial<SttSettingsData>): SttSettingsData {
   const provider = data.provider === 'browser' ||
+    data.provider === 'local' ||
     data.provider === 'openai' ||
     data.provider === 'custom' ||
     data.provider === 'doubao' ||

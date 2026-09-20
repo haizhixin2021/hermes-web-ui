@@ -1,7 +1,7 @@
 import type { AddressInfo } from 'node:net'
 import Koa from 'koa'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createRequestBodyParser } from '../../packages/server/src/middleware/request-body-parser'
+import { createRequestBodyParser } from '../../packages/server/src/modules/studio/middleware/request-body-parser'
 
 let server: ReturnType<Koa['listen']> | null = null
 
@@ -14,7 +14,7 @@ afterEach(async () => {
 })
 
 describe('request body parser', () => {
-  it('parses the text/plain file body sent by the Hermes Studio curl command', async () => {
+  it('parses the text/plain file body sent by the Ekko Studio curl command', async () => {
     const app = new Koa()
     app.use(createRequestBodyParser())
     app.use(ctx => {

@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { join, resolve } from 'path'
 import { tmpdir } from 'os'
 import { mkdir, mkdtemp, rm, symlink } from 'fs/promises'
-import { normalizePlatformPath, validatePath } from '../../packages/server/src/services/hermes/file-provider'
-import { isNearestExistingRealPathWithin, isPathWithin, isRealPathWithin, relativePathFromBase } from '../../packages/server/src/services/hermes/hermes-path'
+import { normalizePlatformPath, validatePath } from '../../packages/server/src/modules/studio/services/files/file-provider'
+import { isNearestExistingRealPathWithin, isPathWithin, isRealPathWithin, relativePathFromBase } from '../../packages/server/src/modules/studio/services/files/path'
 
 describe('file provider platform path normalization', () => {
   it('converts MSYS drive paths to Windows absolute paths on Windows', () => {
@@ -42,6 +42,15 @@ describe('Hermes path containment helpers', () => {
   it('does not treat sibling paths with the same prefix as inside the base', () => {
     expect(isPathWithin('/tmp/hermes-profile2/state.db', '/tmp/hermes-profile')).toBe(false)
     expect(isPathWithin('/tmp/hermes-profile/state.db', '/tmp/hermes-profile')).toBe(true)
+  })
+
+  it('treats a child whose name begins with dots as inside the base', () => {
+    expect(isPathWithin('/tmp/hermes-profile/..hidden', '/tmp/hermes-profile')).toBe(true)
+    expect(isPathWithin('/tmp/hermes-profile/...', '/tmp/hermes-profile')).toBe(true)
+    expect(isPathWithin('/tmp/hermes-profile/notes/..archive.md', '/tmp/hermes-profile')).toBe(true)
+    // A first segment of exactly `..` is still the one that leaves the base.
+    expect(isPathWithin('/tmp/hermes-profile/../evil', '/tmp/hermes-profile')).toBe(false)
+    expect(isPathWithin('/tmp', '/tmp/hermes-profile')).toBe(false)
   })
 
   it('returns normalized relative paths only for children', () => {

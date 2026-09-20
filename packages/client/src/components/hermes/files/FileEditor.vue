@@ -3,6 +3,7 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { NButton, NSpace, useMessage, useDialog } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useFilesStore } from '@/stores/hermes/files'
+import FileTreeToggle from './FileTreeToggle.vue'
 import * as monaco from 'monaco-editor'
 
 // Configure Monaco workers using import.meta.url
@@ -19,7 +20,17 @@ const { t } = useI18n()
 const message = useMessage()
 const dialogApi = useDialog()
 const filesStore = useFilesStore()
-const props = defineProps<{ customClose?: () => void }>()
+const props = withDefaults(defineProps<{
+  customClose?: () => void
+  showTreeToggle?: boolean
+  treeCollapsed?: boolean
+}>(), {
+  showTreeToggle: false,
+  treeCollapsed: false,
+})
+const emit = defineEmits<{
+  'toggle-tree': []
+}>()
 
 const editorContainer = ref<HTMLElement | null>(null)
 let editor: monaco.editor.IStandaloneCodeEditor | null = null
@@ -39,6 +50,17 @@ onMounted(() => {
     automaticLayout: true,
     tabSize: 2,
     wordWrap: 'on',
+    overviewRulerLanes: 0,
+    hideCursorInOverviewRuler: true,
+    overviewRulerBorder: false,
+    scrollbar: {
+      vertical: 'hidden',
+      horizontal: 'hidden',
+      handleMouseWheel: true,
+      alwaysConsumeMouseWheel: false,
+      verticalScrollbarSize: 0,
+      horizontalScrollbarSize: 0,
+    },
   })
 
   editor.onDidChangeModelContent(() => {
@@ -94,7 +116,14 @@ function handleClose() {
 <template>
   <div class="file-editor">
     <div class="editor-header">
-      <span class="editor-filename">{{ filesStore.editingFile?.path }}</span>
+      <div class="editor-file-info">
+        <FileTreeToggle
+          v-if="props.showTreeToggle"
+          :collapsed="props.treeCollapsed"
+          @toggle="emit('toggle-tree')"
+        />
+        <span class="editor-filename">{{ filesStore.editingFile?.path }}</span>
+      </div>
       <NSpace>
         <NButton size="small" type="primary" :loading="saving" @click="handleSave">
           {{ t('files.saveFile') }}
@@ -112,9 +141,14 @@ function handleClose() {
 @use '@/styles/variables' as *;
 
 .file-editor {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
+  width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .editor-header {
@@ -124,6 +158,13 @@ function handleClose() {
   padding: 8px 16px;
   border-bottom: 1px solid $border-color;
   background-color: $bg-card;
+}
+
+.editor-file-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .editor-filename {
@@ -142,6 +183,8 @@ function handleClose() {
 
 .editor-container {
   flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
 }
 </style>

@@ -6,10 +6,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { dirname, join, posix, resolve, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { HERMES_CLI_ARG } from './cli-constants'
 
@@ -47,11 +48,11 @@ interface McpShimInstallOptions extends CliShimInstallOptions {
 }
 
 function platformDelimiter(platform: NodeJS.Platform): string {
-  return platform === 'win32' ? ';' : delimiter
+  return platform === 'win32' ? ';' : ':'
 }
 
 function pathKey(value: string, platform: NodeJS.Platform): string {
-  const normalized = resolve(value)
+  const normalized = platform === 'win32' ? win32.resolve(value) : posix.resolve(value)
   return platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
@@ -71,11 +72,11 @@ function executableForShim(options: Required<Pick<CliShimInstallOptions, 'env' |
 }
 
 export function shimPathForPlatform(binDir: string, platform: NodeJS.Platform = process.platform): string {
-  return join(binDir, platform === 'win32' ? 'hermes-studio.cmd' : 'hermes-studio')
+  return join(binDir, platform === 'win32' ? 'ekko-studio.cmd' : 'ekko-studio')
 }
 
 export function mcpShimPathForPlatform(binDir: string, platform: NodeJS.Platform = process.platform): string {
-  return join(binDir, platform === 'win32' ? 'hermes-studio-mcp.cmd' : 'hermes-studio-mcp')
+  return join(binDir, platform === 'win32' ? 'ekko-studio-mcp.cmd' : 'ekko-studio-mcp')
 }
 
 function shellQuote(value: string): string {
@@ -86,84 +87,142 @@ function windowsRuntimePlatformKey(archName: string): string {
   return `win-${archName}`
 }
 
+function jsSingleQuoted(value: string): string {
+  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
+}
+
+function windowsCliForwarder(runtimePlatform: string, runtimeVersion: string): string {
+  const platform = jsSingleQuoted(runtimePlatform)
+  const version = jsSingleQuoted(runtimeVersion)
+  return [
+    "const fs=require('node:fs')",
+    "const path=require('node:path')",
+    "const cp=require('node:child_process')",
+    'const args=process.argv.slice(1)',
+    "const webUiHome=process.env.HERMES_WEB_UI_HOME||process.env.HERMES_WEBUI_STATE_DIR||path.join(process.env.USERPROFILE||'','.hermes-web-ui')",
+    "let runtime=(process.env.HERMES_DESKTOP_RUNTIME_DIR||'').trim()",
+    `if(!runtime){try{const active=JSON.parse(fs.readFileSync(path.join(webUiHome,'desktop-runtime','active-version.json'),'utf8'));if(active.platform===${platform}&&typeof active.runtimeDirectory==='string'&&active.runtimeDirectory.trim()&&fs.existsSync(active.runtimeDirectory))runtime=active.runtimeDirectory.trim()}catch{}}`,
+    `if(!runtime)runtime=path.join(webUiHome,'desktop-runtime','hermes',${version},${platform})`,
+    "let virtualEnv=path.join(runtime,'python','venv')",
+    "let python=path.join(virtualEnv,'Scripts','python.exe')",
+    "if(!fs.existsSync(python))python=path.join(virtualEnv,'python.exe')",
+    "if(!fs.existsSync(python)){virtualEnv=path.join(runtime,'python');python=path.join(virtualEnv,'python.exe')}",
+    "if(!fs.existsSync(python)){console.error('Ekko Studio Python runtime not found at '+python);console.error('Open Ekko Studio once to finish runtime setup, then retry ekko-studio cli.');process.exit(127)}",
+    "const inheritedPath=process.env.PATH||process.env.Path||''",
+    'const env={...process.env,VIRTUAL_ENV:virtualEnv,UV_PROJECT_ENVIRONMENT:virtualEnv,UV_PYTHON:python,HERMES_AGENT_ROOT:path.join(runtime,\'python\'),HERMES_AGENT_NODE:path.join(runtime,\'node\',\'node.exe\'),HERMES_AGENT_NODE_ROOT:path.join(runtime,\'node\'),AGENT_BROWSER_HOME:path.join(runtime,\'python\',\'agent-browser\'),PLAYWRIGHT_BROWSERS_PATH:path.join(runtime,\'python\',\'ms-playwright\')}',
+    "for(const key of Object.keys(env))if(key.toLowerCase()==='path')delete env[key]",
+    "env.PATH=[path.join(runtime,'python','venv','Scripts'),path.join(runtime,'python','node'),path.join(runtime,'node'),path.join(runtime,'git','cmd'),inheritedPath].filter(Boolean).join(';')",
+    "const result=cp.spawnSync(python,['-m','hermes_cli.main',...args],{stdio:'inherit',windowsHide:true,env})",
+    'if(result.error){console.error(result.error.message);process.exit(127)}',
+    'process.exit(result.status===null?(result.signal?1:0):result.status)',
+  ].join(';')
+}
+
+function utf8Base64(value: string): string {
+  return Buffer.from(value, 'utf-8').toString('base64')
+}
+
+function powershellUtf8Value(value: string): string {
+  return `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${utf8Base64(value)}'))`
+}
+
+function windowsPowerShellSidecarName(name: 'ekko-studio' | 'ekko-studio-mcp'): string {
+  return `${name}.ps1`
+}
+
+function windowsCmdShimContent(name: 'ekko-studio' | 'ekko-studio-mcp', marker: string): string {
+  return [
+    '@echo off',
+    `rem ${marker}`,
+    `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0${windowsPowerShellSidecarName(name)}" %*`,
+    'exit /b %ERRORLEVEL%',
+    '',
+  ].join('\r\n')
+}
+
+export function createPowerShellShimContent(
+  executablePath: string,
+  archName: string = process.arch,
+  runtimeVersion = '0.20.0',
+  nodePath = process.execPath,
+  webUiScriptPath = resolve(process.cwd(), 'bin', 'hermes-web-ui.mjs'),
+): string {
+  const cliForwarder = windowsCliForwarder(windowsRuntimePlatformKey(archName), runtimeVersion)
+  return [
+    `# ${SHIM_MARKER}`,
+    `$App = ${powershellUtf8Value(executablePath)}`,
+    `$Node = ${powershellUtf8Value(nodePath)}`,
+    `$WebUiScript = ${powershellUtf8Value(webUiScriptPath)}`,
+    `$CliForwarder = ${powershellUtf8Value(cliForwarder)}`,
+    '$CommandArgs = @($args)',
+    "$Command = if ($CommandArgs.Count -gt 0) { [string]$CommandArgs[0] } else { '' }",
+    '[string[]]$ForwardArgs = @()',
+    'if ($CommandArgs.Count -gt 1) {',
+    '  $ForwardArgs = [string[]]$CommandArgs[1..($CommandArgs.Count - 1)]',
+    '}',
+    'function Show-HermesStudioHelp {',
+    "  [Console]::Out.WriteLine('Usage: ekko-studio [command] [options]')",
+    "  [Console]::Out.WriteLine('')",
+    "  [Console]::Out.WriteLine('Commands:')",
+    "  [Console]::Out.WriteLine('  (no command)       Open Ekko Studio desktop app')",
+    "  [Console]::Out.WriteLine('  cli [args...]      Run bundled Hermes Agent CLI')",
+    "  [Console]::Out.WriteLine('  web [args...]      Run bundled hermes-web-ui command')",
+    "  [Console]::Out.WriteLine('  help, -h, --help   Show this help message')",
+    '}',
+    "switch ($Command.ToLowerInvariant()) {",
+    "  '' {",
+    '    if (!(Test-Path -LiteralPath $App -PathType Leaf)) {',
+    "      [Console]::Error.WriteLine('Ekko Studio executable not found at ' + $App)",
+    '      exit 127',
+    '    }',
+    '    Start-Process -FilePath $App',
+    '    exit 0',
+    '  }',
+    "  'help' { Show-HermesStudioHelp; exit 0 }",
+    "  '-h' { Show-HermesStudioHelp; exit 0 }",
+    "  '--help' { Show-HermesStudioHelp; exit 0 }",
+    "  'cli' {",
+    '    if (!(Test-Path -LiteralPath $Node -PathType Leaf)) {',
+    "      [Console]::Error.WriteLine('Ekko Studio Node runtime not found at ' + $Node)",
+    "      [Console]::Error.WriteLine('Open Ekko Studio once to finish runtime setup, then retry ekko-studio cli.')",
+    '      exit 127',
+    '    }',
+    '    & $Node -e $CliForwarder @ForwardArgs',
+    '    exit $LASTEXITCODE',
+    '  }',
+    "  'web' {",
+    '    if (!(Test-Path -LiteralPath $Node -PathType Leaf)) {',
+    "      [Console]::Error.WriteLine('Ekko Studio Node runtime not found at ' + $Node)",
+    "      [Console]::Error.WriteLine('Open Ekko Studio once to finish runtime setup, then retry ekko-studio web.')",
+    '      exit 127',
+    '    }',
+    '    if (!(Test-Path -LiteralPath $WebUiScript -PathType Leaf)) {',
+    "      [Console]::Error.WriteLine('Hermes Web UI script not found at ' + $WebUiScript)",
+    '      exit 127',
+    '    }',
+    '    & $Node $WebUiScript @ForwardArgs',
+    '    exit $LASTEXITCODE',
+    '  }',
+    '  default {',
+    "    [Console]::Error.WriteLine('Unknown Ekko Studio command: ' + $Command)",
+    "    [Console]::Error.WriteLine('Run ekko-studio --help for usage.')",
+    '    exit 2',
+    '  }',
+    '}',
+    '',
+  ].join('\r\n')
+}
+
 export function createShimContent(
   executablePath: string,
   platform: NodeJS.Platform = process.platform,
   archName: string = process.arch,
-  runtimeVersion = '0.19.0',
+  runtimeVersion = '0.20.0',
   nodePath = process.execPath,
   webUiScriptPath = resolve(process.cwd(), 'bin', 'hermes-web-ui.mjs'),
 ): string {
   if (platform === 'win32') {
-    const runtimePlatform = windowsRuntimePlatformKey(archName)
-    const cliForwarder = `const cp=require('node:child_process');const args=process.argv.slice(1);if(args[0]&&args[0].toLowerCase()==='cli')args.shift();const r=cp.spawnSync(process.env.PYTHON,['-m','hermes_cli.main',...args],{stdio:'inherit'});if(r.error){console.error(r.error.message);process.exit(127)}process.exit(r.status===null?(r.signal?1:0):r.status)`
-    const webForwarder = `const cp=require('node:child_process');const args=process.argv.slice(1);if(args[0]&&args[0].toLowerCase()==='web')args.shift();const r=cp.spawnSync(process.env.NODE,[process.env.WEBUI_SCRIPT,...args],{stdio:'inherit'});if(r.error){console.error(r.error.message);process.exit(127)}process.exit(r.status===null?(r.signal?1:0):r.status)`
-    return [
-      '@echo off',
-      `rem ${SHIM_MARKER}`,
-      `set "APP=${executablePath}"`,
-      `set "NODE=${nodePath}"`,
-      `set "WEBUI_SCRIPT=${webUiScriptPath}"`,
-      'if "%~1"=="" goto openApp',
-      'if /I "%~1"=="help" goto help',
-      'if /I "%~1"=="-h" goto help',
-      'if /I "%~1"=="--help" goto help',
-      'if /I "%~1"=="cli" goto runCli',
-      'if /I "%~1"=="web" goto runWeb',
-      'echo Unknown Hermes Studio command: %~1 1>&2',
-      'echo Run hermes-studio --help for usage. 1>&2',
-      'exit /b 2',
-      ':resolveRuntime',
-      'set "WEBUI_HOME=%HERMES_WEB_UI_HOME%"',
-      'if "%WEBUI_HOME%"=="" set "WEBUI_HOME=%HERMES_WEBUI_STATE_DIR%"',
-      'if "%WEBUI_HOME%"=="" set "WEBUI_HOME=%USERPROFILE%\\.hermes-web-ui"',
-      'set "RUNTIME=%HERMES_DESKTOP_RUNTIME_DIR%"',
-      'if "%RUNTIME%"=="" if exist "%WEBUI_HOME%\\desktop-runtime\\active-version.json" (',
-      `  for /f "usebackq delims=" %%I in (\`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Join-Path $env:WEBUI_HOME 'desktop-runtime\\active-version.json'; try { $j = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json; if ($j.platform -eq '${runtimePlatform}' -and $j.runtimeDirectory -and (Test-Path -LiteralPath $j.runtimeDirectory)) { [Console]::Out.Write($j.runtimeDirectory) } } catch {}" 2^>nul\`) do set "RUNTIME=%%I"`,
-      ')',
-      `if "%RUNTIME%"=="" set "RUNTIME=%WEBUI_HOME%\\desktop-runtime\\hermes\\${runtimeVersion}\\${runtimePlatform}"`,
-      'set "PYTHON=%RUNTIME%\\python\\python.exe"',
-      'exit /b 0',
-      ':runCli',
-      'call :resolveRuntime',
-      'if not exist "%PYTHON%" (',
-      '  echo Hermes Studio Python runtime not found at "%PYTHON%" 1>&2',
-      '  echo Open Hermes Studio once to finish runtime setup, then retry hermes-studio cli. 1>&2',
-      '  exit /b 127',
-      ')',
-      'if not exist "%NODE%" (',
-      '  echo Hermes Studio Node runtime not found at "%NODE%" 1>&2',
-      '  echo Open Hermes Studio once to finish runtime setup, then retry hermes-studio cli. 1>&2',
-      '  exit /b 127',
-      ')',
-      `"%NODE%" -e "${cliForwarder}" %*`,
-      'exit /b %ERRORLEVEL%',
-      ':runWeb',
-      'if not exist "%NODE%" (',
-      '  echo Hermes Studio Node runtime not found at "%NODE%" 1>&2',
-      '  echo Open Hermes Studio once to finish runtime setup, then retry hermes-studio web. 1>&2',
-      '  exit /b 127',
-      ')',
-      'if not exist "%WEBUI_SCRIPT%" (',
-      '  echo Hermes Web UI script not found at "%WEBUI_SCRIPT%" 1>&2',
-      '  exit /b 127',
-      ')',
-      `"%NODE%" -e "${webForwarder}" %*`,
-      'exit /b %ERRORLEVEL%',
-      ':openApp',
-      'start "" "%APP%"',
-      'exit /b 0',
-      ':help',
-      'echo Usage: hermes-studio [command] [options]',
-      'echo.',
-      'echo Commands:',
-      'echo   ^(no command^)       Open Hermes Studio desktop app',
-      'echo   cli [args...]       Run bundled Hermes Agent CLI',
-      'echo   web [args...]       Run bundled hermes-web-ui command',
-      'echo   help, -h, --help    Show this help message',
-      'exit /b 0',
-      '',
-    ].join('\r\n')
+    return windowsCmdShimContent('ekko-studio', SHIM_MARKER)
   }
 
   return [
@@ -174,17 +233,17 @@ export function createShimContent(
     `WEBUI_SCRIPT=${shellQuote(webUiScriptPath)}`,
     'show_help() {',
     '  cat <<\'EOF\'',
-    'Usage: hermes-studio [command] [options]',
+    'Usage: ekko-studio [command] [options]',
     '',
     'Commands:',
-    '  (no command)       Open Hermes Studio desktop app',
+    '  (no command)       Open Ekko Studio desktop app',
     '  cli [args...]      Run bundled Hermes Agent CLI',
     '  web [args...]      Run bundled hermes-web-ui command',
     '  help, -h, --help   Show this help message',
     'EOF',
     '}',
     'if [ ! -x "$APP" ]; then',
-    '  echo "Hermes Studio executable not found at $APP" >&2',
+    '  echo "Ekko Studio executable not found at $APP" >&2',
     '  exit 127',
     'fi',
     'unset ELECTRON_RUN_AS_NODE',
@@ -199,8 +258,8 @@ export function createShimContent(
     '  web)',
     '    shift',
     '    if [ ! -x "$NODE" ]; then',
-    '      echo "Hermes Studio Node runtime not found at $NODE" >&2',
-    '      echo "Open Hermes Studio once to finish runtime setup, then retry hermes-studio web." >&2',
+    '      echo "Ekko Studio Node runtime not found at $NODE" >&2',
+    '      echo "Open Ekko Studio once to finish runtime setup, then retry ekko-studio web." >&2',
     '      exit 127',
     '    fi',
     '    if [ ! -f "$WEBUI_SCRIPT" ]; then',
@@ -214,8 +273,8 @@ export function createShimContent(
     '    exit 0',
     '    ;;',
     '  *)',
-    '    echo "Unknown Hermes Studio command: $1" >&2',
-    '    echo "Run hermes-studio --help for usage." >&2',
+    '    echo "Unknown Ekko Studio command: $1" >&2',
+    '    echo "Run ekko-studio --help for usage." >&2',
     '    exit 2',
     '    ;;',
     'esac',
@@ -230,32 +289,7 @@ export function createMcpShimContent(
   platform: NodeJS.Platform = process.platform,
 ): string {
   if (platform === 'win32') {
-    return [
-      '@echo off',
-      `rem ${MCP_SHIM_MARKER}`,
-      `set "NODE=${nodePath}"`,
-      `set "SCRIPT=${scriptPath}"`,
-      'if not exist "%NODE%" (',
-      '  echo Hermes Studio Node runtime not found at "%NODE%" 1>&2',
-      '  echo Open Hermes Studio once to finish runtime setup, then retry hermes-studio-mcp. 1>&2',
-      '  exit /b 127',
-      ')',
-      'if not exist "%SCRIPT%" (',
-      '  echo Hermes Studio MCP script not found at "%SCRIPT%" 1>&2',
-      '  exit /b 127',
-      ')',
-      'if "%HERMES_WEB_UI_URL%"=="" (',
-      '  if "%HERMES_DESKTOP_PORT%"=="" (',
-      `    set "HERMES_WEB_UI_URL=${webUiUrl}"`,
-      '  ) else (',
-      '    set "HERMES_WEB_UI_URL=http://127.0.0.1:%HERMES_DESKTOP_PORT%"',
-      '  )',
-      ')',
-      'if "%HERMES_MCP_SERVER_NAME%"=="" set "HERMES_MCP_SERVER_NAME=hermes-studio-mcp"',
-      '"%NODE%" "%SCRIPT%" %*',
-      'exit /b %ERRORLEVEL%',
-      '',
-    ].join('\r\n')
+    return windowsCmdShimContent('ekko-studio-mcp', MCP_SHIM_MARKER)
   }
 
   return [
@@ -264,12 +298,12 @@ export function createMcpShimContent(
     `NODE=${shellQuote(nodePath)}`,
     `SCRIPT=${shellQuote(scriptPath)}`,
     'if [ ! -x "$NODE" ]; then',
-    '  echo "Hermes Studio Node runtime not found at $NODE" >&2',
-    '  echo "Open Hermes Studio once to finish runtime setup, then retry hermes-studio-mcp." >&2',
+    '  echo "Ekko Studio Node runtime not found at $NODE" >&2',
+    '  echo "Open Ekko Studio once to finish runtime setup, then retry ekko-studio-mcp." >&2',
     '  exit 127',
     'fi',
     'if [ ! -f "$SCRIPT" ]; then',
-    '  echo "Hermes Studio MCP script not found at $SCRIPT" >&2',
+    '  echo "Ekko Studio MCP script not found at $SCRIPT" >&2',
     '  exit 127',
     'fi',
     'if [ -z "${HERMES_WEB_UI_URL:-}" ]; then',
@@ -281,12 +315,47 @@ export function createMcpShimContent(
     'fi',
     'export HERMES_WEB_UI_URL',
     'if [ -z "${HERMES_MCP_SERVER_NAME:-}" ]; then',
-    '  HERMES_MCP_SERVER_NAME=hermes-studio-mcp',
+    '  HERMES_MCP_SERVER_NAME=ekko-studio-mcp',
     'fi',
     'export HERMES_MCP_SERVER_NAME',
     'exec "$NODE" "$SCRIPT" "$@"',
     '',
   ].join('\n')
+}
+
+export function createMcpPowerShellShimContent(
+  nodePath: string,
+  scriptPath: string,
+  webUiUrl = 'http://127.0.0.1:8748',
+): string {
+  return [
+    `# ${MCP_SHIM_MARKER}`,
+    `$Node = ${powershellUtf8Value(nodePath)}`,
+    `$Script = ${powershellUtf8Value(scriptPath)}`,
+    `$DefaultWebUiUrl = ${powershellUtf8Value(webUiUrl)}`,
+    'if (!(Test-Path -LiteralPath $Node -PathType Leaf)) {',
+    "  [Console]::Error.WriteLine('Ekko Studio Node runtime not found at ' + $Node)",
+    "  [Console]::Error.WriteLine('Open Ekko Studio once to finish runtime setup, then retry ekko-studio-mcp.')",
+    '  exit 127',
+    '}',
+    'if (!(Test-Path -LiteralPath $Script -PathType Leaf)) {',
+    "  [Console]::Error.WriteLine('Ekko Studio MCP script not found at ' + $Script)",
+    '  exit 127',
+    '}',
+    "if ([string]::IsNullOrWhiteSpace($env:HERMES_WEB_UI_URL)) {",
+    "  if ([string]::IsNullOrWhiteSpace($env:HERMES_DESKTOP_PORT)) {",
+    '    $env:HERMES_WEB_UI_URL = $DefaultWebUiUrl',
+    '  } else {',
+    "    $env:HERMES_WEB_UI_URL = 'http://127.0.0.1:' + $env:HERMES_DESKTOP_PORT",
+    '  }',
+    '}',
+    "if ([string]::IsNullOrWhiteSpace($env:HERMES_MCP_SERVER_NAME)) {",
+    "  $env:HERMES_MCP_SERVER_NAME = 'ekko-studio-mcp'",
+    '}',
+    '& $Node $Script @args',
+    'exit $LASTEXITCODE',
+    '',
+  ].join('\r\n')
 }
 
 function isManagedShim(content: string, marker: string): boolean {
@@ -308,12 +377,34 @@ function writeShim(shimPath: string, content: string, platform: NodeJS.Platform,
   return 'installed'
 }
 
+function writeWindowsShimPair(
+  shimPath: string,
+  commandContent: string,
+  powershellContent: string,
+  marker: string,
+): ShimInstallStatus {
+  const powershellPath = shimPath.replace(/\.cmd$/i, '.ps1')
+  const managedPaths = [shimPath, powershellPath]
+  if (managedPaths.some((file) => {
+    if (!existsSync(file)) return false
+    return !isManagedShim(readFileSync(file, 'utf-8'), marker)
+  })) {
+    return 'skipped'
+  }
+
+  const commandStatus = writeShim(shimPath, commandContent, 'win32', marker)
+  const powershellStatus = writeShim(powershellPath, powershellContent, 'win32', marker)
+  if (commandStatus === 'installed') return 'installed'
+  if (commandStatus === 'updated' || powershellStatus !== 'unchanged') return 'updated'
+  return 'unchanged'
+}
+
 function shellProfilePaths(homeDir: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
   if (platform === 'win32') return []
 
   const shell = env.SHELL?.trim() || ''
   const name = shell.split('/').pop() || ''
-  if (name === 'fish') return [join(homeDir, '.config', 'fish', 'conf.d', 'hermes-studio.fish')]
+  if (name === 'fish') return [join(homeDir, '.config', 'fish', 'conf.d', 'ekko-studio.fish')]
   if (name === 'bash') return [join(homeDir, '.bash_profile'), join(homeDir, '.bashrc')]
   if (name === 'zsh' || platform === 'darwin') return [join(homeDir, '.zprofile'), join(homeDir, '.zshrc')]
   return [join(homeDir, '.profile')]
@@ -429,14 +520,39 @@ export async function installHermesStudioCliShim(options: CliShimInstallOptions 
   const shimPath = shimPathForPlatform(binDir, platform)
 
   mkdirSync(binDir, { recursive: true })
-  const status = writeShim(shimPath, createShimContent(
+  const commandContent = createShimContent(
     executablePath,
     platform,
     process.arch,
     options.runtimeVersion,
     options.nodePath,
     options.webUiScriptPath,
-  ), platform)
+  )
+  const status = platform === 'win32'
+    ? writeWindowsShimPair(
+        shimPath,
+        commandContent,
+        createPowerShellShimContent(
+          executablePath,
+          process.arch,
+          options.runtimeVersion,
+          options.nodePath,
+          options.webUiScriptPath,
+        ),
+        SHIM_MARKER,
+      )
+    : writeShim(shimPath, commandContent, platform)
+  if (status !== 'skipped') {
+    const oldPaths = platform === 'win32'
+      ? [join(binDir, 'hermes-studio.cmd'), join(binDir, 'hermes-studio.ps1')]
+      : [join(binDir, 'hermes-studio')]
+    // Remove the old managed command, without touching user-owned commands or
+    // a Windows sidecar that a custom command may still depend on.
+    const existingOldPaths = oldPaths.filter(path => existsSync(path))
+    if (existingOldPaths.every(path => isManagedShim(readFileSync(path, 'utf-8'), SHIM_MARKER))) {
+      for (const path of existingOldPaths) rmSync(path)
+    }
+  }
   const pathUpdated = await ensureUserBinOnPath(homeDir, binDir, platform, env).catch((err) => {
     console.warn(`[cli-shim] failed to update PATH: ${err instanceof Error ? err.message : String(err)}`)
     return false
@@ -446,7 +562,7 @@ export async function installHermesStudioCliShim(options: CliShimInstallOptions 
     shimPath,
     status,
     pathUpdated,
-    reason: status === 'skipped' ? 'existing hermes-studio shim is not managed by Hermes Studio' : undefined,
+    reason: status === 'skipped' ? 'existing ekko-studio shim is not managed by Ekko Studio' : undefined,
   }
 }
 
@@ -457,11 +573,32 @@ export async function installHermesStudioMcpShim(options: McpShimInstallOptions 
   const binDir = resolve(homeDir, 'bin')
   const shimPath = mcpShimPathForPlatform(binDir, platform)
   const nodePath = options.nodePath || process.execPath
-  const scriptPath = options.scriptPath || resolve(process.cwd(), 'bin', 'hermes-studio-mcp.mjs')
+  const scriptPath = options.scriptPath || resolve(process.cwd(), 'bin', 'ekko-studio-mcp.mjs')
   const webUiUrl = options.webUiUrl || 'http://127.0.0.1:8748'
 
   mkdirSync(binDir, { recursive: true })
-  const status = writeShim(shimPath, createMcpShimContent(nodePath, scriptPath, webUiUrl, platform), platform, MCP_SHIM_MARKER)
+  const commandContent = createMcpShimContent(nodePath, scriptPath, webUiUrl, platform)
+  const status = platform === 'win32'
+    ? writeWindowsShimPair(
+        shimPath,
+        commandContent,
+        createMcpPowerShellShimContent(nodePath, scriptPath, webUiUrl),
+        MCP_SHIM_MARKER,
+      )
+    : writeShim(shimPath, commandContent, platform, MCP_SHIM_MARKER)
+  const legacyShimPath = join(binDir, platform === 'win32' ? 'hermes-studio-mcp.cmd' : 'hermes-studio-mcp')
+  if (status !== 'skipped') {
+    if (platform === 'win32') {
+      writeWindowsShimPair(
+        legacyShimPath,
+        commandContent.replace('ekko-studio-mcp.ps1', 'hermes-studio-mcp.ps1'),
+        createMcpPowerShellShimContent(nodePath, scriptPath, webUiUrl),
+        MCP_SHIM_MARKER,
+      )
+    } else {
+      writeShim(legacyShimPath, commandContent, platform, MCP_SHIM_MARKER)
+    }
+  }
   const pathUpdated = await ensureUserBinOnPath(homeDir, binDir, platform, env).catch((err) => {
     console.warn(`[cli-shim] failed to update PATH: ${err instanceof Error ? err.message : String(err)}`)
     return false
@@ -471,6 +608,6 @@ export async function installHermesStudioMcpShim(options: McpShimInstallOptions 
     shimPath,
     status,
     pathUpdated,
-    reason: status === 'skipped' ? 'existing hermes-studio-mcp shim is not managed by Hermes Studio' : undefined,
+    reason: status === 'skipped' ? 'existing ekko-studio-mcp shim is not managed by Ekko Studio' : undefined,
   }
 }

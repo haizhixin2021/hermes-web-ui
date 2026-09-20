@@ -1,4 +1,5 @@
 import router from '@/router'
+import { invalidateAuth } from './auth-invalidation'
 
 const DEFAULT_BASE_URL = ''
 const ACTIVE_PROFILE_STORAGE_KEY = 'hermes_active_profile_name'
@@ -29,15 +30,20 @@ export function getApiKey(): string {
 }
 
 export function setServerUrl(url: string) {
+  const previousBase = getBaseUrl()
   localStorage.setItem('hermes_server_url', url)
+  if (getBaseUrl() !== previousBase) invalidateAuth()
 }
 
 export function setApiKey(key: string) {
+  const changed = getApiKey() !== key
   localStorage.setItem('hermes_api_key', key)
+  if (changed) invalidateAuth()
 }
 
 export function clearApiKey() {
   localStorage.removeItem('hermes_api_key')
+  invalidateAuth()
 }
 
 function clearAuthSessionState() {
@@ -128,11 +134,11 @@ function shouldAttachProfileHeader(path: string, options: RequestInit): boolean 
 }
 
 function isProfileWideSessionCollection(pathname: string): boolean {
-  return pathname === '/api/hermes/sessions' ||
-    pathname === '/api/hermes/sessions/batch-delete' ||
-    pathname === '/api/hermes/search/sessions' ||
-    pathname === '/api/hermes/sessions/search' ||
-    pathname === '/api/hermes/sessions/conversations'
+  return pathname === '/api/studio/sessions' ||
+    pathname === '/api/studio/sessions/batch-delete' ||
+    pathname === '/api/studio/search/sessions' ||
+    pathname === '/api/studio/sessions/search' ||
+    pathname === '/api/studio/sessions/conversations'
 }
 
 function emitAuthNotice(kind: 'expired' | 'forbidden') {
@@ -170,6 +176,17 @@ function responseErrorMessage(text: string, statusText: string): string {
     return messageFromErrorValue(parsed) || trimmed
   } catch {
     return trimmed
+  }
+}
+
+function responseErrorCode(text: string): string | undefined {
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+  try {
+    const parsed = JSON.parse(trimmed) as { code?: unknown }
+    return typeof parsed?.code === 'string' && parsed.code ? parsed.code : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -224,7 +241,10 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
         emitAuthNotice('forbidden')
       }
     }
-    throw new Error(`API Error ${res.status}: ${responseErrorMessage(text, res.statusText)}`)
+    throw Object.assign(
+      new Error(`API Error ${res.status}: ${responseErrorMessage(text, res.statusText)}`),
+      { status: res.status, code: responseErrorCode(text) },
+    )
   }
 
   return res.json()
