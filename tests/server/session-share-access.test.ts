@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import Koa from 'koa'
@@ -22,6 +22,8 @@ const clients: Socket[] = []
 const sender = { id: 101, name: 'Alice' }
 const recipient = { id: 202, name: 'Bob' }
 const delivered = vi.fn()
+const speechSynthesize = vi.fn()
+const speechTranscribe = vi.fn()
 
 beforeEach(async () => {
   vi.resetModules()
@@ -31,6 +33,10 @@ beforeEach(async () => {
   identityValid = true
   invalidIdentityTokens.clear()
   delivered.mockClear()
+  speechSynthesize.mockReset().mockResolvedValue({ audio: Buffer.from('mp3-audio'), contentType: 'audio/mpeg', engine: 'test', provider: 'edge' })
+  speechTranscribe.mockReset().mockResolvedValue({ text: 'recognized speech', provider: 'openai', model: 'test', durationMs: 20 })
+  vi.doMock('../../packages/server/src/modules/studio/services/voice/tts/providers', () => ({ getTtsProvider: () => ({ synthesize: speechSynthesize }) }))
+  vi.doMock('../../packages/server/src/modules/studio/services/voice/stt', async importOriginal => ({ ...await importOriginal<any>(), transcribeWithProvider: speechTranscribe }))
   processes.length = 0
   terminalService = undefined
   vi.doMock('../../packages/server/src/modules/studio/public/profile-config', () => ({ getProfileDir: () => root, getActiveProfileDir: () => root, getActiveProfileName: () => 'default', listProfileNamesFromDisk: () => ['default'] }))
@@ -55,8 +61,16 @@ beforeEach(async () => {
   vi.doMock('../../packages/server/src/modules/studio/public/session-agent-runtime', async importOriginal => ({
     ...await importOriginal<any>(),
     getSessionAvailableModelGroups: async () => [{ provider: 'custom:test', label: 'Test', models: ['model-a', 'disabled'],
-      api_key: 'private-provider-key', base_url: 'https://private-provider.test', api_mode: 'chat_completions', model_meta: { disabled: { disabled: true } } }],
+      api_key: 'private-provider-key', base_url: 'https://private-provider.test', api_mode: 'chat_completions', model_meta: {
+        'model-a': { alias: 'Model A', reasoning: true, reasoning_efforts: ['low', 'high'], api_key: 'private-provider-key' },
+        disabled: { disabled: true, reasoning_efforts: ['ultra'] },
+      } }],
     notifyHermesSessionModelChanged: vi.fn(),
+    getHermesModelContextLength: ({ profile, provider, model }: any) => {
+      const row = db.prepare('SELECT context_limit FROM model_context WHERE profile = ? AND provider = ? AND model = ?')
+        .get(profile, provider || '', model || '') as any
+      return row?.context_limit || 128_000
+    },
   }))
   vi.doMock('../../packages/server/src/modules/studio/public/chat-agent-runtime', async importOriginal => ({
     ...await importOriginal<any>(),
@@ -99,7 +113,7 @@ afterEach(async () => {
   if (io) await new Promise<void>(resolve => io.close(() => resolve()))
   db.close()
   await rm(root, { recursive: true, force: true })
-  for (const path of ['infrastructure/database/index', 'repositories/users-store', 'services/files/upload-paths', 'services/session-shares/app-identity', 'public/profile-config', 'public/process-tree', 'public/chat-agent-runtime', 'public/session-agent-runtime']) {
+  for (const path of ['infrastructure/database/index', 'repositories/users-store', 'services/files/upload-paths', 'services/session-shares/app-identity', 'public/profile-config', 'public/process-tree', 'public/chat-agent-runtime', 'public/session-agent-runtime', 'services/voice/tts/providers', 'services/voice/stt']) {
     vi.doUnmock(`../../packages/server/src/modules/studio/${path}`)
   }
   vi.doUnmock('../../packages/server/src/modules/hermes/services/profiles/profile')
@@ -128,6 +142,43 @@ async function socket(token: string) {
 function once(socket: Socket, event: string): Promise<any> { return new Promise(resolve => socket.once(event, resolve)) }
 
 describe('existing APIs with session share credentials', () => {
+  it('reads context limits with read access and edits only the bound model with switchModel access', async () => {
+    const { updateSession } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    const { readModelContextRecord } = await import('../../packages/server/src/modules/studio/public/provider-context')
+    updateSession('s1', { provider: 'custom:test', model: 'model-a' })
+    const readonly = await issue()
+    const editor = await issue({ switchModel: true })
+    const path = '/api/studio/sessions/s1/share-context-length'
+    const input = { provider: 'custom:test', model: 'model-a', context_limit: 64_000 }
+    expect(await request(readonly.token, path)).toMatchObject({ status: 200, body: { context_length: 128_000 } })
+    expect((await request(readonly.token, path, 'PUT', input)).status).toBe(403)
+    expect((await request(editor.token, '/api/studio/sessions/s2/share-context-length', 'PUT', input)).status).toBe(403)
+    expect((await request(editor.token, '/api/hermes/model-context/custom%3Atest/model-a', 'PUT', input)).status).toBe(403)
+    for (const invalid of [{ ...input, context_limit: 999 }, { ...input, context_limit: 10_000_001 },
+      { ...input, context_limit: 1234.5 }, { ...input, context_limit: '64000' },
+      { ...input, model: 'other' }, { ...input, provider: 'other' }, { ...input, profile: 'other' }]) {
+      expect((await request(editor.token, path, 'PUT', invalid)).status).toBeGreaterThanOrEqual(400)
+    }
+    expect(await request(editor.token, path, 'PUT', input)).toMatchObject({ status: 200, body: { context_length: 64_000 } })
+    expect(readModelContextRecord('default', 'custom:test', 'model-a')).toMatchObject({ available: true, row: { context_limit: 64_000 } })
+    expect(await request(readonly.token, path)).toMatchObject({ status: 200, body: { context_length: 64_000 } })
+    updateSession('s1', { model: 'model-b' })
+    expect((await request(editor.token, path, 'PUT', input)).status).toBe(400)
+    updateSession('s1', { model: 'model-a', agent: 'ekko-agent', source: 'coding_agent' })
+    expect((await request(editor.token, path, 'PUT', input)).status).toBe(200)
+    for (const agent of ['codex', 'claude', 'pi', 'grok', 'opencode', 'dsh']) {
+      updateSession('s1', { agent, source: 'coding_agent' } as any)
+      expect((await request(editor.token, path)).status).toBe(400)
+      expect((await request(editor.token, path, 'PUT', input)).status).toBe(400)
+    }
+    updateSession('s1', { agent: 'hermes', source: 'cli' })
+    await service.change(7, 's1', editor.record.id, { permissions: { switchModel: false } })
+    expect((await request(editor.token, path, 'PUT', input)).status).toBe(403)
+    expect((await request(editor.token, path)).status).toBe(200)
+    await service.change(7, 's1', editor.record.id, { revoke: true })
+    expect((await request(editor.token, path)).status).toBe(410)
+  })
+
   it('authenticates on the production chat namespace without leaking global snapshots or broadcasts', async () => {
     const { ChatRunSocket } = await import('../../packages/server/src/modules/studio/sockets/chat-run')
     const server = new ChatRunSocket(io) as any
@@ -229,6 +280,7 @@ describe('existing APIs with session share credentials', () => {
     const model = await issue({ switchModel: true })
     const catalog = await request(model.token, '/api/studio/sessions/s1/share-models')
     expect(catalog).toMatchObject({ status: 200, body: { groups: [{ provider: 'custom:test', models: ['model-a'] }] } })
+    expect(catalog.body.groups[0].model_meta).toEqual({ 'model-a': { alias: 'Model A', reasoning: true, reasoning_efforts: ['low', 'high'] } })
     expect(JSON.stringify(catalog.body)).not.toMatch(/private-provider|api_key|base_url/)
     expect((await request(model.token, '/api/studio/sessions/s2/model', 'POST', { model: 'model-a', provider: 'custom:test' })).status).toBe(403)
     for (const body of [{ model: 'disabled', provider: 'custom:test' }, { model: 'not-listed', provider: 'custom:test' }, { model: 'model-a', provider: 'custom:test', reasoningEffort: 'low' }, { model: 'model-a', provider: 'custom:test', apiKey: 'injected' }]) {
@@ -288,8 +340,23 @@ describe('existing APIs with session share credentials', () => {
     expect((await request(token, '/api/studio/sessions/s1/export?mode=compressed')).status).toBe(403)
   })
 
+  it('allows ordinary shared files named after Person sessions while enforcing file permissions', async () => {
+    const { token, record } = await issue({ workspaceRead: true, workspaceWrite: true, download: true })
+    for (const name of ['person-main-notes.txt', 'person-task-runtime.ts']) {
+      await writeFile(join(root, 'workspace', name), 'ordinary file')
+      expect(await request(token, `/api/studio/sessions/s1/workspace-file/read?path=${name}`))
+        .toMatchObject({ status: 200, body: { content: 'ordinary file' } })
+      expect((await request(token, '/api/studio/sessions/s1/workspace-file/write', 'PUT', { path: name, content: 'updated file' })).status).toBe(200)
+      expect(await request(token, `/api/studio/files/download?path=${name}`))
+        .toMatchObject({ status: 200, body: 'updated file' })
+    }
+    await service.change(7, 's1', record.id, { permissions: { workspaceRead: false, workspaceWrite: false, download: false } })
+    expect((await request(token, '/api/studio/sessions/s1/workspace-file/read?path=person-task-runtime.ts')).status).toBe(403)
+    expect((await request(token, '/api/studio/files/download?path=person-main-notes.txt')).status).toBe(403)
+  })
+
   it('binds upload chunks and downloads to the session without granting workspace access', async () => {
-    const first = await issue({ upload: true, download: true })
+    const first = await issue({ upload: true, download: true, workspaceRead: true })
     const second = await issue({ upload: true, download: true }, 's2')
     expect((await request(first.token, '/api/studio/app-uploads', 'POST', { id: 'upload-1111', name: 'note.txt', size: 5 })).status).toBe(200)
     expect((await request(second.token, '/api/studio/app-uploads/upload-1111/chunks?offset=0', 'PUT', 'hello')).status).toBe(403)
@@ -298,6 +365,8 @@ describe('existing APIs with session share credentials', () => {
     expect(result.status).toBe(200)
     const path = '/api/studio/files/download?path=' + encodeURIComponent(result.body.files[0].path)
     expect((await request(first.token, path)).body).toBe('hello')
+    const contentPath = '/api/studio/sessions/s1/workspace-file/content?download=1&path=' + encodeURIComponent(result.body.files[0].path)
+    expect((await request(first.token, contentPath)).body).toBe('hello')
     expect((await request(second.token, path)).status).toBe(403)
     const otherAccess = await accessModule.authenticateSessionShare(second.token, 'cloud-bob')
     const otherRoot = await accessModule.authorizeShareUpload(otherAccess)
@@ -308,6 +377,100 @@ describe('existing APIs with session share credentials', () => {
     expect((await request(first.token, path)).status).toBe(403)
     await service.change(7, 's1', first.record.id, { revoke: true })
     expect((await request(first.token, path)).status).toBe(410)
+  })
+
+  it('includes only this session’s structured historical uploads in preview and download scope', async () => {
+    const { addMessage } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    await mkdir(join(root, 'uploads'))
+    const own = join(root, 'uploads', 'a'.repeat(16) + '.md')
+    const other = join(root, 'uploads', 'b'.repeat(24) + '.md')
+    const mentioned = join(root, 'uploads', 'c'.repeat(16) + '.md')
+    for (const path of [own, other, mentioned]) await writeFile(path, 'attachment')
+    const historical = Math.floor(Date.now() / 1000) - 60
+    addMessage({ session_id: 's1', role: 'user', content: JSON.stringify([{ type: 'file', path: own, name: '旧附件.md' }]), timestamp: historical })
+    addMessage({ session_id: 's2', role: 'user', content: JSON.stringify([{ type: 'image', path: other }]), timestamp: historical })
+    addMessage({ session_id: 's1', role: 'user', content: `[file](${mentioned})`, timestamp: historical })
+    const share = await issue({ download: true, workspaceRead: true, workspaceWrite: true })
+    const url = (path: string) => '/api/studio/files/download?path=' + encodeURIComponent(path)
+    expect(await request(share.token, url(own))).toMatchObject({ status: 200, body: 'attachment' })
+    expect(await request(share.token, '/api/studio/sessions/s1/workspace-file/content?text=1&path=' + encodeURIComponent(own)))
+      .toMatchObject({ status: 200, body: 'attachment' })
+    expect(await request(share.token, '/api/studio/sessions/s1/workspace-file/content?download=1&path=' + encodeURIComponent(own)))
+      .toMatchObject({ status: 200, body: 'attachment' })
+    for (const path of [other, mentioned, join(root, 'uploads')]) expect((await request(share.token, url(path))).status).toBe(403)
+    // A recipient cannot turn a later stored message into a new file grant.
+    addMessage({ session_id: 's1', role: 'user', content: JSON.stringify([{ type: 'file', path: other }]), timestamp: historical + 3600 })
+    expect((await request(share.token, url(other))).status).toBe(403)
+    expect((await request(share.token, '/api/studio/sessions/s1/workspace-file/write', 'PUT', { path: own, content: 'changed' })).status).toBe(403)
+    expect(await readFile(own, 'utf8')).toBe('attachment')
+    await service.change(7, 's1', share.record.id, { permissions: { download: false } })
+    expect((await request(share.token, url(own))).status).toBe(403)
+    expect((await request(share.token, '/api/studio/sessions/s1/workspace-file/content?text=1&path=' + encodeURIComponent(own))).status).toBe(200)
+    await service.change(7, 's1', share.record.id, { revoke: true })
+    expect((await request(share.token, url(own))).status).toBe(410)
+  })
+
+  it.each(['file', 'image'])('preserves a first-message %s upload grant when the new session is created and shared', async type => {
+    const { recordSessionUploadAttachments } = await import('../../packages/server/src/modules/studio/services/files/session-uploads')
+    const { sessionUploadsStore } = await import('../../packages/server/src/modules/studio/repositories/session-uploads-store')
+    const { createSession, getSession } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    await mkdir(join(root, 'uploads'))
+    const own = join(root, 'uploads', 'd'.repeat(24) + '.txt')
+    await writeFile(own, 'first attachment')
+    const input = [{ type, path: own }]
+    expect(getSession('new-local-session')).toBeFalsy()
+    await recordSessionUploadAttachments('new-local-session', 'default', input)
+    expect(sessionUploadsStore.find('new-local-session', 'default', own)).toBeUndefined()
+    await recordSessionUploadAttachments('new-local-session', 'default', input, { allowPendingSession: true })
+    expect(sessionUploadsStore.find('new-local-session', 'default', own)).toBe(await realpath(own))
+    expect(getSession('new-local-session')).toBeFalsy()
+    createSession({ id: 'new-local-session', profile: 'default', source: 'cli' })
+    const share = await issue({ download: true }, 'new-local-session')
+    expect(await request(share.token, '/api/studio/files/download?path=' + encodeURIComponent(own)))
+      .toMatchObject({ status: 200, body: 'first attachment' })
+    await recordSessionUploadAttachments('s1', 'another-profile', input, { allowPendingSession: true })
+    expect(sessionUploadsStore.find('s1', 'another-profile', own)).toBeUndefined()
+  })
+
+  it('records host attachments after sharing without exposing other uploads or symlink targets', async () => {
+    const { recordSessionUploadAttachments } = await import('../../packages/server/src/modules/studio/services/files/session-uploads')
+    const share = await issue({ download: true })
+    await mkdir(join(root, 'uploads'))
+    const own = join(root, 'uploads', 'd'.repeat(24) + '.txt')
+    const other = join(root, 'uploads', 'e'.repeat(24) + '.txt')
+    await writeFile(own, 'new attachment'); await writeFile(other, 'private')
+    const url = '/api/studio/files/download?path=' + encodeURIComponent(own)
+    expect((await request(share.token, url)).status).toBe(403)
+    await recordSessionUploadAttachments('s2', 'default', [{ type: 'file', path: own }])
+    expect((await request(share.token, url)).status).toBe(403)
+    await recordSessionUploadAttachments('s1', 'another-profile', [{ type: 'file', path: own }])
+    expect((await request(share.token, url)).status).toBe(403)
+    await recordSessionUploadAttachments('s1', 'default', [{ type: 'file', path: own }])
+    expect(await request(share.token, url)).toMatchObject({ status: 200, body: 'new attachment' })
+    // Authorization survives process-level service instances because the grant is persisted.
+    const store = (await import('../../packages/server/src/modules/studio/repositories/session-uploads-store')).sessionUploadsStore
+    expect(store.find('s1', 'default', own)).toBe(await realpath(own))
+    await rm(own); await symlink(other, own)
+    expect((await request(share.token, url)).status).toBe(403)
+    await recordSessionUploadAttachments('s1', 'default', [{ type: 'file', path: own }])
+    expect((await request(share.token, url)).status).toBe(403)
+  })
+
+  it('serves session attachments without a workspace, but does not grant download by enabling upload', async () => {
+    const { updateSession, addMessage } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    updateSession('s1', { workspace: null })
+    await mkdir(join(root, 'uploads'))
+    const path = join(root, 'uploads', 'f'.repeat(16) + '.md')
+    await writeFile(path, 'without workspace')
+    addMessage({ session_id: 's1', role: 'user', content: JSON.stringify([{ type: 'file', path }]), timestamp: Math.floor(Date.now() / 1000) - 60 })
+    const share = await issue({ download: true })
+    const url = '/api/studio/sessions/s1/workspace-file/content?download=1&path=' + encodeURIComponent(path)
+    expect(await request(share.token, url)).toMatchObject({ status: 200, body: 'without workspace' })
+    const uploadOnly = await issue({ upload: true })
+    expect((await request(uploadOnly.token, url)).status).toBe(403)
+    const reader = await issue({ workspaceRead: true })
+    expect((await request(reader.token, url)).status).toBe(403)
+    expect((await request(reader.token, url.replace('download=1', 'text=1'))).status).toBe(200)
   })
 
   it('checks every Socket packet, strips execution overrides and closes on policy change', async () => {
@@ -354,5 +517,71 @@ describe('existing APIs with session share credentials', () => {
     expect((await denied).error).toBe('share_app_login_required')
     expect(delivered).not.toHaveBeenCalled()
     await disconnected
+  })
+})
+
+describe('shared speech authorization', () => {
+  const synthPath = '/api/studio/sessions/s1/share-voice/synthesize'
+  const transcribePath = '/api/studio/sessions/s1/share-voice/transcribe'
+  const audioBody = '--voice\r\nContent-Disposition: form-data; name="audio"; filename="speech.mp3"\r\nContent-Type: audio/mpeg\r\n\r\naudio-bytes\r\n--voice--\r\n'
+  const audioHeaders = { 'Content-Type': 'multipart/form-data; boundary=voice' }
+
+  it('defaults to denied and bounds voice grants to one session without exposing settings', async () => {
+    const denied = await issue({ input: true, upload: true })
+    for (const path of [synthPath, transcribePath]) expect((await request(denied.token, path, 'POST', { text: 'hello' })).status).toBe(403)
+    const allowed = await issue({ voice: true })
+    for (const path of [synthPath, transcribePath]) expect((await request(allowed.token, path.replace('/s1/', '/s2/'), 'POST', { text: 'hello' })).status).toBe(403)
+    for (const path of ['/api/studio/tts/settings', '/api/studio/stt/settings']) expect((await request(allowed.token, path)).status).toBe(403)
+    for (const path of ['/api/studio/tts/synthesize', '/api/studio/stt/transcribe']) expect((await request(allowed.token, path, 'POST', { text: 'hello' })).status).toBe(403)
+    expect(speechSynthesize).not.toHaveBeenCalled()
+    expect(speechTranscribe).not.toHaveBeenCalled()
+    expect((await request(allowed.token, synthPath, 'POST', { text: 'hello' })).body).toBe('mp3-audio')
+    expect(speechSynthesize).toHaveBeenCalledWith(expect.objectContaining({ text: 'hello' }), expect.objectContaining({ format: 'mp3' }))
+    // Speech alone does not authorize sending the recognized text.
+    expect((await request(allowed.token, '/api/studio/chat-run/runs', 'POST', { session_id: 's1', input: 'hello' })).status).toBe(403)
+    await service.change(7, 's1', allowed.record.id, { permissions: { voice: false } })
+    expect((await request(allowed.token, synthPath, 'POST', { text: 'hello' })).status).toBe(403)
+  })
+
+  it('uses the bound Profile active STT settings and rejects provider/options overrides', async () => {
+    const settings = await import('../../packages/server/src/modules/studio/public/voice-settings')
+    settings.saveSttProviderSetting('default', 'openai', { settings: { model: 'host-model' }, secrets: { apiKey: 'host-secret' } })
+    settings.saveActiveSttProvider('default', 'openai')
+    const allowed = await issue({ voice: true })
+    const result = await request(allowed.token, transcribePath, 'POST', audioBody, audioHeaders)
+    expect(result).toMatchObject({ status: 200, body: { text: 'recognized speech' } })
+    expect(speechTranscribe).toHaveBeenCalledWith(expect.objectContaining({ provider: 'openai', audio: Buffer.from('audio-bytes'), settings: expect.objectContaining({ model: 'host-model' }), secrets: expect.objectContaining({ apiKey: 'host-secret' }) }))
+    expect(JSON.stringify(result.body)).not.toContain('host-secret')
+    for (const name of ['provider', 'apiKey', 'profile']) {
+      const overridden = `--voice\r\nContent-Disposition: form-data; name="${name}"\r\n\r\nother\r\n` + audioBody
+      expect((await request(allowed.token, transcribePath, 'POST', overridden, audioHeaders)).status).toBe(400)
+    }
+    for (const body of [{ text: 'hello', provider: 'custom' }, { text: 'hello', options: { apiKey: 'evil', baseUrl: 'https://evil.test' } }, { text: 'hello', profile: 'other' }, { text: 'x'.repeat(5001) }]) {
+      expect((await request(allowed.token, synthPath, 'POST', body)).status).toBeGreaterThanOrEqual(400)
+    }
+    expect(speechTranscribe).toHaveBeenCalledTimes(1)
+    const { SttNoSpeechDetectedError } = await import('../../packages/server/src/modules/studio/services/voice/stt/types')
+    speechTranscribe.mockRejectedValueOnce(new SttNoSpeechDetectedError('no speech'))
+    expect(await request(allowed.token, transcribePath, 'POST', audioBody, audioHeaders)).toMatchObject({ status: 200, body: { text: '', provider: 'openai' } })
+    expect(speechSynthesize).not.toHaveBeenCalled()
+  })
+
+  it('aborts pending synthesis when voice permission is revoked', async () => {
+    const allowed = await issue({ voice: true })
+    let started!: () => void
+    const ready = new Promise<void>(resolve => { started = resolve })
+    let signal!: AbortSignal
+    speechSynthesize.mockImplementationOnce(({ signal: incoming }) => {
+      signal = incoming
+      started()
+      return new Promise((_resolve, reject) => incoming.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }))
+    })
+    const result = request(allowed.token, synthPath, 'POST', { text: 'hello' }).catch(error => error)
+    await ready
+    await service.change(7, 's1', allowed.record.id, { permissions: { voice: false } })
+    await result
+    await vi.waitFor(() => {
+      expect(signal.aborted).toBe(true)
+    })
   })
 })

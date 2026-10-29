@@ -220,6 +220,28 @@ describe('chat run webhooks', () => {
     expect(enqueue.mock.calls.every(([event]) => !('push_target_id' in event))).toBe(true)
   })
 
+  it('publishes main Person event types on the existing bus while keeping workers and HTTP webhooks private', async () => {
+    const service=await import('../../packages/server/src/modules/studio/services/webhooks/index')
+    const {businessEvents}=await import('../../packages/server/src/modules/studio/services/webhooks/business-events')
+    const enqueue=vi.spyOn(service.getChatWebhookDispatcher(),'enqueue').mockReturnValue(true)
+    const received:any[]=[]
+    const stop=businessEvents.subscribe('person-test',event=>{received.push(event);return true})
+    const base={sessionId:'person-main-1',profile:'default',source:'builtin_agent',agent:'ekko' as const,payload:{run_id:'r',output:'Report ready'}}
+    try {
+      for(const event of ['run.completed','run.failed','approval.requested','approval.resolved','clarify.requested','clarify.resolved']) {
+        expect(service.observeChatRunWebhookEvent({...base,event})).toBe(true)
+      }
+      expect(received.map(event=>event.type)).toEqual(['person.run.completed','person.run.failed','person.approval.requested',
+        'person.approval.resolved','person.clarification.requested','person.clarification.resolved'])
+      expect(received.every(event=>event.source==='person' && !event.chat)).toBe(true)
+      expect(enqueue).not.toHaveBeenCalled()
+      received.length=0
+      for(const event of ['run.completed','clarify.requested']) expect(service.observeChatRunWebhookEvent({...base,sessionId:'person-task-private',event})).toBe(false)
+      for(const event of ['tool.completed','message.created','plan.updated']) expect(service.observeChatRunWebhookEvent({...base,event})).toBe(false)
+      expect(received).toEqual([])
+    } finally {stop();enqueue.mockRestore()}
+  })
+
   it('normalizes terminal Chat Run events before enqueueing them', async () => {
     const webhookService = await import('../../packages/server/src/modules/studio/services/webhooks/index')
     const dispatcher = webhookService.getChatWebhookDispatcher()
@@ -259,7 +281,7 @@ describe('chat run webhooks', () => {
     enqueue.mockRestore()
   })
 
-  it('fans session notifications out from the unified webhook observer', async () => {
+  it('keeps HTTP webhook delivery active without forwarding session notifications to social media', async () => {
     const notifySessionPush = vi.fn(async () => 1)
     vi.doMock('../../packages/server/src/modules/studio/services/social-messages/session-push', () => ({
       notifySessionPush,
@@ -294,28 +316,13 @@ describe('chat run webhooks', () => {
       payload: { tool_call_id: 'tool-1' },
     })
 
-    await vi.waitFor(() => expect(notifySessionPush).toHaveBeenCalledTimes(3))
-    expect(notifySessionPush).toHaveBeenNthCalledWith(
-      1,
-      'session-push',
-      'run.completed',
-      { run_id: 'run-1', output: 'done' },
-      'bridge',
-    )
-    expect(notifySessionPush).toHaveBeenNthCalledWith(
-      2,
-      'session-push',
-      'approval.requested',
-      { approval_id: 'approval-1', command: 'npm test' },
-      'bridge',
-    )
-    expect(notifySessionPush).toHaveBeenNthCalledWith(
-      3,
-      'session-push',
-      'clarify.requested',
-      { clarify_id: 'clarify-1', question: 'Continue?' },
-      'bridge',
-    )
+    expect(enqueue.mock.calls.map(([event]) => event.type)).toEqual([
+      'chat.run.completed',
+      'chat.approval.requested',
+      'chat.clarification.requested',
+      'chat.tool.started',
+    ])
+    expect(notifySessionPush).not.toHaveBeenCalled()
     enqueue.mockRestore()
   })
 
@@ -389,6 +396,8 @@ describe('chat run webhooks', () => {
       const { publishGroupMessage, publishGroupInteraction, publishDomainEvent } = await import('../../packages/server/src/modules/studio/services/webhooks/domain-events')
       const room = { id: 'room', name: 'Room', summaryProfile: 'default' }
       publishGroupMessage(room, { id: 'message', senderType: 'agent', role: 'assistant', content: 'Group answer' }, [])
+      publishGroupMessage(room, { id: 'usage', senderType: 'agent', role: 'tool', tool_name: 'run_usage',
+        content: JSON.stringify({ runId: 'group-run', inputTokens: 1200, outputTokens: 200 }) }, [])
       publishGroupInteraction(room, 'group.clarification.requested', 'group-run', 'question')
       publishDomainEvent('workflow.run.completed', 'default', { workflow_id: 'workflow', run_id: 'workflow-run' }, { title: 'Workflow' })
       await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3))

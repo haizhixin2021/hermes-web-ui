@@ -55,11 +55,12 @@ Studio 向自身配置的 App 线路 `/api/app/auth/session-share-identity` 核�
 
 ## 现有接口的权限映射
 
-领取后的基本 `read` 权限可以读取绑定 session 的历史、上下文、用量并恢复消息流。七项可配置权限默认 false：
+领取后的基本 `read` 权限可以读取绑定 session 的历史、上下文、用量并恢复消息流。可配置权限默认 false：
 
 | 字段 | 现有接口或操作 |
 | --- | --- |
 | `input` | `POST /api/studio/chat-run/runs`；Socket `run`、`abort`、排队操作、批准和澄清回复 |
+| `voice` | 会话限定的语音识别、合成；App 语音输入和对话还需 `input` |
 | `upload` | `/api/studio/uploads` 和 `/api/studio/app-uploads` 的创建、分片、完成、取消 |
 | `download` | `/api/studio/files/download`、session 导出、`workspace-file/content?download=1` |
 | `workspaceRead` | session 的 `workspace-files/list`、文件读取、预览、diff 和运行文件变更 |
@@ -79,7 +80,7 @@ Studio 向自身配置的 App 线路 `/api/app/auth/session-share-identity` 核�
 
 额外目录格式为 `extraPaths: [{ path: "/absolute/directory", writable: false }]`，最多 16 项，必须存在且由本地超级管理员授权。`outsideWorkspace=true` 要求非空白名单。工作区和额外目录固定真实路径，文件入口检查路径穿越、符号链接越界及已知凭据路径（`.env*`、`.token`、`.model-run-token`、`auth.json`、`.ssh` 等）。rename/copy 同时校验两端。工作区改变后需重新分享。
 
-分享上传写入由服务端按 session 划分的附件目录；上传分片还绑定具体 share ID。`upload` 不等于工作区写权限。下载只允许授权工作区/额外目录或该 session 的分享上传目录，不能按任意路径读取整个 Profile 的附件。历史附件如位于这些范围之外，需要明确的目录授权，不根据聊天文本中的路径自动授权。
+分享上传写入由服务端按 session 划分的附件目录；上传分片还绑定具体 share ID。`upload` 不等于工作区写权限。下载只允许授权工作区/额外目录或该 session 的分享上传目录，不能按任意路径读取整个 Profile 的附件。会话附件会自动纳入文件访问范围，无需开启 `outsideWorkspace`：分享者发送的结构化上传附件按会话持久化登记；首次分享之前的历史结构化附件按文件匹配补录。普通聊天文本、Markdown 链接和其他会话附件不会产生授权。旧版本在首次分享之后写入且缺少可信归属的附件不自动补录。附件预览仍需 `workspaceRead`，下载仍需 `download`；自动纳入不授予目录浏览、工作区写入或删除权限。
 
 **按本功能约定，权限只限制 App 对接口的直接调用。Agent 和终端沿用既有执行权限，不引入文件系统或工具沙箱。** 开启 `input` 后，Agent 能执行原有工具；开启 `terminal` 后，shell 能执行宿主机账号允许的命令。因此 `outsideWorkspace=false` 不限制 Agent/shell 的间接文件访问，关闭 `download` 也不是对已显示内容的防复制措施。
 
@@ -102,3 +103,12 @@ App 保存分享连接和领取记录时按账号隔离，使用 `https://ekkost
 ## 验证
 
 相关测试包含 `session-shares`、`session-share-app-identity`、`session-shares-routes`、`session-share-access`、普通账号鉴权、排队执行、会话文件控制器、App 上传、Relay 和移动终端 Socket 测试。集成测试使用隔离 SQLite、临时目录和模拟云端身份/PTY，不创建真实分享或运行真实 Agent。
+
+## 语音权限
+
+`voice`（允许使用语音）默认关闭，旧分享记录也按关闭处理。开启后允许朗读回复；App 的语音输入和语音对话还需开启 `input`，识别后的文本发送继续执行原有 `input` 鉴权。
+
+- `POST /api/studio/sessions/:id/share-voice/synthesize`：仅接受 `{ text }`，最多 5,000 字符，输出 MP3。
+- `POST /api/studio/sessions/:id/share-voice/transcribe`：仅接受 multipart 单个 `audio` 文件，无需 `upload` 权限。
+
+Studio 使用分享绑定 Profile 已配置的语音服务，拒绝接收者指定 provider、凭据或 options，不开放全局语音设置。沿用语音请求体限制和中转媒体大小限制。关闭语音权限会中止服务端待完成请求，App 停止录音和播放，丢弃迟到结果。直连和云端中转均使用同一组会话限定接口。

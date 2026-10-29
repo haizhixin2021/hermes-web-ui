@@ -68,13 +68,18 @@ import ModelBreakdown from '@/components/hermes/usage/ModelBreakdown.vue'
 import AgentBreakdown from '@/components/hermes/usage/AgentBreakdown.vue'
 
 describe('usage cache visualizations', () => {
-  it('renders cache-read as a visible segment in the daily usage bars', () => {
+  it('separates cache reads from input/output and switches trend metrics', async () => {
     const wrapper = mount(DailyTrend)
-
+    expect(wrapper.find('.bar-segment.cache').exists()).toBe(false)
+    expect(wrapper.find('.bar-segment.input').attributes('style')).toContain('66.666')
+    await wrapper.find('[data-metric="cache"]').trigger('click')
     const cacheSegment = wrapper.find('.bar-segment.cache')
     expect(cacheSegment.exists()).toBe(true)
-    expect(cacheSegment.attributes('style')).toContain('height: 33.333%')
+    expect(cacheSegment.attributes('style')).toContain('height: 100%')
+    expect(wrapper.find('.bar-segment.input').exists()).toBe(false)
     expect(wrapper.text()).toContain('usage.cacheRead')
+    await wrapper.find('[data-metric="cost"]').trigger('click')
+    expect(wrapper.find('.bar-segment.cost').exists()).toBe(true)
   })
 
   it('renders model breakdown as input/output/cache stacked segments', () => {
@@ -91,10 +96,33 @@ describe('usage cache visualizations', () => {
   it('renders agent breakdown as input/output/cache stacked segments', () => {
     const wrapper = mount(AgentBreakdown)
 
-    expect(wrapper.text()).toContain('usage.agents.hermes')
-    expect(wrapper.find('.agent-swatch').attributes('style')).toContain('background: rgb(99, 179, 237)')
+    expect(wrapper.text()).toContain('Hermes')
+    expect(wrapper.find('.agent-details').text()).toContain('usage.cacheWrite 10')
+    expect(wrapper.find('.agent-details').text()).toContain('usage.sessions 2')
+    expect(wrapper.find('.agent-logo img').attributes('src')).toBe('/coding-agents/hermes.png')
     expect(wrapper.find('.agent-bar-segment.input').exists()).toBe(true)
     expect(wrapper.find('.agent-bar-segment.output').exists()).toBe(true)
     expect(wrapper.find('.agent-bar-segment.cache').attributes('style')).toContain('width: 33.333%')
+  })
+
+  it('uses the matching logos for usage aliases and zhezhe, with generated avatars for unknown agents', () => {
+    const original = mockUsageStore.agentUsage
+    mockUsageStore.agentUsage = ['zhezhe', 'claude_code', 'ekko_agent', 'qwen', 'future-cli', 'unknown']
+      .map(agent => ({ ...original[0], agent }))
+    try {
+      const wrapper = mount(AgentBreakdown)
+      for (const [agent, logo] of [
+        ['zhezhe', 'person.jpg'], ['claude_code', 'claude-code.svg'],
+        ['ekko_agent', 'ekko-agent.png'], ['qwen', 'qwen-logo.svg'],
+      ]) {
+        expect(wrapper.find(`[data-agent="${agent}"] .agent-logo img`).attributes('src')).toBe(`/coding-agents/${logo}`)
+      }
+      for (const agent of ['future-cli', 'unknown']) {
+        expect(wrapper.find(`[data-agent="${agent}"] .agent-logo img`).exists()).toBe(false)
+        expect(wrapper.find(`[data-agent="${agent}"] .agent-logo svg`).exists()).toBe(true)
+      }
+    } finally {
+      mockUsageStore.agentUsage = original
+    }
   })
 })

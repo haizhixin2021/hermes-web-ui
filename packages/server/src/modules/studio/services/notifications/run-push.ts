@@ -1,5 +1,5 @@
 import { notificationPreview } from './notification-preview'
-import { getSessionContextMessage } from '../../repositories/session-store'
+import { chatCompletionText } from './chat-completion-text'
 import { listAppConnections } from '../../repositories/app-connections-store'
 import { findUserById } from '../../repositories/users-store'
 import { listUserPushDevices, removeUserPushDevice } from '../../repositories/user-push-store'
@@ -9,6 +9,8 @@ import { appEventEnvelope, canReceiveAppEvent } from '../webhooks/app-events'
 import { decryptPushSecret } from './push-secrets'
 
 const PUSH_EVENTS: Record<string, 'completion' | 'failure' | 'approval' | 'interaction'> = {
+  'person.run.completed': 'completion', 'person.run.failed': 'failure',
+  'person.approval.requested': 'approval', 'person.clarification.requested': 'interaction',
   'chat.run.completed': 'completion', 'chat.run.failed': 'failure',
   'chat.approval.requested': 'approval', 'chat.clarification.requested': 'interaction',
   'group.message.created': 'completion', 'group.run.failed': 'failure',
@@ -51,21 +53,17 @@ export function createRunPushConsumer(send: typeof fetch = (...args) => fetch(..
         if (attempted.has(key)) return
         attempted.add(key)
         if (attempted.size > 5000) attempted.delete(attempted.values().next().value!)
-        const messageId = Number(event.subject.message_id)
-        const exactMessage = event.type === 'chat.run.completed' && Number.isSafeInteger(messageId)
-          ? getSessionContextMessage(subjectId, messageId) : null
-        const currentOutput = typeof payload.output === 'string' && payload.output
-          ? payload.output : exactMessage?.role === 'assistant' ? exactMessage.display_content || exactMessage.content : ''
+        const currentOutput = chatCompletionText(event)
         const response = await send(pushUrl, {
           method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${registration.push_token}` },
           body: JSON.stringify({ schema_version: 1, event_id: event.id, event_type: kind,
             recipient: { platform: 'ios', app_id: registration.app_id,
               apns_environment: registration.apns_environment, apns_token: registration.apns_token },
-            // Explicit server opt-in; default retains the existing privacy boundary.
+            // Preview is enabled by default; set 0 to keep notification content private.
             // Custom content requires a gateway that honors notification title/body.
-            notification: process.env.STUDIO_PUSH_CONTENT_PREVIEW === '1'
-              ? notificationPreview(event.type === 'chat.run.completed'
+            notification: process.env.STUDIO_PUSH_CONTENT_PREVIEW !== '0'
+              ? notificationPreview(event.type === 'chat.run.completed' || event.type === 'person.run.completed'
                 ? { ...('display' in envelope ? envelope.display as Record<string, unknown> : {}), content: currentOutput, preview: '' }
                 : 'display' in envelope ? envelope.display : undefined, kind === 'completion')
               : { title: '', body: '' },

@@ -1,4 +1,5 @@
 import { parseGroupTaskPlanMessage, isOlderGroupTaskPlan } from '@/utils/task-plan'
+import { parseGroupRunUsageMessage } from '@/utils/run-usage'
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useSettingsStore } from './settings'
@@ -13,6 +14,8 @@ import { getActiveProfileName, getStoredUsername } from '@/api/client'
 import { fetchCurrentUser } from '@/api/studio/auth'
 import { formatMessageWithReference, type Attachment, type ContentBlock, type MessageReference } from './chat'
 import {
+    deleteGroupMessages as deleteGroupMessagesApi,
+    type GroupMessagesDeleted,
     connectGroupChat,
     disconnectGroupChat,
     getSocket,
@@ -22,10 +25,12 @@ import {
     type RoomAgent,
     type RoomAgentSummary,
     type GroupAgentActivity,
+    type GroupMessageRoutingDecision,
     type RoomAgentHandoffChain,
     type RoomAgentInput,
     type RoomSummaryConfig,
     type RoomSummaryState,
+    type RoomSummaryReview,
     type ChatMessage,
     type GroupChatMention,
     type GroupExecutionQueueItem,
@@ -185,6 +190,37 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     const currentRoomId = ref<string | null>(null)
     const rooms = ref<RoomInfo[]>([])
     const messages = ref<ChatMessage[]>([])
+    const messageDeletionRevisions = ref(new Map<string, number>())
+    const deletedMessageIds = new Map<string, Set<string>>()
+    const deletionHistoryNeedsReload = new Set<string>()
+
+    function applyMessagesDeleted(data: GroupMessagesDeleted) {
+        if (!data.roomId || !Array.isArray(data.messageIds)
+            || data.messageDeletionRevision <= (messageDeletionRevisions.value.get(data.roomId) || 0)) return
+        if (data.messageDeletionRevision > (messageDeletionRevisions.value.get(data.roomId) || 0) + 1) deletionHistoryNeedsReload.add(data.roomId)
+        messageDeletionRevisions.value.set(data.roomId, data.messageDeletionRevision)
+        const removed = deletedMessageIds.get(data.roomId) || new Set<string>()
+        for (const id of data.messageIds) removed.add(id)
+        deletedMessageIds.set(data.roomId, removed)
+        const room = rooms.value.find(item => item.id === data.roomId)
+        if (room) { room.totalTokens = data.totalTokens; room.messageDeletionRevision = data.messageDeletionRevision }
+        const reference = messageReferences.value.get(data.roomId)
+        if (reference && removed.has(reference.id)) clearMessageReference(data.roomId)
+        if (data.roomId !== currentRoomId.value) return
+        flushPendingStreamDeltas(data.roomId)
+        messages.value = messages.value.filter(message => !removed.has(message.id))
+        loadedMessageCount.value = messages.value.length
+        totalMessages.value = data.messageCount
+        hasMoreBefore.value = loadedMessageCount.value < totalMessages.value
+        for (const id of data.messageIds) messageRoutingDecisions.value.delete(id)
+        for (const [id, chain] of handoffChains.value) if (removed.has(chain.sourceMessageId)) handoffChains.value.delete(id)
+    }
+
+    async function deleteMessages(roomId: string, ids: string[], revision: string) {
+        const result = await deleteGroupMessagesApi(roomId, ids, revision)
+        applyMessagesDeleted(result)
+        return result
+    }
     const pendingStreamDeltas = new Map<string, {
         roomId: string
         messageId: string
@@ -209,8 +245,10 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     const contextStatuses = ref<Map<string, { agentName: string; status: string }>>(new Map())
     const activeAgentRuns = ref<Map<string, GroupAgentActivity>>(new Map())
     const roomSummaryStates = ref<Map<string, RoomSummaryState>>(new Map())
+    const roomSummaryReviews = ref<Map<string, RoomSummaryReview>>(new Map())
     const handoffChains = ref<Map<string, RoomAgentHandoffChain>>(new Map())
     const executionQueue = ref<GroupExecutionQueueItem[]>([])
+    const messageRoutingDecisions = ref<Map<string, GroupMessageRoutingDecision>>(new Map())
     const autoPlaySpeechEnabled = ref(false)
     const pendingApprovals = ref<Map<string, GroupPendingApproval>>(new Map())
     const pendingClarifies = ref<Map<string, GroupPendingClarify>>(new Map())
@@ -605,6 +643,20 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         roomSummaryStates.value = new Map(roomSummaryStates.value)
     }
 
+    async function acceptRoutingSuggestion(messageId: string): Promise<void> {
+        const socket = getSocket(); const roomId = currentRoomId.value
+        if (!socket || !roomId) throw new Error('Group chat socket not connected')
+        await new Promise<void>((resolve, reject) => socket.emit('accept_routing_suggestion', { roomId, messageId }, (res?: { ok?: boolean; error?: string }) => res?.ok ? resolve() : reject(new Error(res?.error || 'Suggestion failed'))))
+    }
+
+    function applyRoomSummaryReview(review: RoomSummaryReview) {
+        if (!review?.roomId) return
+        const previous = roomSummaryReviews.value.get(review.roomId)
+        if (previous && (previous.createdAt > review.createdAt || previous.sourceVersion > review.sourceVersion)) return
+        roomSummaryReviews.value.set(review.roomId, review)
+        roomSummaryReviews.value = new Map(roomSummaryReviews.value)
+    }
+
     function clearCurrentRoomTransientState() {
         emitStopTyping()
         clearRemoteTypingState()
@@ -683,7 +735,23 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         if (changed) historicalMessageAgents.value = [...historicalById.values()]
     }
 
-    function applyRealtimeJoinState(res: any, options: { syncMessages?: boolean } = {}) {
+    function applyRealtimeJoinState(res: any, options: { syncMessages?: boolean; cachedMessageIds?: Set<string>; deletionRevision?: number } = {}) {
+        const staleDeletionSnapshot = res.roomId && Number(res.messageDeletionRevision || 0)
+            < (messageDeletionRevisions.value.get(res.roomId) || 0)
+        if (options.syncMessages && res.roomId) {
+            const revision = Number(res.messageDeletionRevision || 0)
+            const previous = messageDeletionRevisions.value.get(res.roomId) || 0
+            if (revision < (options.deletionRevision || 0)) return
+            // Compare with the request boundary, since a newer deletion event may
+            // arrive before this join acknowledgement. Retain new live messages.
+            if (revision > (options.deletionRevision ?? previous) || deletionHistoryNeedsReload.has(res.roomId)) {
+                messages.value = options.cachedMessageIds
+                    ? messages.value.filter(message => !options.cachedMessageIds!.has(message.id))
+                    : []
+                if (revision >= previous) deletionHistoryNeedsReload.delete(res.roomId)
+            }
+            messageDeletionRevisions.value.set(res.roomId, Math.max(previous, revision))
+        }
         members.value = res.members || []
         if (res.agents) {
             snapshotCurrentMessageAgents(agents.value)
@@ -702,6 +770,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             captureHistoricalMessageAgents(res.messages)
             const byId = new Map(messages.value.map(message => [message.id, message]))
             for (const message of res.messages) {
+                if (deletedMessageIds.get(res.roomId)?.has(message.id)) continue
                 const existing = byId.get(message.id)
                 if (existing && isOlderGroupTaskPlan(existing, message)) continue
                 const isStreaming = message.isStreaming === true || message.finish_reason === 'streaming'
@@ -712,7 +781,10 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                     : mergeFinalMessage(existing || null, message))
             }
             messages.value = Array.from(byId.values()).sort((a, b) => a.timestamp - b.timestamp)
-            if (typeof res.total === 'number' || typeof res.hasMore === 'boolean') {
+            if (staleDeletionSnapshot) {
+                loadedMessageCount.value = messages.value.length
+                hasMoreBefore.value = loadedMessageCount.value < totalMessages.value
+            } else if (typeof res.total === 'number' || typeof res.hasMore === 'boolean') {
                 applyMessagePaging(res)
             } else {
                 loadedMessageCount.value = Math.max(loadedMessageCount.value, messages.value.length)
@@ -740,6 +812,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         }
         if (res.roomSummary?.roomId === currentRoomId.value) applyRoomSummaryState(res.roomSummary)
         executionQueue.value = Array.isArray(res.executionQueue) ? res.executionQueue : []
+        messageRoutingDecisions.value = new Map((Array.isArray(res.routingDecisions) ? res.routingDecisions : []).map((decision: GroupMessageRoutingDecision) => [decision.messageId, decision]))
         if (typeof res.roomId === 'string' && res.roomId) {
             replaceRoomPendingInteractions(res.roomId, res.pendingApprovals, res.pendingClarifies)
         }
@@ -808,6 +881,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         const storedAvatar = getStoredGroupUserAvatar()
 
         const joinGeneration = connectionGeneration
+        const cachedMessageIds = new Set(messages.value.map(message => message.id))
+        const deletionRevision = messageDeletionRevisions.value.get(roomId) || 0
         const joinPromise = new Promise<void>((resolve, reject) => {
             let settled = false
             const timeout = setTimeout(() => {
@@ -849,7 +924,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                     finish(() => reject(joinError))
                     return
                 }
-                applyRealtimeJoinState(res, options)
+                applyRealtimeJoinState(res, { ...options, cachedMessageIds, deletionRevision })
                 realtimeJoinedRoomId.value = roomId
                 realtimeJoinedSocketId.value = socketId
                 finish(resolve)
@@ -996,7 +1071,10 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             realtimeJoinedSocketId.value = null
         })
 
+        socket.on('messages_deleted', applyMessagesDeleted)
+
         socket.on('message', (msg: ChatMessage) => {
+            if (deletedMessageIds.get(msg.roomId)?.has(msg.id)) return
             if (msg.role !== 'tool' && msg.finish_reason !== 'streaming') {
                 recordPersistedRoomActivity(msg.roomId, Number(msg.persistedAt || msg.timestamp || 0))
             }
@@ -1038,6 +1116,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         })
 
         socket.on('message_stream_start', (msg: ChatMessage) => {
+            if (deletedMessageIds.get(msg.roomId)?.has(msg.id)) return
             if (msg.roomId !== currentRoomId.value) return
             flushPendingStreamDeltas(msg.roomId, msg.id)
             messages.value = messages.value.filter(m => !(
@@ -1210,7 +1289,9 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             hasMoreBefore.value = loadedMessageCount.value < totalMessages.value
         })
 
+        socket.on('message_routing_updated', (decision: GroupMessageRoutingDecision) => { messageRoutingDecisions.value.set(decision.messageId, decision); messageRoutingDecisions.value = new Map(messageRoutingDecisions.value) })
         socket.on('room_summary_updated', applyRoomSummaryState)
+        socket.on('room_summary_review_updated', applyRoomSummaryReview)
 
         socket.on('handoff_updated', (chain: RoomAgentHandoffChain) => {
             if (!chain?.chainId || chain.roomId !== currentRoomId.value) return
@@ -1414,7 +1495,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             roomName.value = res.room.name
             historicalMessageAgents.value = []
             captureHistoricalMessageAgents(res.messages)
-            messages.value = res.messages
+            messages.value = res.messages.filter(message => !deletedMessageIds.get(res.room.id)?.has(message.id))
+            messageDeletionRevisions.value.set(res.room.id, Math.max(messageDeletionRevisions.value.get(res.room.id) || 0, Number(res.room.messageDeletionRevision || 0)))
             handoffChains.value = new Map((res.handoffChains || []).map(chain => [chain.chainId, chain]))
             applyMessagePaging(res)
             agents.value = res.agents
@@ -1433,6 +1515,8 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     async function loadOlderMessages(): Promise<boolean> {
         const roomId = currentRoomId.value
         if (!roomId || isLoadingOlderMessages.value || !hasMoreBefore.value) return false
+        const deletionRevision = messageDeletionRevisions.value.get(roomId) || 0
+        const selectionSequence = roomSelectionSequence
         const before = messages.value[0]?.id
         if (!before) return false
         isLoadingOlderMessages.value = true
@@ -1456,10 +1540,11 @@ export const useGroupChatStore = defineStore('groupChat', () => {
                     })
                 })
                 : await getRoomDetail(roomId, { before, limit, history: true })
-            if (currentRoomId.value !== roomId) return false
+            if (currentRoomId.value !== roomId || selectionSequence !== roomSelectionSequence
+                || deletionRevision !== (messageDeletionRevisions.value.get(roomId) || 0)) return false
             const existingIds = new Set(messages.value.map(message => message.id))
             captureHistoricalMessageAgents(res.messages)
-            const olderMessages = res.messages.filter(message => !existingIds.has(message.id))
+            const olderMessages = res.messages.filter(message => !existingIds.has(message.id) && !deletedMessageIds.get(roomId)?.has(message.id))
             messages.value = [...olderMessages, ...messages.value]
             loadedMessageCount.value = messages.value.length
             totalMessages.value = res.total ?? totalMessages.value
@@ -1994,9 +2079,15 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         contextStatuses,
         activeAgentRuns,
         roomSummaryStates,
+        roomSummaryReviews,
         applyRoomSummaryState,
+        applyRoomSummaryReview,
         handoffChains,
         executionQueue,
+        messageDeletionRevisions,
+        deleteMessages,
+        messageRoutingDecisions,
+        acceptRoutingSuggestion,
         pendingApprovals,
         pendingClarifies,
         activePendingApproval,
@@ -2227,6 +2318,11 @@ function mapGroupMessages(msgs: ChatMessage[], activeAgentNames = new Set<string
         const taskPlan = parseGroupTaskPlanMessage(msg)
         if (taskPlan) {
             result.push({ ...msg, role: 'assistant', content: '', taskPlan })
+            continue
+        }
+        const runUsage = parseGroupRunUsageMessage(msg)
+        if (runUsage) {
+            result.push({ ...msg, role: 'assistant', content: '', runUsage })
             continue
         }
         if (msg.role === 'tool') {

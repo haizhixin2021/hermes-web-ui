@@ -1,6 +1,6 @@
 import { getDb } from '../infrastructure/database'
 import { SESSION_SHARES_TABLE } from '../infrastructure/database/schemas'
-import { SessionShareError, type SessionShareRecord, type SessionShareAppUser } from '../contracts/session-shares'
+import { sharePermissions, SessionShareError, type SessionShareRecord, type SessionShareAppUser } from '../contracts/session-shares'
 
 function db() {
   const value = getDb()
@@ -12,7 +12,7 @@ function db() {
 
 function decode(row: any): SessionShareRecord | null {
   if (!row) return null
-  return { ...row, permissions: JSON.parse(row.permissions), extra_paths: JSON.parse(row.extra_paths) }
+  return { ...row, permissions: sharePermissions(JSON.parse(row.permissions)), extra_paths: JSON.parse(row.extra_paths) }
 }
 
 export const sessionSharesStore = {
@@ -29,7 +29,7 @@ export const sessionSharesStore = {
     return decode(db().prepare(`SELECT * FROM ${SESSION_SHARES_TABLE} WHERE token_hash = ?`).get(hash))
   },
   list(sessionId: string, ownerId: number): SessionShareRecord[] {
-    return db().prepare(`SELECT * FROM ${SESSION_SHARES_TABLE} WHERE session_id = ? AND created_by_user_id = ? ORDER BY created_at DESC, id`)
+    return db().prepare(`SELECT * FROM ${SESSION_SHARES_TABLE} WHERE session_id = ? AND created_by_user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC, id`)
       .all(sessionId, ownerId).map(row => decode(row)!)
   },
   claim(id: string, actor: SessionShareAppUser, now: number): SessionShareRecord | null {

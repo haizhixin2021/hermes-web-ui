@@ -20,6 +20,7 @@ const chatApi = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/studio/chat', () => ({
+  onUnobservedRunStarted: vi.fn(() => vi.fn()),
   startRunViaSocket: chatApi.startRunViaSocket,
   resumeSession: chatApi.resumeSession,
   registerSessionHandlers: chatApi.registerSessionHandlers,
@@ -39,6 +40,7 @@ vi.mock('@/api/studio/chat', () => ({
     chatApi.sessionTitleUpdatedHandlers.push(handler)
     return vi.fn()
   }),
+  onRunUsageUpdated: vi.fn(() => vi.fn()),
   onSessionWorkspaceUpdated: vi.fn((handler: (event: any) => void) => {
     chatApi.sessionWorkspaceUpdatedHandlers.push(handler)
     return vi.fn()

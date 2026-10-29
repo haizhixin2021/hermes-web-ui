@@ -1,11 +1,13 @@
 <script setup lang="ts">
+import RunUsageCard from "./RunUsageCard.vue";
+import PersonTaskReturnCard from '../person/PersonTaskReturnCard.vue';
 import {
   formatReferencedContentForDisplay,
   parseMessageReference,
   type Message,
   type ContentBlock,
 } from "@/stores/hermes/chat";
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 import { useMessage } from "naive-ui";
 import { downloadFile, getDownloadUrl } from "@/api/studio/download";
@@ -35,8 +37,7 @@ import { isServerTtsProvider } from "@/api/studio/tts";
 import type { ProfileAvatar as ProfileAvatarData } from "@/api/hermes/profiles";
 import ProfileAvatar from "@/components/hermes/profiles/ProfileAvatar.vue";
 import ImagePreviewOverlay from "./ImagePreviewOverlay.vue";
-
-const MarkdownRenderer = defineAsyncComponent(async () => (await import("./MarkdownRenderer.vue")).default);
+import MarkdownRenderer from "./MarkdownRenderer.vue";
 
 const TOOL_PAYLOAD_DISPLAY_LIMIT = 1000;
 const JSON_STRING_DISPLAY_LIMIT = 200;
@@ -48,6 +49,8 @@ const JSON_TRUNCATED_KEY = "__truncated__";
 
 const props = withDefaults(defineProps<{
   message: Message
+  hideRunUsage?: boolean
+  hideReasoning?: boolean
   highlight?: boolean
   headingIdPrefix?: string
   showForkAction?: boolean
@@ -67,6 +70,15 @@ const isAgentError = computed(() => props.message.role === "assistant" && props.
 const effectiveHeadingIdPrefix = computed(() => props.headingIdPrefix || `msg-${props.message.id}`);
 const isCommandMessage = computed(() => props.message.role === "command" || props.message.systemType === "command");
 const isCommandError = computed(() => props.message.role === "command" && props.message.systemType === "error");
+const commandResultContent = computed(() => {
+  const data = props.message.commandData || {};
+  const key = String(data.messageKey || "");
+  if (!["nativeUsage", "nativeUsageUnknown", "nativeContextUnknown", "nativeContextEstimate", "nativeCompactUnavailable"].includes(key)) {
+    return props.message.content;
+  }
+  const params = Object.fromEntries(Object.entries(data).filter(([, value]) => typeof value === "string" || typeof value === "number"));
+  return t(`codingAgents.${key}`, params);
+});
 const isStatusCommand = computed(() =>
   isCommandMessage.value
   && props.message.commandAction === "status"
@@ -993,7 +1005,7 @@ onBeforeUnmount(() => {
           class="tool-details-expand"
         >
           <div class="tool-details" @click="handleToolDetailClick">
-            <div v-if="message.reasoning?.trim()" class="tool-detail-section">
+            <div v-if="!hideReasoning && message.reasoning?.trim()" class="tool-detail-section">
               <div class="tool-detail-label">{{ t("chat.thinkingLabel") }}</div>
               <div class="tool-detail-reasoning">
                 <MarkdownRenderer :content="message.reasoning" />
@@ -1026,6 +1038,7 @@ onBeforeUnmount(() => {
           <div v-if="message.role === 'assistant'" class="message-author assistant-message-author">
             <img
               class="msg-avatar"
+              :class="{ 'msg-avatar--person': assistantAgent.label === 'zhezhe' }"
               :src="assistantAgent.src"
               :alt="assistantAgent.label"
               draggable="false"
@@ -1105,7 +1118,7 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div
-              v-if="hasThinking"
+              v-if="!hideReasoning && hasThinking"
               class="thinking-block"
               :class="{ expanded: thinkingExpanded }"
             >
@@ -1212,10 +1225,13 @@ onBeforeUnmount(() => {
 
             <!-- Render assistant message content -->
             <MarkdownRenderer
-              v-if="message.role === 'assistant' && message.content && !parsedThinking.body"
+              v-if="message.role === 'assistant' && message.content && !parsedThinking.body && !(hideReasoning && hasThinking)"
               :content="message.content"
               :heading-id-prefix="effectiveHeadingIdPrefix"
             />
+
+            <PersonTaskReturnCard v-if="message.personTaskReturn && !message.isStreaming" :result="message.personTaskReturn" />
+            <RunUsageCard v-if="!hideRunUsage && message.runUsage && !message.isStreaming" :usage="message.runUsage" />
 
             <ToolChangeCard
               v-for="change in workspaceChanges"
@@ -1252,7 +1268,7 @@ onBeforeUnmount(() => {
             </div>
             <div v-else-if="isCommandMessage && message.content" class="command-result">
               <span class="command-result-icon">/</span>
-              <MarkdownRenderer :content="message.content" />
+              <MarkdownRenderer :content="commandResultContent" />
             </div>
 
             <span v-if="message.isStreaming && !message.content" class="streaming-dots">
@@ -1349,15 +1365,15 @@ onBeforeUnmount(() => {
     }
 
     .message-bubble {
-      background-color: $msg-user-bg;
-      border-radius: 10px;
+      background-color: var(--theme-userMessage-bg, $msg-user-bg);
+      border-radius: var(--radius-component, 10px);
     }
   }
 
   &.assistant {
     flex-direction: row;
     align-items: flex-start;
-    gap: 8px;
+    gap: calc(8px * var(--spacing-scale, 1));
 
     .msg-body {
       max-width: 80%;
@@ -1370,20 +1386,21 @@ onBeforeUnmount(() => {
       height: 22px;
       flex-shrink: 0;
       box-sizing: border-box;
-      border: 1px solid #fff;
+      border: var(--border-width, 1px) solid #fff;
       border-radius: 50%;
       object-fit: cover;
+      &--person { aspect-ratio: 1; border-radius: 4px; object-fit: cover; border: 0; }
     }
 
     .message-bubble {
-      background-color: $msg-assistant-bg;
-      border-radius: 10px;
+      background-color: var(--theme-assistantMessage-bg, $msg-assistant-bg);
+      border-radius: var(--radius-component, 10px);
     }
 
     .message-bubble.agent-error {
       color: $error;
       background-color: rgba(var(--error-rgb), 0.06);
-      border: 1px solid rgba(var(--error-rgb), 0.2);
+      border: var(--border-width, 1px) solid rgba(var(--error-rgb), 0.2);
     }
   }
 
@@ -1421,7 +1438,7 @@ onBeforeUnmount(() => {
 .msg-body {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: calc(8px * var(--spacing-scale, 1));
   max-width: 85%;
   min-width: 0;
   box-sizing: border-box;
@@ -1438,12 +1455,12 @@ onBeforeUnmount(() => {
 .message-author {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: calc(6px * var(--spacing-scale, 1));
   max-width: 100%;
   margin-bottom: 6px;
   color: $text-secondary;
-  font-size: 12px;
-  line-height: 22px;
+  font-size: calc(var(--font-size-base, 14px) * 12 / 14);
+  line-height: var(--line-height, calc(var(--font-size-base, 14px) * 22 / 14));
 }
 
 .user-message-author {
@@ -1466,16 +1483,16 @@ onBeforeUnmount(() => {
 
 .user-profile-avatar {
   box-sizing: border-box;
-  border: 1px solid #fff;
+  border: var(--border-width, 1px) solid #fff;
 }
 
 .message-bubble {
-  padding: 10px 14px;
+  padding: calc(10px * var(--spacing-scale, 1)) calc(14px * var(--spacing-scale, 1));
   font-size: var(--font-size-base);
-  line-height: 1.65;
+  line-height: var(--line-height, 1.65);
   word-break: break-word;
   overflow-wrap: anywhere;
-  border-radius: 10px;
+  border-radius: var(--radius-component, 10px);
   max-width: 100%;
   min-width: 0;
   position: relative;
@@ -1490,11 +1507,11 @@ onBeforeUnmount(() => {
 
   &.command {
     border-inline-start: none;
-    border: 1px solid rgba(var(--accent-primary-rgb), 0.12);
+    border: var(--border-width, 1px) solid rgba(var(--accent-primary-rgb), 0.12);
     background-color: rgba(var(--accent-primary-rgb), 0.04);
     color: $text-secondary;
     max-width: min(100%, 960px);
-    padding: 8px 10px;
+    padding: calc(8px * var(--spacing-scale, 1)) calc(10px * var(--spacing-scale, 1));
   }
 
   &.command-error {
@@ -1505,7 +1522,7 @@ onBeforeUnmount(() => {
   &.agent-error {
     color: $error;
     background-color: rgba(var(--error-rgb), 0.06);
-    border: 1px solid rgba(var(--error-rgb), 0.2);
+    border: var(--border-width, 1px) solid rgba(var(--error-rgb), 0.2);
 
     :deep(.markdown-body),
     :deep(.markdown-body p),
@@ -1527,16 +1544,16 @@ onBeforeUnmount(() => {
 
 :global(html.theme-has-custom-background .message.user .message-bubble:not(.system):not(.command):not(.agent-error)),
 :global(html.theme-has-custom-background .message.assistant .message-bubble:not(.system):not(.command):not(.agent-error)) {
-  background-color: rgba(var(--bg-main-surface-rgb), 0.78);
-  border: 1px solid rgba(var(--text-primary-rgb), 0.18);
-  -webkit-backdrop-filter: blur(8px) saturate(110%);
-  backdrop-filter: blur(8px) saturate(110%);
+  background-color: var(--message-theme-bg, rgba(var(--bg-main-surface-rgb), 0.78));
+  border: var(--border-width, 1px) solid rgba(var(--text-primary-rgb), 0.18);
+  -webkit-backdrop-filter: var(--message-theme-filter, blur(8px) saturate(110%));
+  backdrop-filter: var(--message-theme-filter, blur(8px) saturate(110%));
 }
 
 .command-result {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: calc(8px * var(--spacing-scale, 1));
   min-width: 0;
 
   :deep(.markdown-body) {
@@ -1555,7 +1572,7 @@ onBeforeUnmount(() => {
 .command-status-grid {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: calc(8px * var(--spacing-scale, 1));
   min-width: 0;
   overflow-x: auto;
   white-space: nowrap;
@@ -1565,24 +1582,24 @@ onBeforeUnmount(() => {
 .command-status-item {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: calc(4px * var(--spacing-scale, 1));
   flex: 0 0 auto;
-  padding: 2px 7px;
-  border: 1px solid rgba(var(--accent-primary-rgb), 0.1);
+  padding: calc(2px * var(--spacing-scale, 1)) calc(7px * var(--spacing-scale, 1));
+  border: var(--border-width, 1px) solid rgba(var(--accent-primary-rgb), 0.1);
   border-radius: 999px;
   background: rgba(var(--accent-primary-rgb), 0.035);
-  line-height: 1.4;
+  line-height: var(--line-height, 1.4);
 }
 
 .command-status-key {
   color: $text-muted;
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
 }
 
 .command-status-value {
   color: $text-primary;
-  font-family: $font-code;
-  font-size: 11px;
+  font-family: var(--font-code, $font-code);
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
 }
 
 .command-result-icon {
@@ -1595,9 +1612,9 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: rgba(var(--accent-primary-rgb), 0.1);
   color: $accent-primary;
-  font-family: $font-code;
-  font-size: 12px;
-  line-height: 1;
+  font-family: var(--font-code, $font-code);
+  font-size: calc(var(--font-size-base, 14px) * 12 / 14);
+  line-height: var(--line-height, 1);
   margin-top: 2px;
 }
 
@@ -1649,7 +1666,7 @@ onBeforeUnmount(() => {
 .msg-attachments {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: calc(8px * var(--spacing-scale, 1));
   margin-bottom: 8px;
 }
 
@@ -1657,7 +1674,7 @@ onBeforeUnmount(() => {
   border-radius: $radius-sm;
   overflow: hidden;
   background-color: rgba(0, 0, 0, 0.04);
-  border: 1px solid $border-light;
+  border: var(--border-width, 1px) solid $border-light;
 
   &.image {
     max-width: 200px;
@@ -1698,11 +1715,11 @@ onBeforeUnmount(() => {
 .msg-attachment-video-footer {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
+  gap: calc(8px * var(--spacing-scale, 1));
+  padding: calc(7px * var(--spacing-scale, 1)) calc(10px * var(--spacing-scale, 1));
   color: $text-secondary;
   background: rgba(0, 0, 0, 0.04);
-  font-size: 12px;
+  font-size: calc(var(--font-size-base, 14px) * 12 / 14);
 
   .att-name {
     min-width: 0;
@@ -1715,16 +1732,16 @@ onBeforeUnmount(() => {
   .att-size {
     flex-shrink: 0;
     color: $text-muted;
-    font-size: 11px;
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
   }
 }
 
 .msg-attachment-context {
   max-width: 420px;
-  padding: 7px 9px;
-  border-top: 1px solid $border-light;
+  padding: calc(7px * var(--spacing-scale, 1)) calc(9px * var(--spacing-scale, 1));
+  border-top: var(--border-width, 1px) solid $border-light;
   color: $text-secondary;
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
 
   summary { cursor: pointer; user-select: none; }
   pre { max-height: 200px; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.45 monospace; }
@@ -1733,9 +1750,9 @@ onBeforeUnmount(() => {
 .msg-attachment-file {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  font-size: 12px;
+  gap: calc(6px * var(--spacing-scale, 1));
+  padding: calc(6px * var(--spacing-scale, 1)) calc(10px * var(--spacing-scale, 1));
+  font-size: calc(var(--font-size-base, 14px) * 12 / 14);
   color: $text-secondary;
 
   .att-name {
@@ -1747,24 +1764,24 @@ onBeforeUnmount(() => {
 
   .att-size {
     color: $text-muted;
-    font-size: 11px;
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
     flex-shrink: 0;
   }
 }
 
 .thinking-block {
   margin-bottom: 8px;
-  padding: 4px 0;
-  border-bottom: 1px dashed $border-light;
+  padding: calc(4px * var(--spacing-scale, 1)) 0;
+  border-bottom: var(--border-width, 1px) dashed $border-light;
 
   .thinking-header {
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 11px;
+    gap: calc(6px * var(--spacing-scale, 1));
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
     color: $text-muted;
     cursor: pointer;
-    padding: 2px 4px;
+    padding: calc(2px * var(--spacing-scale, 1)) calc(4px * var(--spacing-scale, 1));
     border-radius: $radius-sm;
     user-select: none;
 
@@ -1783,7 +1800,7 @@ onBeforeUnmount(() => {
   }
 
   .thinking-icon {
-    font-size: 11px;
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
     flex-shrink: 0;
   }
 
@@ -1799,9 +1816,9 @@ onBeforeUnmount(() => {
 
   .thinking-body {
     margin-top: 6px;
-    padding: 6px 10px;
+    padding: calc(6px * var(--spacing-scale, 1)) calc(10px * var(--spacing-scale, 1));
     border-inline-start: 2px solid $border-light;
-    font-size: 13px;
+    font-size: calc(var(--font-size-base, 14px) * 13 / 14);
     opacity: 0.85;
     font-style: italic;
 
@@ -1812,9 +1829,9 @@ onBeforeUnmount(() => {
 .message-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: calc(6px * var(--spacing-scale, 1));
   margin-top: 4px;
-  padding: 0 4px;
+  padding: 0 calc(4px * var(--spacing-scale, 1));
   color: $text-muted;
   opacity: 0;
   transition: opacity 0.15s ease;
@@ -1875,7 +1892,7 @@ onBeforeUnmount(() => {
 }
 
 .message-time {
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
   color: inherit;
   user-select: none;
 }
@@ -1883,10 +1900,10 @@ onBeforeUnmount(() => {
 .tool-line {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 11px;
+  gap: calc(6px * var(--spacing-scale, 1));
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
   color: $text-muted;
-  padding: 2px 4px;
+  padding: calc(2px * var(--spacing-scale, 1)) calc(4px * var(--spacing-scale, 1));
   border-radius: $radius-sm;
   min-width: 0;
   max-width: 100%;
@@ -1913,7 +1930,7 @@ onBeforeUnmount(() => {
   }
 
   .tool-name {
-    font-family: $font-code;
+    font-family: var(--font-code, $font-code);
     flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
@@ -1978,7 +1995,7 @@ onBeforeUnmount(() => {
   margin-inline-start: 16px;
   margin-top: 2px;
   border-inline-start: 2px solid $border-light;
-  padding-inline-start: 10px;
+  padding-inline-start: calc(10px * var(--spacing-scale, 1));
 }
 
 .tool-detail-expand-enter-active,
@@ -2008,7 +2025,7 @@ onBeforeUnmount(() => {
 }
 
 .tool-detail-label {
-  font-size: 10px;
+  font-size: calc(var(--font-size-base, 14px) * 10 / 14);
   font-weight: 600;
   color: $text-muted;
   text-transform: uppercase;
@@ -2026,7 +2043,7 @@ onBeforeUnmount(() => {
   }
 
   :deep(code.hljs) {
-    font-size: 11px;
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
     max-height: 300px;
     overflow-y: auto;
     white-space: pre-wrap;
@@ -2044,12 +2061,12 @@ onBeforeUnmount(() => {
 .tool-detail-reasoning {
   max-height: 300px;
   overflow-y: auto;
-  padding: 8px 10px;
-  border: 1px solid $border-light;
+  padding: calc(8px * var(--spacing-scale, 1)) calc(10px * var(--spacing-scale, 1));
+  border: var(--border-width, 1px) solid $border-light;
   border-radius: $radius-sm;
   background: rgba(var(--text-primary-rgb), 0.035);
   color: $text-secondary;
-  font-size: 12px;
+  font-size: calc(var(--font-size-base, 14px) * 12 / 14);
 
   :deep(.markdown-body > :first-child) {
     margin-top: 0;
@@ -2062,7 +2079,7 @@ onBeforeUnmount(() => {
 
 .tool-change-loading {
   color: $text-muted;
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
 }
 
 .assistant-workspace-change {
@@ -2087,8 +2104,8 @@ onBeforeUnmount(() => {
 
 .streaming-dots {
   display: flex;
-  gap: 4px;
-  padding: 4px 0;
+  gap: calc(4px * var(--spacing-scale, 1));
+  padding: calc(4px * var(--spacing-scale, 1)) 0;
 
   span {
     width: 6px;

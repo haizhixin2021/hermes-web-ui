@@ -18,6 +18,7 @@ export type ChatModelRequest = any
 export type ChatModelResponse = any
 
 export interface ChatAgentRuntimeDependencies {
+  projectBrowserHistory?<T extends { role: string; content: unknown; name?: string | null; tool_name?: string | null }>(messages: T[], options?: { truncateOtherTools?: (content: string) => string }): T[]
   createPrimaryAgentBridge(options?: Record<string, unknown>): PrimaryAgentBridgeClient
   getPrimaryAgentBridgeManager(): any
   redactPrimaryAgentBridgeError(error: string | undefined, endpoint?: string, replacement?: string): string | undefined
@@ -47,6 +48,11 @@ export interface ChatAgentRuntimeDependencies {
 
 let dependencies: ChatAgentRuntimeDependencies | null = null
 
+export function projectChatBrowserHistory<T extends { role: string; content: unknown; name?: string | null; tool_name?: string | null }>(messages: T[], options?: { truncateOtherTools?: (content: string) => string }): T[] {
+  return dependencies?.projectBrowserHistory?.(messages, options) ?? messages.map(message => message.role === 'tool' && typeof message.content === 'string' && options?.truncateOtherTools
+    ? { ...message, content: options.truncateOtherTools(message.content) } : message)
+}
+
 export function configureChatAgentRuntime(next: ChatAgentRuntimeDependencies): void {
   dependencies = next
 }
@@ -67,6 +73,7 @@ export const redactPrimaryAgentBridgeError = (
 ) => configured().redactPrimaryAgentBridgeError(error, endpoint, replacement)
 
 export const chatCodingAgentRunManager = {
+  waitForSessionExit: (...args: any[]) => configured().codingAgentRunManager.waitForSessionExit(...args),
   hasSession: (...args: any[]) => configured().codingAgentRunManager.hasSession(...args),
   stop: (...args: any[]) => configured().codingAgentRunManager.stop(...args),
   isSessionLaunchCompatible: (...args: any[]) => configured().codingAgentRunManager.isSessionLaunchCompatible(...args),

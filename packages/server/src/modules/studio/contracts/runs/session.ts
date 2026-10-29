@@ -1,6 +1,7 @@
 import type { AgentRuntime } from '../agents/runtime'
 import type { ChatMessage } from './messages'
 import type { RunMode } from './surface'
+import type { RunUsageSummary } from './run-usage'
 
 export interface EkkoBackgroundContinuationContext {
   version: 1
@@ -59,6 +60,9 @@ export interface SessionMessage {
 }
 
 export interface QueuedRun {
+  personStageDelivery?: { userId: number; deliveryId: string }
+  /** Internal account-bound Person result delivery. */
+  personDelivery?: { userId: number; executionId: string }
   /** Internal admission check, never serialized or supplied by the client. */
   authorize?: () => Promise<void>
   /** Captured at admission, independent of whichever socket drains the queue. */
@@ -133,6 +137,13 @@ export interface QueueInsertionControl {
 }
 
 export interface SessionState {
+  /** Manual Hermes compression also holds history against message deletion. */
+  isCompressing?: boolean
+  /** Explicit Stop suppresses automatic wakeups until the next user run. */
+  backgroundWakeStopped?: boolean
+  /** Snapshot the owning runtime's interrupted turn without waiting for model IO. */
+  finalizeRunUsage?: () => RunUsageSummary | undefined
+  nativeUsageSource?: 'coding_agent'
   pushTargetId?: string
   messages: SessionMessage[]
   messageTotal?: number
@@ -151,17 +162,25 @@ export interface SessionState {
   abortController?: AbortController
   runId?: string
   activeRunMarker?: string
+  /** Generation owned by a live Hermes output consumer, including finalization. */
+  bridgeRunPollMarker?: string
   profile?: string
   inputTokens?: number
   outputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
   contextTokens?: number
+  /** Ekko's system/tool context, kept separately from conversation history. */
+  ekkoContext?: { fixedContextTokens: number }
+  /** Bound to the actual agent for this turn, including account agents such as Person. */
+  ekkoBoundaryInterrupt?: (expectedRunId: string) => { status: string; phase?: string; reason?: string }
   bridgeContext?: BridgeContextState
   isAborting?: boolean
   queue: QueuedRun[]
   queueInsertion?: QueueInsertionControl
   responseRun?: ResponseRunState
   source?: ChatRunSource
-  webhookAgent?: 'bridge' | 'ekko' | 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh'
+  webhookAgent?: 'bridge' | 'ekko' | 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh' | 'cursor' | 'antigravity' | 'qwen' | 'kimi' | 'codebuddy' | 'qoder' | 'copilot' | 'zcode'
   webhookRoomId?: string
   webhookWorkflowId?: string
   webhookWorkflowNodeId?: string
@@ -208,8 +227,8 @@ export interface BridgeContextState {
   workspace?: string
 }
 
-export type ChatRunSource = 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow' | 'group_chat'
-export type ChatCodingAgentId = 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh' | 'ekko-agent'
+export type ChatRunSource = 'api_server' | 'cli' | 'coding_agent' | 'builtin_agent' | 'global_agent' | 'workflow' | 'group_chat'
+export type ChatCodingAgentId = 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh' | 'cursor' | 'antigravity' | 'qwen' | 'kimi' | 'codebuddy' | 'qoder' | 'copilot' | 'zcode' | 'ekko-agent'
 
 export interface BridgeCompressionResult {
   messages: ChatMessage[]

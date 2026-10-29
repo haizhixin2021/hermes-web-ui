@@ -1,3 +1,4 @@
+import { studioModelReasoningEffort } from '../../../studio/public/model-reasoning-effort'
 import { setTimeout as delay } from 'timers/promises'
 import { createConnection, type Socket } from 'net'
 import { tmpdir } from 'os'
@@ -506,6 +507,7 @@ export class AgentBridgeClient {
     profile?: string,
     options: AgentBridgeChatOptions = {},
   ): Promise<AgentBridgeChatStarted> {
+    const reasoningEffort = studioModelReasoningEffort({ ...options, reasoningEffort: options.reasoning_effort })
     return this.request<AgentBridgeChatStarted>({
       action: 'chat',
       session_id: sessionId,
@@ -524,8 +526,7 @@ export class AgentBridgeClient {
       ...(options.background_delegation_enabled !== undefined
         ? { background_delegation_enabled: options.background_delegation_enabled }
         : {}),
-      // Local patch (reasoning-effort): per-session reasoning effort override.
-      ...(options.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     })
   }
 
@@ -616,13 +617,15 @@ export class AgentBridgeClient {
 
   async *streamOutput(
     runId: string,
-    options: AgentBridgeRequestOptions & { intervalMs?: number } = {},
+    options: AgentBridgeRequestOptions & { intervalMs?: number; shouldContinue?: () => boolean } = {},
   ): AsyncGenerator<AgentBridgeOutput> {
     const intervalMs = options.intervalMs || 100
     let cursor = 0
     let eventCursor = 0
     for (;;) {
+      if (options.shouldContinue && !options.shouldContinue()) return
       const chunk = await this.getOutput(runId, cursor, eventCursor, options)
+      if (options.shouldContinue && !options.shouldContinue()) return
       cursor = chunk.cursor
       eventCursor = chunk.event_cursor
       if (chunk.delta || chunk.done || (chunk.events && chunk.events.length > 0)) yield chunk
@@ -669,6 +672,15 @@ export class AgentBridgeClient {
       action: 'request_boundary_interrupt',
       session_id: sessionId,
       ...(expectedRunId ? { expected_run_id: expectedRunId } : {}),
+      ...(profile ? { profile } : {}),
+    })
+  }
+
+  cancelBoundaryInterrupt(sessionId: string, expectedRunId: string, profile?: string): Promise<AgentBridgeResponse> {
+    return this.request({
+      action: 'cancel_boundary_interrupt',
+      session_id: sessionId,
+      expected_run_id: expectedRunId,
       ...(profile ? { profile } : {}),
     })
   }

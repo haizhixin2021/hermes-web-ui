@@ -1,13 +1,18 @@
 // @vitest-environment jsdom
 import { nextTick, defineComponent, h } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { enableAutoUnmount, mount } from '@vue/test-utils'
+
+enableAutoUnmount(afterEach)
 
 const apiMocks = vi.hoisted(() => ({
   fetchSessionsMock: vi.fn(),
   searchSessionsMock: vi.fn(),
   routerPushMock: vi.fn(),
+  personRequestMock: vi.fn(),
 }))
+
+vi.mock('@/api/person', () => ({ personRequest: apiMocks.personRequestMock }))
 
 vi.mock('@/api/studio/sessions', () => ({
   fetchSessions: apiMocks.fetchSessionsMock,
@@ -16,7 +21,9 @@ vi.mock('@/api/studio/sessions', () => ({
 
 const chatStoreMock = vi.hoisted(() => ({
   sessions: [] as Array<Record<string, any>>,
+  activeSessionId: null as string | null,
   loadSessions: vi.fn(),
+  addOrUpdateSession: vi.fn(),
   switchSession: vi.fn(),
   newChat: vi.fn(),
 }))
@@ -28,6 +35,7 @@ vi.mock('@/stores/hermes/chat', () => ({
 const routerCurrentRoute = { value: { name: 'hermes.logs' } }
 
 vi.mock('vue-router', () => ({
+  useRoute: () => routerCurrentRoute.value,
   useRouter: () => ({
     currentRoute: routerCurrentRoute,
     push: apiMocks.routerPushMock,
@@ -78,9 +86,14 @@ describe('session search modal', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.clearAllMocks()
+    apiMocks.personRequestMock.mockResolvedValue({ sessions: [], next_offset: null })
     chatStoreMock.sessions = []
     chatStoreMock.loadSessions.mockResolvedValue(undefined)
-    chatStoreMock.switchSession.mockResolvedValue(undefined)
+    chatStoreMock.activeSessionId = null
+    chatStoreMock.switchSession.mockImplementation(async (sessionId: string) => {
+      chatStoreMock.activeSessionId = sessionId
+      return true
+    })
     apiMocks.fetchSessionsMock.mockResolvedValue([
       {
         id: 'recent-1',
@@ -159,6 +172,55 @@ describe('session search modal', () => {
     expect(wrapper.text()).toContain('Recent Docker fix')
   })
 
+  it.each([
+    { agent: 'antigravity', mode: 'global' },
+    { agent: 'antigravity', mode: 'scoped' },
+    { agent: 'cursor', mode: 'global' },
+  ])('preserves $agent identity and $mode mode when opening an unloaded search result', async ({ agent, mode }) => {
+    apiMocks.searchSessionsMock.mockResolvedValue([{
+      id: 'coding-history', source: 'coding_agent', agent, agent_mode: mode,
+      agent_session_id: 'runtime', agent_native_session_id: 'native',
+      provider: mode === 'global' ? 'global' : 'custom:test', model: 'test-model',
+      title: 'Coding history', started_at: 1710000000, ended_at: null,
+      message_count: 2, matched_message_id: 17,
+    }])
+    const wrapper = mount(SessionSearchModal)
+    useSessionSearch().openSessionSearch()
+    await flushPromises()
+    await wrapper.get('input.n-input-stub').setValue('Coding')
+    await vi.advanceTimersByTimeAsync(200)
+    await flushPromises()
+    await wrapper.get('button.result-item').trigger('click')
+    await flushPromises()
+
+    expect(chatStoreMock.addOrUpdateSession).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'coding-history', agent, codingAgentId: agent, codingAgentMode: mode,
+      agentSessionId: 'runtime', agentNativeSessionId: 'native',
+    }))
+    expect(chatStoreMock.switchSession).toHaveBeenCalledWith('coding-history', '17')
+    wrapper.unmount()
+  })
+
+  it.each(['ekko-agent', 'ekko', 'ekko_agent'])('shows %s as builtin and opens it with native scoped identity', async agent => {
+    apiMocks.fetchSessionsMock.mockResolvedValue([{
+      id: 'ekko-history', source: 'coding_agent', agent, agent_mode: 'global',
+      agent_session_id: 'runtime', agent_native_session_id: 'native',
+      title: 'Native history', model: 'test-model', started_at: 100, ended_at: null, message_count: 1,
+    }])
+    const wrapper = mount(SessionSearchModal)
+    useSessionSearch().openSessionSearch()
+    await flushPromises()
+    await nextTick()
+    expect(wrapper.get('.result-source').text()).toBe('chat.builtinAgent')
+    await wrapper.get('button.result-item').trigger('click')
+    await flushPromises()
+    expect(chatStoreMock.addOrUpdateSession).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'ekko-history', source: 'builtin_agent', agent, codingAgentId: 'ekko-agent', codingAgentMode: 'scoped', agentSessionId: 'runtime', agentNativeSessionId: 'native',
+    }))
+    expect(chatStoreMock.switchSession).toHaveBeenCalledWith('ekko-history', null)
+    wrapper.unmount()
+  })
+
   it('searches by content and opens the matched session', async () => {
     const { openSessionSearch } = useSessionSearch()
     const wrapper = mount(SessionSearchModal)
@@ -182,6 +244,26 @@ describe('session search modal', () => {
     expect(chatStoreMock.loadSessions).toHaveBeenCalled()
     expect(chatStoreMock.switchSession).toHaveBeenCalledWith('match-1', '17')
     expect(apiMocks.routerPushMock).toHaveBeenCalledWith({ name: 'hermes.session', params: { sessionId: 'match-1' } })
+  })
+
+  it('searches only Person conversations and navigates to the original matched message', async () => {
+    routerCurrentRoute.value = { name: 'hermes.person' }
+    apiMocks.personRequestMock.mockImplementation(async (path: string) => ({ sessions: path.includes('search=') ? [{
+      id: 'person-main-B', title: 'Travel', started_at: 100, matched_message_id: 73, snippet: 'A past receipt',
+    }] : [], next_offset: null }))
+    const wrapper = mount(SessionSearchModal)
+    useSessionSearch().openSessionSearch()
+    await flushPromises()
+    await wrapper.get('input.n-input-stub').setValue('receipt')
+    await vi.advanceTimersByTimeAsync(200)
+    await flushPromises()
+    expect(apiMocks.personRequestMock).toHaveBeenCalledWith('/conversations?search=receipt', undefined, 'GET')
+    expect(apiMocks.searchSessionsMock).not.toHaveBeenCalled()
+    expect(apiMocks.fetchSessionsMock).not.toHaveBeenCalled()
+    await wrapper.get('button.result-item').trigger('click')
+    expect(apiMocks.routerPushMock).toHaveBeenCalledWith({ name: 'hermes.person', query: { session: 'person-main-B', message: '73' } })
+    expect(chatStoreMock.switchSession).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 })
 

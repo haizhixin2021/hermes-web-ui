@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
+vi.mock('naive-ui', async importOriginal => ({
+  ...await importOriginal<typeof import('naive-ui')>(),
+  useMessage: () => ({ success: vi.fn(), error: vi.fn() }),
+}))
+
 vi.mock('vue-i18n', () => ({
   useI18n: () => ({
     t: (key: string) => key,
@@ -89,6 +94,26 @@ describe('tool trace visibility', () => {
       'tool-named',
       'assistant-1',
     ])
+  })
+
+  it('lets an assistant host hide all tools without changing the ordinary chat preference', async () => {
+    const wrapper = mountLiveList()
+    useChatStore().focusMessageId = 'tool-named'
+    await wrapper.setProps({ hideToolCalls: true })
+
+    expect(wrapper.findAll('.stub-message').map(node => node.attributes('data-id'))).toEqual([
+      'user-1',
+      'assistant-1',
+    ])
+    expect(wrapper.findAll('.tool-call-name').map(node => node.text())).not.toContain('search')
+    expect(wrapper.find('.tool-run-card').exists()).toBe(false)
+    expect(wrapper.find('.compression-item').exists()).toBe(true)
+    expect(useToolTraceVisibility().toolTraceVisible.value).toBe(true)
+
+    await wrapper.setProps({ hideToolCalls: false })
+    expect(wrapper.find('[data-id="tool-named"]').exists()).toBe(true)
+    expect(wrapper.findAll('.tool-call-name').map(node => node.text())).toContain('search')
+    wrapper.unmount()
   })
 
   it('groups and folds completed history tools from the same run', async () => {

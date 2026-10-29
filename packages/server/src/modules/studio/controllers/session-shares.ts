@@ -1,6 +1,7 @@
 import type { Context } from 'koa'
 import { inspectAppUserToken } from '../public/auth'
 import { publicSessionShare, SessionShareError, type SessionShareAction } from '../contracts/session-shares'
+import { authorizeSessionShare } from '../services/session-shares/access'
 import { sessionShareService } from '../services/session-shares/service'
 import { shareAppIdentityVerifier } from '../services/session-shares/app-identity'
 import { logger } from '../public/logging'
@@ -67,7 +68,7 @@ export async function create(ctx: any): Promise<void> {
   })
 }
 
-/** List this Studio owner's invitations for a session. Never returns token plaintext or hashes. */
+/** List this Studio owner's non-revoked invitations for a session. Never returns token plaintext or hashes. */
 export async function list(ctx: any): Promise<void> {
   await respond(ctx, async () => {
     const ownerId = await manageOwner(ctx)
@@ -144,4 +145,38 @@ export async function workspaces(ctx: Context): Promise<void> {
     const { sessionShareWorkspaces } = await import('../services/session-shares/settings')
     ctx.body = await sessionShareWorkspaces(ctx.state.sessionShare, ctx.query.path)
   })
+}
+
+export async function contextLength(ctx: Context): Promise<void> {
+  await respond(ctx, async () => {
+    if (!ctx.state.sessionShare) throw new SessionShareError('share_recipient_required')
+    const { sessionShareContextLength } = await import('../services/session-shares/settings')
+    ctx.body = sessionShareContextLength(ctx.state.sessionShare)
+  })
+}
+
+export async function setContextLength(ctx: Context): Promise<void> {
+  await respond(ctx, async () => {
+    if (!ctx.state.sessionShare) throw new SessionShareError('share_recipient_required')
+    const { setSessionShareContextLength } = await import('../services/session-shares/settings')
+    ctx.body = setSessionShareContextLength(ctx.state.sessionShare, ctx.request.body)
+  })
+}
+
+export async function synthesizeSpeech(ctx: Context): Promise<void> {
+  if (!ctx.state.sessionShare) throw new SessionShareError('share_recipient_required')
+  const value = body(ctx, ['text'])
+  if (typeof value.text !== 'string' || !value.text.trim() || value.text.length > 5_000) {
+    throw new SessionShareError('share_invalid_request', 400)
+  }
+  ctx.request.body = { text: value.text, options: { format: 'mp3' } }
+  const { synthesize } = await import('./tts')
+  authorizeSessionShare(ctx.state.sessionShare, 'voice', ctx.params.id)
+  await synthesize(ctx)
+}
+
+export async function transcribeSpeech(ctx: Context): Promise<void> {
+  if (!ctx.state.sessionShare) throw new SessionShareError('share_recipient_required')
+  const { transcribe } = await import('./stt')
+  await transcribe(ctx)
 }

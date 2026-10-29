@@ -1,12 +1,16 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { flushPromises, mount } from '@vue/test-utils'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { createTestingPinia } from '@pinia/testing'
 import { nextTick } from 'vue'
 import { useChatStore } from '@/stores/hermes/chat'
 import { useSettingsStore } from '@/stores/hermes/settings'
+import { useAppStore } from '@/stores/hermes/app'
 import ChatInput from '@/components/hermes/chat/ChatInput.vue'
 
+enableAutoUnmount(afterEach)
+
+const persistReasoningEffortMock = vi.hoisted(() => vi.fn())
 const fetchSkillsMock = vi.hoisted(() => vi.fn())
 const fetchSkillBundlesMock = vi.hoisted(() => vi.fn())
 const deleteSkillBundleApiMock = vi.hoisted(() => vi.fn())
@@ -23,6 +27,7 @@ vi.mock('naive-ui', () => ({
   NSwitch: { template: '<button type="button"></button>' },
   NDropdown: { template: '<div><slot /></div>' },
   NModal: { template: '<div><slot /><slot name="footer" /></div>' },
+  NSpin: { template: '<div role="status"><slot /></div>' },
   NInputNumber: { template: '<input />' },
   NPopover: {
     template: '<div class="n-popover-stub"><slot name="trigger" /><slot /></div>',
@@ -48,7 +53,7 @@ vi.mock('naive-ui', () => ({
 
 vi.mock('@/api/studio/sessions', () => ({
   fetchContextLength: vi.fn().mockResolvedValue(256000),
-  setSessionReasoningEffort: vi.fn().mockResolvedValue(true),
+  setSessionReasoningEffort: persistReasoningEffortMock,
 }))
 
 vi.mock('@/api/hermes/model-context', () => ({
@@ -89,7 +94,7 @@ function mountForSession(
   sessionId: string,
   sessionOverrides: Partial<ReturnType<typeof useChatStore>['sessions'][number]> = {},
   displayOverrides: Record<string, any> = {},
-  componentProps: { initialText?: string; persistDraft?: boolean } = {},
+  componentProps: Partial<InstanceType<typeof ChatInput>['$props']> = {},
 ) {
   const pinia = createTestingPinia({ stubActions: false, createSpy: vi.fn })
   const chatStore = useChatStore()
@@ -106,6 +111,7 @@ function mountForSession(
 describe('ChatInput draft persistence', () => {
   beforeEach(() => {
     localStorage.clear()
+    persistReasoningEffortMock.mockReset().mockResolvedValue(true)
     window.innerWidth = 1024
     fetchSkillsMock.mockReset()
     fetchSkillsMock.mockResolvedValue({ categories: [], archived: [] })
@@ -124,6 +130,155 @@ describe('ChatInput draft persistence', () => {
       configurable: true,
       value: vi.fn(),
     })
+  })
+
+  it('isolates the new-chat composer from the active session draft and reference', async () => {
+    localStorage.setItem('hermes_chat_input_drafts_v1', JSON.stringify({ 'existing': 'Keep this draft' }))
+    const wrapper = mountForSession('existing', { inputTokens: 900, reasoningEffort: 'high' }, {}, { draft: true, persistDraft: false })
+    const store = useChatStore()
+    store.setMessageReference('existing', { id: 'reference', role: 'assistant', content: 'Previous answer', timestamp: 1 })
+    await nextTick()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+    expect(wrapper.find('.message-reference-preview').exists()).toBe(false)
+    expect(wrapper.find('.context-usage-row').exists()).toBe(false)
+    expect(wrapper.find('.reasoning-effort-button').exists()).toBe(false)
+    await wrapper.get('textarea').setValue('New conversation')
+    expect(JSON.parse(localStorage.getItem('hermes_chat_input_drafts_v1')!)).toEqual({ existing: 'Keep this draft' })
+  })
+
+  it('hides settings only for the requesting host while keeping the draft and model control', async () => {
+    const wrapper = mountForSession('assistant', {}, {}, { modelLabel: 'Test model' })
+    await wrapper.get('textarea').setValue('Keep my draft')
+    expect(wrapper.find('.input-settings-button').exists()).toBe(true)
+
+    await wrapper.setProps({ hideSettings: true })
+    expect(wrapper.find('.input-settings-button').exists()).toBe(false)
+    expect(wrapper.find('.input-model-button').exists()).toBe(true)
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Keep my draft')
+
+    await wrapper.setProps({ hideSettings: false })
+    expect(wrapper.find('.input-settings-button').exists()).toBe(true)
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Keep my draft')
+  })
+
+  it('keeps the first message when creation fails and prevents duplicate submissions', async () => {
+    let finish!: (value: boolean) => void
+    const submit = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve }))
+    const wrapper = mountForSession('existing', {}, {}, { draft: true, persistDraft: false, submit })
+    const send = vi.spyOn(useChatStore(), 'sendMessage').mockResolvedValue(undefined)
+    await wrapper.get('textarea').setValue('First message')
+    await wrapper.get('.send-button').trigger('click')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    expect(submit).toHaveBeenCalledOnce()
+    expect(send).not.toHaveBeenCalled()
+    finish(false)
+    await flushPromises()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('First message')
+    await wrapper.setProps({ submit: vi.fn().mockResolvedValue(true) })
+    await wrapper.get('.send-button').trigger('click')
+    await flushPromises()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('uses the draft model effort levels and value without inheriting existing session settings', async () => {
+    const wrapper = mountForSession('existing', { provider: 'old-provider', model: 'old-model', reasoningEffort: 'low' }, {}, {
+      draft: true,
+      draftConfig: { provider: 'draft-provider', model: 'draft-model', profile: 'research' },
+    })
+    const app = useAppStore()
+    app.profileModelGroups = [{ profile: 'research', default: 'draft-model', default_provider: 'draft-provider', groups: [{
+      provider: 'draft-provider', label: 'Draft provider', models: ['draft-model', 'simple-model'],
+      model_meta: { 'draft-model': { reasoning_efforts: ['high', 'max'] }, 'simple-model': { reasoning: false } },
+    }] }]
+    await nextTick()
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('1')
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('low')
+    await wrapper.setProps({ reasoningEffort: 'max' })
+    expect(wrapper.get('.reasoning-effort-button').classes()).toContain('active')
+    expect(wrapper.get('.reasoning-effort-slider-popover').attributes('style')).toContain('#ef4444')
+    await wrapper.setProps({ draftConfig: { provider: 'draft-provider', model: 'simple-model', profile: 'research' } })
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('0')
+    await wrapper.setProps({ draftConfig: { provider: 'moa', model: 'ensemble', profile: 'research' } })
+    expect(wrapper.find('.reasoning-effort-button').exists()).toBe(false)
+    await wrapper.setProps({ draftConfig: { provider: 'draft-provider', model: 'draft-model', codingAgentMode: 'global' }, reasoningEffort: '' })
+    expect(wrapper.find('.reasoning-effort-button').exists()).toBe(false)
+  })
+
+  it('blocks Enter submission until the new-chat configuration is ready', async () => {
+    const submit = vi.fn().mockResolvedValue(true)
+    const wrapper = mountForSession('existing', {}, {}, { draft: true, sendDisabled: true, submit })
+    await wrapper.get('textarea').setValue('First message')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    expect(submit).not.toHaveBeenCalled()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('First message')
+  })
+  it('keeps the task stop action available with a draft even before streaming, preserving text and attachments', async () => {
+    const request = vi.fn()
+    const submit = vi.fn().mockResolvedValue(true)
+    const wrapper = mountForSession('person-task-1', {}, {}, { submit, sendDisabled: true, stopControl: { active: true, pending: false, request } })
+    const nativeStop = vi.spyOn(useChatStore(), 'stopStreaming').mockImplementation(() => {})
+    expect(useChatStore().isStreaming).toBe(false)
+    await wrapper.get('textarea').setValue('Continue with this later')
+    ;(wrapper.vm as any).addFiles([new File(['notes'], 'notes.txt', { type: 'text/plain' })])
+    await nextTick()
+    const button = wrapper.get('.send-button')
+    expect(button.attributes('aria-label')).toBe('Stop')
+    expect((button.element as HTMLButtonElement).disabled).toBe(false)
+    await button.trigger('click')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    expect(request).toHaveBeenCalledOnce()
+    expect(submit).not.toHaveBeenCalled()
+    expect(nativeStop).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('notes.txt')
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Continue with this later')
+    await wrapper.setProps({ stopControl: { active: true, pending: true, request } })
+    expect((button.element as HTMLButtonElement).disabled).toBe(true)
+    expect(button.attributes('aria-busy')).toBe('true')
+    await button.trigger('click')
+    expect(request).toHaveBeenCalledOnce()
+    await wrapper.setProps({ sendDisabled: false, stopControl: { active: false, pending: false, request } })
+    expect(button.attributes('aria-label')).toBe('Send')
+    await button.trigger('click'); await flushPromises()
+    expect(submit).toHaveBeenCalledWith('Continue with this later', expect.arrayContaining([expect.objectContaining({ name: 'notes.txt' })]))
+  })
+
+  it('sends task follow-ups while active and retains Stop when empty or awaiting acknowledgement', async () => {
+    const request = vi.fn()
+    const submit = vi.fn().mockResolvedValue(true)
+    const stopControl = { active: true, pending: false, allowSend: true, request }
+    const wrapper = mountForSession('person-task-1', {}, {}, { submit, stopControl })
+    const button = wrapper.get('.send-button')
+    expect(button.attributes('aria-label')).toBe('Stop')
+    await wrapper.get('textarea').setValue('Add this to the same task')
+    expect(button.attributes('aria-label')).toBe('Send')
+    await button.trigger('click'); await flushPromises()
+    expect(submit).toHaveBeenCalledWith('Add this to the same task', undefined)
+    expect(request).not.toHaveBeenCalled()
+    expect(button.attributes('aria-label')).toBe('Stop')
+    await wrapper.get('textarea').setValue('Keep this draft while stopping')
+    await wrapper.setProps({ sendDisabled: true, stopControl: { ...stopControl, pending: true } })
+    expect(button.attributes('aria-label')).toBe('Stop')
+    expect((button.element as HTMLButtonElement).disabled).toBe(true)
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    expect(submit).toHaveBeenCalledTimes(1)
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Keep this draft while stopping')
+  })
+
+  it('uses the global draft native effort choices without changing the active conversation', async () => {
+    const onEffortChange = vi.fn()
+    const wrapper = mountForSession('existing', { reasoningEffort: 'low' }, {}, {
+      draft: true, draftConfig: { codingAgentMode: 'global', model: 'native-model' },
+      nativeReasoningEfforts: ['low', 'high'], reasoningEffort: 'high',
+      'onUpdate:reasoningEffort': onEffortChange,
+    })
+    await nextTick()
+    expect(wrapper.find('.reasoning-effort-button').exists()).toBe(true)
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('1')
+    await wrapper.get('.n-slider-stub').setValue('0')
+    expect(onEffortChange).toHaveBeenCalledWith('low')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('low')
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
   })
 
   it('adds a pasted non-image file to the attachment list', async () => {
@@ -314,23 +469,89 @@ describe('ChatInput draft persistence', () => {
     expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).not.toBe('180px')
   })
 
-  it('shows context usage for coding-agent sessions', async () => {
+  it('shows only cumulative native usage including caches while retaining Hermes and Ekko context', async () => {
     const wrapper = mountForSession('session-codex', {
       source: 'coding_agent',
       agent: 'codex',
       codingAgentId: 'codex',
       inputTokens: 1200,
       outputTokens: 800,
+      cacheReadTokens: 3000,
+      cacheWriteTokens: 100,
       contextTokens: 2000,
     })
     await nextTick()
 
-    expect(wrapper.find('.context-info').exists()).toBe(true)
-    expect(wrapper.find('.context-info').text()).toContain('2.0k')
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 5.1k')
+    expect(wrapper.find('.context-limit-editable').exists()).toBe(false)
+    expect(wrapper.find('.context-bar').exists()).toBe(false)
+
+    const chatStore = useChatStore()
+    Object.assign(chatStore.activeSession!, { agent: 'cursor', codingAgentId: 'cursor' })
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 5.1k')
+    Object.assign(chatStore.activeSession!, { inputTokens: 24_003, outputTokens: 474, cacheReadTokens: 20_736, cacheWriteTokens: 0, contextTokens: 0 })
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 45.2k')
+    Object.assign(chatStore.activeSession!, { contextTokens: 24_477 })
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 45.2k')
+    Object.assign(chatStore.activeSession!, { inputTokens: 1200, outputTokens: 800, contextTokens: 2000 })
+    Object.assign(chatStore.activeSession!, { agent: 'ekko-agent', codingAgentId: 'ekko-agent' })
+    await flushPromises()
+
+    expect(wrapper.get('.context-info').text()).toMatch(/2\.0k\s+\//)
+    expect(wrapper.get('.context-limit-editable').text()).toBe('256.0k')
+    expect(wrapper.get('.context-info').text()).toContain('chat.contextRemaining 254.0k')
+    expect(wrapper.find('.context-bar').exists()).toBe(true)
+
+    Object.assign(chatStore.activeSession!, { source: 'cli', agent: 'hermes', codingAgentId: undefined })
+    await nextTick()
+
+    expect(wrapper.get('.context-info').text()).toMatch(/2\.0k\s+\//)
+    expect(wrapper.get('.context-limit-editable').text()).toBe('256.0k')
     expect(wrapper.find('.context-bar').exists()).toBe(true)
   })
 
-  it('shows reasoning effort selector for coding-agent sessions', async () => {
+  it.each(['hermes', 'ekko-agent'])('never substitutes historical usage for missing or zero %s context', async agent => {
+    const wrapper = mountForSession('session-context', {
+      source: agent === 'hermes' ? 'cli' : 'builtin_agent', agent,
+      inputTokens: 100_000, outputTokens: 36_100, contextTokens: 19_000,
+    })
+    await flushPromises()
+    expect(wrapper.get('.context-info').text()).toMatch(/^19\.0k\s+\//)
+    const session = useChatStore().activeSession!
+    session.contextTokens = 0
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toMatch(/^0\s+\//)
+    expect(wrapper.get('.context-info').text()).toContain('chat.contextRemaining 256.0k')
+    for (const value of [undefined, NaN, Infinity, -1]) {
+      session.contextTokens = value
+      await nextTick()
+      expect(wrapper.get('.context-info').text()).toMatch(/^—\s+\//)
+      expect(wrapper.get('.context-info').text()).toContain('chat.contextRemaining —')
+      expect(wrapper.find('.context-bar').exists()).toBe(false)
+      expect(wrapper.text()).not.toContain('136.1k')
+    }
+  })
+
+  it.each(['cursor', 'codex', 'claude-code', 'pi', 'grok', 'opencode', 'dsh'])('shows only this session cumulative usage for %s', async agent => {
+    const wrapper = mountForSession('session-usage', {
+      source: 'coding_agent', agent, codingAgentId: agent as any,
+      inputTokens: 1_800_000_000, outputTokens: 1_200_000, cacheReadTokens: 56_000_000,
+      cacheWriteTokens: 0, contextTokens: 50_000,
+    })
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 1857.2M')
+    expect(wrapper.find('.context-limit-editable').exists()).toBe(false)
+    expect(wrapper.find('.context-bar').exists()).toBe(false)
+    expect(wrapper.get('.context-usage-row').text()).not.toContain('chat.contextUsed')
+    useChatStore().activeSession!.contextTokens = 0
+    await nextTick()
+    expect(wrapper.get('.context-info').text()).toBe('chat.sessionUsage 1857.2M')
+  })
+
+  it('allows reasoning effort changes in scoped coding-agent sessions', async () => {
     const wrapper = mountForSession('session-codex', {
       source: 'coding_agent',
       agent: 'codex',
@@ -342,7 +563,30 @@ describe('ChatInput draft persistence', () => {
     expect(wrapper.find('.n-popover-stub').exists()).toBe(true)
     expect(wrapper.find('.n-slider-stub').exists()).toBe(true)
     expect(wrapper.get('.n-slider-stub').attributes('min')).toBe('0')
-    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('7')
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('4')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeUndefined()
+    await wrapper.get('.n-slider-stub').setValue('2')
+    expect(useChatStore().setSessionReasoningEffort).toHaveBeenCalledWith('session-codex', 'high')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+  })
+
+  it.each([
+    ['ekko-agent', '', 'chat.reasoningEffort.options.none'],
+    ['ekko-agent', 'high', 'chat.reasoningEffort.options.high'],
+    ['ekko-agent', 'unlisted-effort', 'unlisted-effort'],
+    ['hermes', '', 'chat.reasoningEffort.options.default'],
+  ])('keeps %s run-detail effort %s read-only without rewriting the saved value', async (agent, effort, label) => {
+    const wrapper = mountForSession('ekko-run-detail', {
+      source: 'workflow', agent, codingAgentId: agent === 'hermes' ? undefined : 'ekko-agent',
+      codingAgentMode: agent === 'hermes' ? undefined : 'scoped',
+      provider: 'test-provider', model: 'historical-model', reasoningEffort: effort,
+    }, {}, { reasoningEffortDisabled: true })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain(label)
+    await wrapper.get('.n-slider-stub').setValue('1')
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+    expect(useChatStore().activeSession?.reasoningEffort).toBe(effort)
   })
 
   it('hides the reasoning effort selector for global coding-agent sessions', async () => {
@@ -358,6 +602,87 @@ describe('ChatInput draft persistence', () => {
     expect(wrapper.find('.n-slider-stub').exists()).toBe(false)
   })
 
+  it('displays and preserves the saved global effort while native capabilities are unavailable', async () => {
+    const wrapper = mountForSession('session-global-saved', {
+      source: 'coding_agent', codingAgentId: 'codex', codingAgentMode: 'global', reasoningEffort: 'high',
+    })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.high')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    await wrapper.setProps({ nativeReasoningEfforts: [] })
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+    await wrapper.setProps({ nativeReasoningEfforts: ['low', 'high'] })
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('1')
+    await wrapper.get('.n-slider-stub').setValue('1')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+    await wrapper.setProps({ nativeReasoningEfforts: undefined })
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.high')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+  })
+
+  it('shows a fixed native effort as read-only when its family has only one variant', async () => {
+    const wrapper = mountForSession('fixed-native-effort', { codingAgentMode: 'global', model: 'gpt-oss-medium' }, {}, {
+      nativeReasoningEfforts: ['medium'], nativeEffortChoices: [{ model: 'gpt-oss-medium', effort: 'medium' }],
+    })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.medium')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+  })
+
+  it('keeps native ID and effort fixed in an existing coding-agent conversation', async () => {
+    const wrapper = mountForSession('native-effort-variant', { codingAgentId: 'antigravity', codingAgentMode: 'global', model: 'gemini-high' }, {}, {
+      nativeReasoningEfforts: ['low', 'high'], nativeEffortChoices: [{ model: 'gemini-low', effort: 'low' }, { model: 'gemini-high', effort: 'high' }],
+    })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.high')
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('1')
+    await wrapper.get('.n-slider-stub').setValue('0')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+    expect(useChatStore().activeSession?.model).toBe('gemini-high')
+  })
+
+  it.each(['codex', 'grok', 'zcode', 'cursor'])('allows a scoped %s session to switch among supported model efforts', async agent => {
+    const wrapper = mountForSession('editable-scoped', { source: 'coding_agent', agent, codingAgentId: agent as any, codingAgentMode: 'scoped', model: 'reasoning-model', provider: 'test', reasoningEffort: 'high' })
+    useAppStore().modelGroups = [{ provider: 'test', label: 'Test', models: ['reasoning-model'], model_meta: { 'reasoning-model': { reasoning: true, reasoning_efforts: ['low', 'high', 'max'] } } }]
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.high')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('2')
+    await wrapper.get('.n-slider-stub').setValue('0')
+    expect(useChatStore().setSessionReasoningEffort).toHaveBeenCalledWith('editable-scoped', 'low')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('low')
+    expect(useChatStore().activeSession?.model).toBe('reasoning-model')
+  })
+
+  it('allows a new native draft to select effort while the existing coding-agent session is read-only', async () => {
+    const change = vi.fn()
+    const wrapper = mountForSession('existing-agent', { codingAgentId: 'cursor', codingAgentMode: 'global', reasoningEffort: 'high' }, {}, {
+      draft: true, draftConfig: { codingAgentMode: 'global', model: 'gemini-high' }, reasoningEffort: 'high',
+      nativeReasoningEfforts: ['low', 'high'], nativeEffortChoices: [{ model: 'gemini-low', effort: 'low' }, { model: 'gemini-high', effort: 'high' }],
+      'onUpdate:reasoningEffort': change,
+    })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeUndefined()
+    await wrapper.get('.n-slider-stub').setValue('0')
+    expect(change).toHaveBeenCalledWith('low')
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+    expect(useChatStore().setSessionReasoningEffort).not.toHaveBeenCalled()
+  })
+
+  it('keeps a saved native effort that is absent from a refreshed catalog', async () => {
+    const wrapper = mountForSession('session-global-native-level', {
+      source: 'coding_agent', codingAgentId: 'codex', codingAgentMode: 'global', reasoningEffort: 'high',
+    }, {}, { nativeReasoningEfforts: ['low'] })
+    await nextTick()
+    expect(wrapper.get('.reasoning-effort-button').text()).toContain('chat.reasoningEffort.options.high')
+    expect(wrapper.get('.reasoning-effort-button').attributes('disabled')).toBeDefined()
+    expect(useChatStore().activeSession?.reasoningEffort).toBe('high')
+  })
+
   it('hides the reasoning effort selector for MoA sessions', async () => {
     const wrapper = mountForSession('session-moa', {
       provider: 'moa',
@@ -368,39 +693,94 @@ describe('ChatInput draft persistence', () => {
     expect(wrapper.find('.n-popover-stub').exists()).toBe(false)
   })
 
+  it('does not retry a rejected automatic effort write and still allows explicit changes', async () => {
+    persistReasoningEffortMock.mockResolvedValue(false)
+    const wrapper = mountForSession('failed-default-effort')
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledTimes(1)
+    expect(persistReasoningEffortMock).toHaveBeenCalledWith('failed-default-effort', 'low')
+    expect(useChatStore().activeSession?.reasoningEffort).toBeUndefined()
+    useAppStore().modelGroups = []
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledTimes(1)
+    await wrapper.get('.n-slider-stub').setValue('2')
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledTimes(2)
+    expect(persistReasoningEffortMock).toHaveBeenLastCalledWith('failed-default-effort', 'high')
+    useChatStore().activeSession!.model = 'another-model'
+    await flushPromises()
+    expect(persistReasoningEffortMock).toHaveBeenCalledTimes(3)
+    expect(persistReasoningEffortMock).toHaveBeenLastCalledWith('failed-default-effort', 'low')
+  })
+
+  it('selects the lowest effort again when a managed draft returns to the default model', async () => {
+    const wrapper = mountForSession('draft-default-effort', {}, {}, {
+      draft: true, draftConfig: { codingAgentMode: 'global', model: '' },
+      nativeReasoningEfforts: ['low', 'high'], reasoningEffort: '',
+    })
+    await flushPromises()
+    expect(wrapper.emitted('update:reasoningEffort')).toEqual([['low']])
+    await wrapper.setProps({ reasoningEffort: 'low' })
+    await wrapper.setProps({ reasoningEffort: '' })
+    await flushPromises()
+    expect(wrapper.emitted('update:reasoningEffort')).toEqual([['low'], ['low']])
+    expect(persistReasoningEffortMock).not.toHaveBeenCalled()
+  })
+
   it('stores maximum reasoning effort for the active session', async () => {
     const wrapper = mountForSession('session-reasoning-max')
     const store = useChatStore()
 
-    await wrapper.get('.n-slider-stub').setValue('7')
+    await wrapper.get('.n-slider-stub').setValue('4')
     await nextTick()
 
     expect(store.sessions[0].reasoningEffort).toBe('max')
-    expect(wrapper.get('.reasoning-effort-button').attributes('style')).toContain('--reasoning-effort-accent-color: #ef4444')
+    expect(wrapper.get('.reasoning-effort-slider-popover').attributes('style')).toContain('--reasoning-effort-accent-color: #ef4444')
     expect(wrapper.get('.n-slider-stub').classes()).toContain('reasoning-effort-slider--max')
+  })
+
+  it('uses the selected model effort ladder and resets an unsupported effort after switching models', async () => {
+    const wrapper = mountForSession('session-model-efforts', { provider: 'custom:work', model: 'glm', profile: 'research' })
+    const appStore = useAppStore()
+    appStore.profileModelGroups = [{ profile: 'research', default: 'glm', default_provider: 'custom:work', groups: [{
+      provider: 'custom:work', label: 'Work', base_url: 'https://api.z.ai/v1', api_key: '', models: ['glm', 'fast'],
+      model_meta: { glm: { reasoning: true, reasoning_efforts: ['low', 'high', 'max'] }, fast: { reasoning: false } },
+    }] }]
+    await nextTick()
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('2')
+    await wrapper.get('.n-slider-stub').setValue('2')
+    expect(wrapper.get('.reasoning-effort-slider-popover').attributes('style')).toContain('--reasoning-effort-accent-color: #ef4444')
+    await wrapper.get('.n-slider-stub').setValue('1')
+    const store = useChatStore()
+    expect(store.sessions[0].reasoningEffort).toBe('high')
+    store.sessions[0].model = 'fast'
+    await flushPromises()
+    expect(wrapper.get('.n-slider-stub').attributes('max')).toBe('0')
+    expect(store.sessions[0].reasoningEffort).toBeUndefined()
   })
 
   it('stores the selected reasoning effort for the active session', async () => {
     const wrapper = mountForSession('session-reasoning')
     const store = useChatStore()
 
-    await wrapper.get('.n-slider-stub').setValue('5')
+    await wrapper.get('.n-slider-stub').setValue('2')
     await nextTick()
 
     expect(store.sessions[0].reasoningEffort).toBe('high')
-    expect(wrapper.get('.reasoning-effort-button').attributes('style')).toContain('--reasoning-effort-accent-color: #f9c33c')
+    expect(wrapper.get('.reasoning-effort-slider-popover').attributes('style')).toContain('--reasoning-effort-accent-color: #f9c33c')
     expect(wrapper.get('.n-slider-stub').classes()).not.toContain('reasoning-effort-slider--max')
   })
 
-  it.each(['opencode', 'codex', 'claude', 'pi', 'grok'] as const)('shows the supported commands for %s', async agent => {
+  it.each(['opencode', 'cursor', 'codex', 'claude', 'pi', 'grok'] as const)('shows the supported commands for %s', async agent => {
     const wrapper = mountForSession(`session-commands-${agent}`, { source: 'coding_agent', agent })
     await wrapper.get('textarea').setValue('/')
     await nextTick()
     const commands = wrapper.findAll('.slash-command-item').map(item => item.text())
-    for (const name of ['context', 'usage', 'status']) {
+    for (const name of ['usage', 'status']) {
       expect(commands.some(text => text.includes(`/${name}`))).toBe(true)
     }
-    expect(commands.some(text => text.includes('/compact'))).toBe(agent !== 'opencode')
+    expect(commands.some(text => text.includes('/context'))).toBe(agent !== 'cursor')
+    expect(commands.some(text => text.includes('/compact'))).toBe(agent !== 'opencode' && agent !== 'cursor')
     wrapper.unmount()
   })
 

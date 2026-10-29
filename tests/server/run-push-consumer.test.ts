@@ -88,6 +88,32 @@ describe('user device APNs delivery', () => {
       ekko_run: { cloud_user_id: 107, run_kind: 'chat', session_id: 'session-a', run_id: 'runtime-a' } })
     expect(JSON.stringify(bodies)).not.toContain('push_')
   })
+
+  it.each([
+    ['person.run.completed','completion'],['person.run.failed','failure'],
+    ['person.approval.requested','approval'],['person.clarification.requested','interaction'],
+  ])('sends %s to the main assistant owner through the existing push protocol',async(type,kind)=>{
+    await register();await register(8,'other-phone','cd')
+    session={...session,id:'person-main-7',studio_user_id:'7',push_enabled:0}
+    const consume=await consumer()
+    await consume(event({type,source:'person',subject:{session_id:session.id,run_id:'main-run',
+      ...(kind==='approval'?{approval_id:'a'}:kind==='interaction'?{clarification_id:'q'}:{})},
+      payload:{run_id:'main-run',approval_id:'a',clarify_id:'q',output:'Report ready'}}))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({event_type:kind,recipient:{apns_token:'ab'.repeat(32)},
+      ekko_run:{run_kind:'chat',session_id:'person-main-7',cloud_user_id:107}})
+    fetchMock.mockClear()
+    for(const session_id of ['person-task-private','person-main-8']) {
+      await consume(event({type,source:'person',subject:{session_id,run_id:'invalid',approval_id:'a',clarification_id:'q'},payload:{run_id:'invalid',approval_id:'a',clarify_id:'q'}}))
+    }
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('ignores the legacy session push opt-out for ordinary APNs', async () => {
+    await register(); session.push_enabled = 0
+    await (await consumer())(event())
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
   it('never includes long private titles or generated output in push requests', async () => {
     await register()
     session.title = 'PRIVATE TITLE'.repeat(1000)
@@ -98,6 +124,13 @@ describe('user device APNs delivery', () => {
     expect(JSON.parse(body).notification).toEqual({ title: '', body: '' })
     expect(body).not.toContain('PRIVATE')
     expect(Buffer.byteLength(body, 'utf8')).toBeLessThan(4096)
+  })
+  it('defaults to current title and reply when the preview setting is absent', async () => {
+    vi.stubEnv('STUDIO_PUSH_CONTENT_PREVIEW', undefined)
+    await register()
+    const consume = await consumer()
+    await consume(event({ payload: { run_id: 'runtime-a', output: '**Current reply**' } }))
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).notification).toEqual({ title: 'Saved task', body: 'Current reply' })
   })
   it('opt-in sends current final reply without historical preview fallback', async () => {
     vi.stubEnv('STUDIO_PUSH_CONTENT_PREVIEW', '1')
@@ -115,6 +148,29 @@ describe('user device APNs delivery', () => {
     const consume = await consumer()
     await consume(event({ subject: { session_id: 'session-a', run_id: 'runtime-a', message_id: '42' }, payload: { run_id: 'runtime-a', output: '' } }))
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).notification).toEqual({ title: 'Saved task', body: 'Persisted current reply' })
+  })
+  it('uses the terminal assistant message ahead of accumulated output on both Android and iOS', async () => {
+    vi.stubEnv('STUDIO_PUSH_CONTENT_PREVIEW', '1')
+    await register()
+    session.preview = 'Unrelated historical reply'
+    const completion = event({
+      subject: { session_id: 'session-a', run_id: 'runtime-a', message_id: '42' },
+      payload: { run_id: 'runtime-a', output: 'First progress reply. '.repeat(30) + 'Persisted current reply' },
+    })
+    const { appEventEnvelope } = await import('../../packages/server/src/modules/studio/services/webhooks/app-events')
+    expect(appEventEnvelope(completion)).toMatchObject({ display: { content: 'Persisted current reply' } })
+    await (await consumer())(completion)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).notification).toEqual({ title: 'Saved task', body: 'Persisted current reply' })
+  })
+  it('never falls back to session history on Android or iOS when the current reply is unavailable', async () => {
+    vi.stubEnv('STUDIO_PUSH_CONTENT_PREVIEW', '1')
+    await register()
+    session.preview = 'Unrelated historical reply'
+    const completion = event({ payload: { run_id: 'runtime-a', output: '' } })
+    const { appEventEnvelope } = await import('../../packages/server/src/modules/studio/services/webhooks/app-events')
+    expect(appEventEnvelope(completion)).toMatchObject({ display: { content: '' } })
+    await (await consumer())(completion)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).notification.body).toBe('')
   })
   it('mutes APNs without deleting registration and token refresh does not re-enable the connection', async () => {
     const a = await register(); await register(7, 'phone-b', 'bc')

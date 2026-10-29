@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
+import { notifyComputerUseStarted } from '@/composables/useComputerUsePermissionPrompt'
+
+vi.mock('@/composables/useComputerUsePermissionPrompt', () => ({ notifyComputerUseStarted: vi.fn() }))
 
 const chatApi = vi.hoisted(() => ({
   startRunViaSocket: vi.fn(),
@@ -15,6 +18,7 @@ const sessionsApi = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/studio/chat', () => ({
+  onUnobservedRunStarted: vi.fn(() => vi.fn()),
   startRunViaSocket: chatApi.startRunViaSocket,
   resumeSession: vi.fn(),
   registerSessionHandlers: vi.fn(),
@@ -25,6 +29,7 @@ vi.mock('@/api/studio/chat', () => ({
   onPeerUserMessage: vi.fn(() => vi.fn()),
   onSessionCommand: vi.fn(() => vi.fn()),
   onSessionTitleUpdated: vi.fn(() => vi.fn()),
+  onRunUsageUpdated: vi.fn(() => vi.fn()),
   onSessionWorkspaceUpdated: vi.fn(() => vi.fn()),
   onSessionSettingsUpdated: vi.fn(() => vi.fn()),
 }))
@@ -83,6 +88,23 @@ describe('chat store reasoning/tool boundaries', () => {
     chatApi.startRunViaSocket.mockReturnValue({ abort: vi.fn() })
     sessionsApi.deleteSession.mockResolvedValue(true)
     sessionsApi.setSessionModel.mockResolvedValue(true)
+  })
+
+  it.each(['ekko-agent', 'hermes'])('only checks permissions for the active live Ekko session: %s', async agent => {
+    const store = useChatStore()
+    const session = { ...makeSession(), agent }
+    store.sessions = [session]
+    store.activeSessionId = session.id
+    store.activeSession = session
+    await store.sendMessage('use the desktop')
+    const onEvent = chatApi.startRunViaSocket.mock.calls[0][1] as (event: RunEvent) => void
+    onEvent({ event: 'tool.started', session_id: session.id, tool: 'computer_use', arguments: '{"action":"call","tool":"list_apps"}' })
+    if (agent === 'ekko-agent') expect(notifyComputerUseStarted).toHaveBeenCalledWith('computer_use', { action: 'call', tool: 'list_apps' })
+    else expect(notifyComputerUseStarted).not.toHaveBeenCalled()
+    vi.mocked(notifyComputerUseStarted).mockClear()
+    store.activeSessionId = 'another-session'
+    onEvent({ event: 'tool.started', session_id: session.id, tool: 'computer_use', arguments: { action: 'call' } })
+    expect(notifyComputerUseStarted).not.toHaveBeenCalled()
   })
 
   it('keeps reasoning with the assistant segment that follows each tool boundary', async () => {
@@ -849,7 +871,7 @@ describe('chat store reasoning/tool boundaries', () => {
     session.codingAgentId = 'codex'
     session.codingAgentMode = 'global'
     session.provider = 'should-not-send'
-    session.model = 'should-not-send'
+    session.model = 'native-selected'
     session.baseUrl = 'http://example.invalid'
     session.apiKey = 'secret'
     session.apiMode = 'chat_completions'
@@ -867,11 +889,11 @@ describe('chat store reasoning/tool boundaries', () => {
       mode: 'global',
     }))
     expect(body.provider).toBeUndefined()
-    expect(body.model).toBeUndefined()
+    expect(body.model).toBe('native-selected')
     expect(body.baseUrl).toBeUndefined()
     expect(body.apiKey).toBeUndefined()
     expect(body.apiMode).toBeUndefined()
-    expect(body.reasoning_effort).toBeUndefined()
+    expect(body.reasoning_effort).toBe('high')
   })
 
   it('sends the hidden API mode when starting a scoped Ekko run', async () => {
@@ -892,8 +914,8 @@ describe('chat store reasoning/tool boundaries', () => {
     await store.sendMessage('check the weather')
 
     expect(chatApi.startRunViaSocket.mock.calls[0][0]).toEqual(expect.objectContaining({
-      source: 'coding_agent',
-      coding_agent_id: 'ekko-agent',
+      source: 'builtin_agent',
+      agent_id: 'ekko-agent',
       mode: 'scoped',
       provider: 'custom:fun-codex',
       model: 'gpt-5.5',
@@ -1041,6 +1063,21 @@ describe('chat store reasoning/tool boundaries', () => {
     expect(abort).toHaveBeenCalledTimes(1)
     expect(chatApi.socketEmit).not.toHaveBeenCalled()
     expect(store.abortState).toEqual(expect.objectContaining({ aborting: true }))
+  })
+
+  it('deletes the last active session without creating a replacement', async () => {
+    const store = useChatStore()
+    const session = makeSession()
+    store.sessions = [session]
+    store.activeSessionId = session.id
+    store.activeSession = session
+
+    await expect(store.deleteSession(session.id)).resolves.toBe(true)
+
+    expect(store.sessions).toEqual([])
+    expect(store.activeSessionId).toBeNull()
+    expect(store.activeSession).toBeNull()
+    expect(sessionsApi.deleteSession).toHaveBeenCalledWith(session.id, undefined)
   })
 
   it('keeps a session in the local list when server deletion fails', async () => {
