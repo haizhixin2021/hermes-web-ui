@@ -68,8 +68,8 @@ RUN set -e; \
 #RUN curl -fsSL https://hs.clawpilot.me/install/install.sh | bash
 
 # 安装 mem0ai和hindsight_client
-RUN uv pip install mem0ai
-RUN uv pip install hindsight_client
+#RUN uv pip install mem0ai
+#RUN uv pip install hindsight_client
 
 WORKDIR /app
 
