@@ -4,7 +4,7 @@ import type { PersonSchedule } from '../../contracts/person'
 import { personDb, personTransaction, getPersonTask, enqueuePersonExecution, listPersonSchedules, personOperation } from '../../repositories/person-store'
 import { requirePersonSession } from '../../repositories/person-session-store'
 import { nextWorkflowScheduleAt } from '../workflow/schedule'
-import { enqueuePersonScheduledStage, personTaskStage } from '../../repositories/person-stage-store'
+import { enqueuePersonScheduledStage, personTaskStage, PERSON_STAGE_PENDING_WORK_SQL } from '../../repositories/person-stage-store'
 import { personRequirements } from '../../contracts/person-flow'
 
 export function applyPersonSchedule(userId: number, input: Record<string, unknown>) {
@@ -36,6 +36,13 @@ export function applyPersonSchedule(userId: number, input: Record<string, unknow
     const schedule = db.prepare('SELECT * FROM person_schedules WHERE id=? AND owner_user_id=?').get(id, userId) as unknown as PersonSchedule | undefined
     if (!schedule) throw personError('Schedule not found', 404)
     requirePersonSession(userId, schedule.session_id)
+    if (input.action === 'delete') {
+      if (!db.prepare('DELETE FROM person_schedules WHERE id=? AND owner_user_id=? AND revision=?')
+        .run(id, userId, personRevision(input.expected_revision)).changes) throw personError('Schedule changed', 409)
+      // Occurrences are schedule metadata; their workers, results and flows remain.
+      db.prepare('DELETE FROM person_occurrences WHERE schedule_id=?').run(id)
+      return { deleted: true, schedule_id: id }
+    }
     if (input.action === 'update') {
       if (schedule.task_id && getPersonTask(userId, schedule.task_id).status !== 'open') throw personError('Task must be open',409)
       if (input.mode && input.mode !== schedule.mode || input.task_id && input.task_id !== schedule.task_id || input.session_id && input.session_id !== schedule.session_id) throw personError('Schedule target is fixed; create a new schedule')
@@ -78,7 +85,9 @@ export function tickPersonSchedules(now = Date.now()) {
       requirePersonSession(schedule.owner_user_id, schedule.session_id)
       const active = db.prepare("SELECT id FROM person_executions WHERE task_id=? AND state IN ('pending','queued','starting','stopping','running','waiting_person','waiting_user','waiting_approval')").get(schedule.task_id)
       const task = schedule.task_id ? getPersonTask(schedule.owner_user_id, schedule.task_id) : undefined
-      const activeFlow = db.prepare("SELECT 1 FROM person_occurrences o JOIN person_flows f ON f.id=o.flow_id WHERE o.schedule_id=? AND f.state='active'").get(schedule.id)
+      const activeFlow = db.prepare(`SELECT 1 FROM person_occurrences o JOIN person_flows f ON f.id=o.flow_id WHERE o.schedule_id=?
+        AND (f.state='active' OR (f.state='failed' AND EXISTS(SELECT 1 FROM person_stages s
+          WHERE s.flow_id=f.id AND s.group_position=f.current_position AND ${PERSON_STAGE_PENDING_WORK_SQL}))) LIMIT 1`).get(schedule.id)
       const recent = now - schedule.next_at <= (schedule.misfire === 'run_latest' ? 86400_000 : 60_000)
       if (recent && !active && !activeFlow && (!task || task.status === 'open')) {
         if (schedule.mode === 'assistant') flow = enqueuePersonScheduledStage(schedule.owner_user_id, schedule.session_id, schedule.title, schedule.goal)

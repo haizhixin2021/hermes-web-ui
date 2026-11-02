@@ -724,7 +724,7 @@ describe('LocalAppRelayServer', () => {
       id: 'chat-1',
       namespace: '/chat-run',
       auth: { token: 'untrusted-token' },
-      query: { profile: 'default' },
+      query: { profile: 'default', session_state: '1' },
     }, openAck)
 
     await vi.waitFor(() => expect(openAck).toHaveBeenCalledWith({
@@ -737,7 +737,8 @@ describe('LocalAppRelayServer', () => {
       'http://127.0.0.1:8748/chat-run',
       expect.objectContaining({
         auth: { token: 'local-user-token' },
-        query: { profile: 'default' },
+        query: { profile: 'default', session_state: '1' },
+        forceNew: true,
       }),
     )
 

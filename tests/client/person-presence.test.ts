@@ -21,33 +21,15 @@ beforeEach(() => {
 })
 afterEach(() => { usePersonPresenceStore().stop(); vi.useRealTimers() })
 
-it('uses the shared server state and never treats connection, polling or elapsed client time as user input', () => {
+it('subscribes once for task counts without reporting user activity', () => {
   const store = usePersonPresenceStore(); store.start(); store.start()
   expect(transport.sockets).toHaveLength(1)
   const socket = transport.sockets[0]
-  socket.handlers.get('person.presence')({ state: 'sleeping', lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.avatarSrc).toBe('/person/sleeping.gif')
+  socket.handlers.get('person.presence')({ state: 'sleeping', backgroundTaskCount: 3, lastActivityAt: 1, sleepAt: 600001 })
+  expect(store.backgroundTaskCount).toBe(3)
+  for (const event of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) window.dispatchEvent(new Event(event))
   vi.advanceTimersByTime(20 * 60 * 1000)
   expect(socket.volatile.emit).not.toHaveBeenCalled()
-  socket.handlers.get('person.presence')({ state: 'searching', lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.state).toBe('searching')
-})
-
-it('throttles input with a trailing report and drops offline/background input', () => {
-  const store = usePersonPresenceStore(); store.start()
-  const socket = transport.sockets[0]
-  window.dispatchEvent(new Event('pointerdown'))
-  expect(socket.volatile.emit).toHaveBeenCalledTimes(1)
-  for (let i = 0; i < 20; i++) window.dispatchEvent(new Event('pointermove'))
-  expect(socket.volatile.emit).toHaveBeenCalledTimes(1)
-  vi.advanceTimersByTime(1000)
-  expect(socket.volatile.emit).toHaveBeenCalledTimes(2)
-  socket.connected = false
-  window.dispatchEvent(new Event('keydown')); vi.advanceTimersByTime(1000)
-  socket.connected = true
-  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
-  window.dispatchEvent(new Event('wheel')); vi.advanceTimersByTime(1000)
-  expect(socket.volatile.emit).toHaveBeenCalledTimes(2)
 })
 
 it('clears old account state and rejects retained socket callbacks after logout', () => {
@@ -58,12 +40,14 @@ it('clears old account state and rejects retained socket callbacks after logout'
   transport.invalidate!()
   store.start()
   old.handlers.get('person.presence')({ state: 'searching', lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.state).toBe('idle')
+  expect(store.snapshot).toBeNull()
   expect(store.backgroundTaskCount).toBe(0)
   expect(old.disconnect).toHaveBeenCalledOnce()
   window.dispatchEvent(new Event('keydown'))
-  expect(transport.sockets[1].volatile.emit).toHaveBeenCalledOnce()
+  expect(transport.sockets[1].volatile.emit).not.toHaveBeenCalled()
   expect(old.volatile.emit).not.toHaveBeenCalled()
+  transport.sockets[1].handlers.get('person.presence')({ state: 'idle', backgroundTaskCount: 2 })
+  expect(store.backgroundTaskCount).toBe(2)
 })
 
 it('takes task counts from server snapshots independently of outcome animations', () => {
@@ -77,18 +61,12 @@ it('takes task counts from server snapshots independently of outcome animations'
   expect(store.backgroundTaskCount).toBe(0)
 })
 
-it('uses authoritative outcome deadlines and gives consecutive outcome animations distinct identities', () => {
+it('ignores invalid background task counts', () => {
   const store = usePersonPresenceStore(); store.start()
   const socket = transport.sockets[0]
-  socket.handlers.get('person.presence')({ state: 'done', feedbackId: 'task:a', feedbackUntil: 3000, lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.avatarSrc).toBe('/person/done.gif')
-  expect(store.avatarKey).toBe('task:a')
-  vi.advanceTimersByTime(4000)
-  expect(store.state).toBe('done') // The server, not a device timer, owns the transition.
-  socket.handlers.get('person.presence')({ state: 'error', feedbackId: 'task:b', feedbackUntil: 7000, lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.avatarSrc).toBe('/person/error.gif')
-  expect(store.avatarKey).toBe('task:b')
-  socket.handlers.get('person.presence')({ state: 'sleeping', lastActivityAt: 1, sleepAt: 600001 })
-  expect(store.avatarKey).toBe('sleeping')
+  for (const count of [undefined, null, -1, 1.5, NaN, Infinity, '3', Number.MAX_SAFE_INTEGER + 1]) {
+    socket.handlers.get('person.presence')({ state: 'idle', backgroundTaskCount: count })
+    expect(store.backgroundTaskCount).toBe(0)
+  }
   expect(socket.volatile.emit).not.toHaveBeenCalled()
 })

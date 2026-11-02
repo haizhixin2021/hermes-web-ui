@@ -1273,7 +1273,7 @@ function makeSocket(url, options) {
   }
   state.allSockets = state.allSockets || []
   state.allSockets.push(socket)
-  if (String(url).endsWith('/chat-run') || String(url).endsWith('/global-agent')) {
+  if (!options?.query?.session_state && (String(url).endsWith('/chat-run') || String(url).endsWith('/global-agent'))) {
     state.sockets.push(socket)
     state.latest = socket
   }

@@ -27,7 +27,7 @@ import { useProfilesStore } from "@/stores/hermes/profiles";
 import { useToolTraceVisibility } from "@/composables/useToolTraceVisibility";
 import { openSubagentStream, subagentIdFromToolCall } from "@/utils/hermes/subagent-stream";
 import { messageScrollPositionKey, rememberMessageScrollPosition } from "./message-scroll-position";
-import { chatSessionAgentAvatar } from "@/utils/chat-agent-avatar";
+import { chatSessionAgentAvatar, personAvatarAnimation, personAvatarStyle } from "@/utils/chat-agent-avatar";
 import { parseThinking } from "@/utils/thinking-parser";
 import { groupCompletedToolsByRun } from "./tool-run-grouping";
 import { useMessageSelection } from './useMessageSelection';
@@ -215,6 +215,12 @@ const emptyState = computed(() => {
       ? t("chat.emptyState")
       : t("chat.emptyStateAgent", { agent: agent.label }),
   };
+});
+const showEmptyConversation = computed(() => {
+  const session = chatStore.activeSession;
+  return !chatStore.isLoadingMessages && !isRunIndicatorActive.value
+    && !!session && (session.messagesLoaded === true || session.isLocalOnly === true)
+    && chatStore.messages.length === 0 && (session.messageTotal ?? session.messageCount ?? 0) === 0;
 });
 
 function assistantMessageBody(message: Message): string {
@@ -789,7 +795,7 @@ defineExpose({
       :inert="isSearchLoading || undefined"
       :aria-hidden="isSearchLoading || undefined"
       :messages="messageRows"
-      :show-empty="!isRunIndicatorActive"
+      :show-empty="showEmptyConversation"
       :virtualized="(chatStore.activeSession?.loadedMessageCount || 0) > LIVE_CHAT_MAX_LOADED_MESSAGES"
       :padding="virtualListPadding"
       @scroll="handleListScroll"
@@ -797,7 +803,7 @@ defineExpose({
     >
       <template #empty>
         <div class="empty-state">
-          <img :src="emptyState.logo" :alt="emptyState.alt" class="empty-logo" :class="{ 'empty-logo--person': assistantAgent.label === 'zhezhe' }" />
+          <img :src="emptyState.logo" :alt="emptyState.alt" class="empty-logo" :class="{ 'empty-logo--person': !!personAvatarAnimation(assistantAgent, 'idle') }" :style="personAvatarStyle(assistantAgent)" />
           <p>{{ emptyState.text }}</p>
         </div>
       </template>
@@ -1239,8 +1245,10 @@ defineExpose({
 
 <style scoped lang="scss">
 @use "@/styles/variables" as *;
+@use "@/styles/person-avatar" as *;
 
 .message-list-shell {
+  color: $text-primary;
   flex: 1;
   min-height: 0;
   position: relative;
@@ -1757,7 +1765,7 @@ defineExpose({
     height: 48px;
     object-fit: contain;
     opacity: 0.25;
-    &--person { aspect-ratio: 1; border-radius: 4px; object-fit: cover; }
+    &--person { @include person-avatar(48px); opacity: 1; }
   }
 
   p {

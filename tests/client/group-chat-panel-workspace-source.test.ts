@@ -472,20 +472,7 @@ describe('GroupChatPanel workspace save handling', () => {
     expect(source).not.toContain('@click="handleLocateSummaryAnchor"')
   })
 
-  it('fades the group chat surface when switching between rooms like single chat', () => {
-    const groupSource = readFileSync('packages/client/src/components/hermes/group-chat/GroupChatPanel.vue', 'utf8')
-    const singleSource = readFileSync('packages/client/src/components/hermes/chat/ChatPanel.vue', 'utf8')
-
-    expect(groupSource).toContain('ref="groupChatSurfaceRef"')
-    expect(groupSource).toContain('if (!roomId || !previousRoomId || roomId === previousRoomId) return')
-    expect(groupSource).toContain('roomFadeAnimation?.cancel()')
-    expect(groupSource).toContain('roomFadeAnimation = surface.animate(')
-    expect(groupSource).toContain('duration: 1500')
-    expect(groupSource).toContain("easing: 'ease'")
-    expect(groupSource).toContain("{ flush: 'post' }")
-    expect(singleSource).toContain('duration: 1500')
-    expect(singleSource).toContain('easing: "ease"')
-  })
+  // Actual group/single surface fades are covered by page-loading.spec.ts.
 
   it('renders room creation and manageable room settings as right-side drawers', () => {
     const source = readFileSync('packages/client/src/components/hermes/group-chat/GroupChatPanel.vue', 'utf8')

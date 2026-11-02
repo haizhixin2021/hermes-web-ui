@@ -1,5 +1,5 @@
 import { deploymentUrl } from '@/utils/deployment-url'
-import { chatSessionAgentAvatar } from '@/utils/chat-agent-avatar'
+import { chatSessionAgentAvatar, PERSON_AVATAR } from '@/utils/chat-agent-avatar'
 import { deleteSessionMessages, type MessageDeletionResult } from '@/api/studio/sessions'
 import { isNativeCodingAgent } from '@/utils/agent-catalog'
 import { historySessionSource, isBuiltinEkkoSession } from '@/utils/hermes/session-agent'
@@ -480,6 +480,7 @@ export interface Session {
   agentPreset?: string
   botType?: string
   messages: Message[]
+  messagesLoaded?: boolean
   createdAt: number
   updatedAt: number
   model?: string
@@ -919,7 +920,7 @@ function mapHermesMessages(msgs: HermesMessage[], taskPlans: unknown[] = [], pre
   // needed to name later tool result rows when resuming persisted history.
   const filteredMsgs = msgs.filter(m => {
     if (m.role === 'assistant') {
-      return (m.tool_calls?.length || 0) > 0 || runtimePayloadText((m as any).content).trim() !== '' || !!m.run_usage
+      return (m.tool_calls?.length || 0) > 0 || runtimePayloadText((m as any).content).trim() !== '' || !!m.run_usage || !!m.person_task_return
     }
     return true
   })
@@ -1465,6 +1466,8 @@ function createChatState(scopedSessionId?: string) {
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
   const queuedUserMessages = ref<Map<string, Message[]>>(new Map())
+  /** Inputs submitted locally that have not yet been acknowledged by the server. */
+  const pendingUserMessageIds = new Map<string, Set<string>>()
   /** sessionId → server-owned safe-boundary insertion state */
   const queueInsertionStates = ref<Map<string, QueueInsertionState>>(new Map())
   /** sessionId → queue ids that server reported as dequeued before the peer message arrived */
@@ -1540,6 +1543,8 @@ function createChatState(scopedSessionId?: string) {
   const pushEnabledConfirmedValues = new Map<string, boolean>()
 
   function beginMessageLoad(sessionId: string, requestSequence: number) {
+    const session = sessions.value.find(session => session.id === sessionId)
+    if (session) session.messagesLoaded = false
     const next = new Map(messageLoadRequests.value)
     next.set(sessionId, requestSequence)
     messageLoadRequests.value = next
@@ -1582,6 +1587,7 @@ function createChatState(scopedSessionId?: string) {
     completedUnreadSessions.value = new Set()
     queueLengths.value = new Map()
     queuedUserMessages.value = new Map()
+    pendingUserMessageIds.clear()
     queueInsertionStates.value = new Map()
     pendingApprovals.value = new Map([...pendingApprovals.value].filter(([id]) => id.startsWith('person-main-')))
     pendingClarifies.value = new Map([...pendingClarifies.value].filter(([id]) => id.startsWith('person-main-')))
@@ -2043,6 +2049,7 @@ function createChatState(scopedSessionId?: string) {
       if (!detail) return false
       const mapped = mapHermesMessages(detail.messages || [], detail.taskPlans, target.messages)
       target.messages = mapped
+      target.messagesLoaded = true
       restorePersistedSubagentStreams(sid)
       setWorkspaceRunChanges(sid, detail.workspaceRunChanges || [])
       target.loadedMessageCount = detail.messages.length
@@ -2224,6 +2231,7 @@ function createChatState(scopedSessionId?: string) {
           target.parentLastMessageRole = (data as any).parentLastMessageRole || target.parentLastMessageRole || null
           if (Array.isArray(data.messages)) {
             target.messages = mapHermesMessages(data.messages as any[], data.taskPlans, target.messages)
+            target.messagesLoaded = true
             restorePersistedSubagentStreams(sessionId)
             setWorkspaceRunChanges(sessionId, data.workspaceRunChanges || [])
             target.loadedMessageCount = data.messageLoadedCount ?? data.messages.length
@@ -2350,10 +2358,12 @@ function createChatState(scopedSessionId?: string) {
     const target = sessions.value.find(s => s.id === sessionId)
     if (!target || (!searchSelection && target.isLoadingOlderMessages) || !target.hasMoreBefore) return false
     const offset = target.loadedMessageCount || 0
-    if (!searchSelection && offset >= LIVE_CHAT_MAX_LOADED_MESSAGES) return false
+    const personMain = sessionId.startsWith('person-main-')
+    const budgetCount = personMain ? target.messages.length : offset
+    if (!searchSelection && budgetCount >= LIVE_CHAT_MAX_LOADED_MESSAGES) return false
     const limit = searchSelection
       ? LIVE_CHAT_MESSAGE_PAGE_SIZE
-      : Math.min(LIVE_CHAT_MESSAGE_PAGE_SIZE, LIVE_CHAT_MAX_LOADED_MESSAGES - offset)
+      : Math.min(LIVE_CHAT_MESSAGE_PAGE_SIZE, LIVE_CHAT_MAX_LOADED_MESSAGES - budgetCount)
     const loadToken = {}
     const previousMessages = target.messages
     olderMessageLoads.set(target, loadToken)
@@ -2377,7 +2387,7 @@ function createChatState(scopedSessionId?: string) {
       target.messageTotal = page.total
       target.messageCount = page.total
       target.hasMoreBefore = page.hasMore
-      return olderMessages.length > 0
+      return olderMessages.length > 0 || personMain
     } catch (err) {
       console.error('Failed to load older session messages:', err)
       return false
@@ -3064,6 +3074,7 @@ function createChatState(scopedSessionId?: string) {
     if (action === 'clear' && command === 'clear') {
       if (target) target.messages = []
       queuedUserMessages.value.delete(sid)
+      pendingUserMessageIds.delete(sid)
       queueLengths.value.delete(sid)
       queueInsertionStates.value.delete(sid)
       clearMessageReference(sid)
@@ -3099,6 +3110,7 @@ function createChatState(scopedSessionId?: string) {
       clearRunStartedAt(sid)
       queueLengths.value.delete(sid)
       queuedUserMessages.value.delete(sid)
+      pendingUserMessageIds.delete(sid)
       queueInsertionStates.value.delete(sid)
       clearMessageReference(sid)
       setAbortState(sid, null)
@@ -3212,6 +3224,7 @@ function createChatState(scopedSessionId?: string) {
   }
 
   function dropQueuedUserMessage(sessionId: string, messageId: string): boolean {
+    acknowledgeUserMessage(sessionId, messageId)
     const queue = queuedUserMessages.value.get(sessionId)
     if (!queue?.length) return false
     const next = queue.filter(message => message.id !== messageId)
@@ -3305,20 +3318,56 @@ function createChatState(scopedSessionId?: string) {
   }
 
   function replaceQueuedUserMessages(sessionId: string, messages: Message[]) {
-    const existingById = new Map((queuedUserMessages.value.get(sessionId) || []).map(message => [message.id, message]))
-    const merged = messages.map(message => ({
+    const existingQueue = queuedUserMessages.value.get(sessionId) || []
+    const transcript = getSessionMsgs(sessionId)
+    const transcriptIds = new Set(transcript.map(message => message.id))
+    const pendingIds = pendingUserMessageIds.get(sessionId)
+    const existingById = new Map([...transcript, ...existingQueue].map(message => [message.id, message]))
+    // An old snapshot cannot put an already-started input back in the queue.
+    const queued = messages.filter(message => !transcriptIds.has(message.id) || pendingIds?.has(message.id))
+    const confirmedIds = new Set(queued.map(message => message.id))
+    const merged: Message[] = queued.map(message => ({
       ...(existingById.get(message.id) || {}),
       ...message,
+      timestamp: existingById.get(message.id)?.timestamp ?? message.timestamp,
       attachments: existingById.get(message.id)?.attachments || message.attachments,
       queued: true,
     }))
+    for (const id of confirmedIds) acknowledgeUserMessage(sessionId, id)
+    // A snapshot may predate later sends (including attachment uploads).
+    merged.push(...existingQueue.filter(message => !confirmedIds.has(message.id) && pendingIds?.has(message.id)))
+    const queuedIds = new Set(merged.map(message => message.id))
+    const target = sessions.value.find(session => session.id === sessionId)
+    if (target && transcript.some(message => queuedIds.has(message.id))) {
+      target.messages = transcript.filter(message => !queuedIds.has(message.id))
+    }
     const nextMap = new Map(queuedUserMessages.value)
     if (merged.length > 0) {
       nextMap.set(sessionId, merged)
+      queueLengths.value.set(sessionId, Math.max(queueLengths.value.get(sessionId) || 0, merged.length))
     } else {
       nextMap.delete(sessionId)
     }
     queuedUserMessages.value = nextMap
+  }
+
+  function promoteStartedQueuedMessage(sessionId: string, queueId: string | undefined) {
+    if (!queueId) return
+    acknowledgeUserMessage(sessionId, queueId)
+    const queue = queuedUserMessages.value.get(sessionId) || []
+    const message = queue.find(item => item.id === queueId)
+    if (!message) return
+    dropQueuedUserMessage(sessionId, queueId)
+    if (!getSessionMsgs(sessionId).some(item => item.id === queueId)) {
+      addMessage(sessionId, { ...message, queued: false })
+      updateSessionTitle(sessionId)
+    }
+  }
+
+  function acknowledgeUserMessage(sessionId: string, messageId: string) {
+    const ids = pendingUserMessageIds.get(sessionId)
+    ids?.delete(messageId)
+    if (!ids?.size) pendingUserMessageIds.delete(sessionId)
   }
 
   function markDequeuedQueueId(sessionId: string, messageId: string) {
@@ -3353,6 +3402,7 @@ function createChatState(scopedSessionId?: string) {
       ? String((evt as any).dequeued_queue_id)
       : ''
     if (dequeuedId) {
+      acknowledgeUserMessage(sessionId, dequeuedId)
       const existingQueue = queuedUserMessages.value.get(sessionId) || []
       const dequeued = existingQueue.find(message => message.id === dequeuedId)
       if (Array.isArray((evt as any).queued_messages)) {
@@ -3381,6 +3431,8 @@ function createChatState(scopedSessionId?: string) {
     const content = typeof peer?.content === 'string' ? peer.content : ''
     const messageId = peer?.id != null ? String(peer.id) : ''
     if (!messageId || !content.trim()) return
+
+    acknowledgeUserMessage(sessionId, messageId)
 
     if ((queuedUserMessages.value.get(sessionId) || []).some(msg => msg.id === messageId)) return
 
@@ -3793,6 +3845,10 @@ function createChatState(scopedSessionId?: string) {
       systemType: isSessionSlashCommand ? 'command' : undefined,
     }
 
+    const pendingIds = pendingUserMessageIds.get(sid) || new Set<string>()
+    pendingIds.add(userMsg.id)
+    pendingUserMessageIds.set(sid, pendingIds)
+
     if (shouldQueue) {
       enqueueUserMessage(sid, userMsg)
     } else {
@@ -3999,6 +4055,7 @@ function createChatState(scopedSessionId?: string) {
           const previousReasoningAssistantMessageId = reasoningAssistantMessageId
           const replayRunMarker = getReplayRunMarker(data.events) ?? activeRunMarker
           target.messages = mapHermesMessages(data.messages as any[], data.taskPlans, target.messages)
+          target.messagesLoaded = true
           restorePersistedSubagentStreams(sid)
           setWorkspaceRunChanges(sid, data.workspaceRunChanges || [])
           target.loadedMessageCount = data.messageLoadedCount ?? data.messages.length
@@ -4118,6 +4175,9 @@ function createChatState(scopedSessionId?: string) {
           if (eventRunMarker) activeRunMarker = eventRunMarker
           switch (evt.event) {
             case 'run.started':
+              // Optimistic queueing can race with the previous run finishing.
+              // A direct start then has no matching server dequeue event.
+              promoteStartedQueuedMessage(sid, evt.queue_id)
               clearSessionCompletedUnread(sid)
               serverWorking.value.add(sid)
               setRunStartedAt(sid, Date.now())
@@ -4599,6 +4659,7 @@ function createChatState(scopedSessionId?: string) {
             }
 
             case 'run.failed': {
+              if (evt.queue_id) acknowledgeUserMessage(sid, evt.queue_id)
               clearRunStartedAt(sid)
               clearPendingInteractions(sid)
               const failedMessages = getSessionMsgs(sid)
@@ -4682,6 +4743,7 @@ function createChatState(scopedSessionId?: string) {
       }
     } catch (err: any) {
       if (generation !== runtimeGeneration) return
+      acknowledgeUserMessage(sid, userMsg.id)
       if (isBridgeForkCommand) {
         const nextPendingForkCommands = new Set(pendingForkCommands.value)
         nextPendingForkCommands.delete(sid)
@@ -4823,6 +4885,7 @@ function createChatState(scopedSessionId?: string) {
         }
 
         case 'run.started':
+          promoteStartedQueuedMessage(sid, evt.queue_id)
           clearSessionCompletedUnread(sid)
           serverWorking.value.add(sid)
           setRunStartedAt(sid, Date.now())
@@ -5356,7 +5419,7 @@ function createChatState(scopedSessionId?: string) {
       announcedPersonRuns.add(evt.notification_id)
       if (announcedPersonRuns.size > 1000) announcedPersonRuns.delete(announcedPersonRuns.values().next().value!)
       if (useSettingsStore().display.notify_on_complete) void showCompletionNotification({
-        title: 'zhezhe', body: truncateNotificationText(evt.output || '', 140),
+        title: PERSON_AVATAR.label, body: truncateNotificationText(evt.output || '', 140),
         icon: chatSessionAgentAvatar({ id: sid }).src, tag: `hermes-person-${evt.notification_id}`, clickUrl: `/person?session=${encodeURIComponent(sid)}`,
       })
       return
@@ -5373,6 +5436,7 @@ function createChatState(scopedSessionId?: string) {
 
     const messageId = peer?.id != null ? String(peer.id) : ''
     const isPeerCommand = peer?.role === 'command'
+    if (messageId && peer?.queued === false) promoteStartedQueuedMessage(sid, messageId)
     const msgs = getSessionMsgs(sid)
     if (messageId && msgs.some(msg => msg.id === messageId)) {
       serverWorking.value.add(sid)
@@ -5527,6 +5591,7 @@ function createChatState(scopedSessionId?: string) {
                 activeSession.value.isLocalOnly = false
               }
               activeSession.value.messages = mapHermesMessages(data.messages as any[], data.taskPlans, activeSession.value.messages)
+              activeSession.value.messagesLoaded = true
               restorePersistedSubagentStreams(sid)
               setWorkspaceRunChanges(sid, data.workspaceRunChanges || [])
               activeSession.value.loadedMessageCount = data.messageLoadedCount ?? data.messages.length

@@ -17,7 +17,7 @@ import { useChatStore } from "@/stores/hermes/chat";
 import { useFilesStore } from "@/stores/hermes/files";
 import { useToolPanelStore } from "@/stores/hermes/tool-panel";
 import { useSettingsStore } from "@/stores/hermes/settings";
-import { chatSessionAgentAvatar, type ChatAgentAvatar } from "@/utils/chat-agent-avatar";
+import { chatSessionAgentAvatar, personAvatarAnimation, personAvatarStyle, type ChatAgentAvatar } from "@/utils/chat-agent-avatar";
 import TaskPlanCard from './TaskPlanCard.vue';
 import ToolChangeCard from "./ToolChangeCard.vue";
 import {
@@ -1038,7 +1038,8 @@ onBeforeUnmount(() => {
           <div v-if="message.role === 'assistant'" class="message-author assistant-message-author">
             <img
               class="msg-avatar"
-              :class="{ 'msg-avatar--person': assistantAgent.label === 'zhezhe' }"
+              :class="{ 'msg-avatar--person': !!personAvatarAnimation(assistantAgent, 'idle') }"
+              :style="personAvatarStyle(assistantAgent)"
               :src="assistantAgent.src"
               :alt="assistantAgent.label"
               draggable="false"
@@ -1343,6 +1344,7 @@ onBeforeUnmount(() => {
 
 <style scoped lang="scss">
 @use "@/styles/variables" as *;
+@use "@/styles/person-avatar" as *;
 
 .message {
   display: flex;
@@ -1389,7 +1391,7 @@ onBeforeUnmount(() => {
       border: var(--border-width, 1px) solid #fff;
       border-radius: 50%;
       object-fit: cover;
-      &--person { aspect-ratio: 1; border-radius: 4px; object-fit: cover; border: 0; }
+      &--person { @include person-avatar(22px); }
     }
 
     .message-bubble {

@@ -50,6 +50,8 @@ const ALLOWED_GROUP_AGENT_CLIENT_EVENTS = new Set([
   'run.accepted', 'run.completed', 'run.failed', 'agent.event', 'agent.events', 'agent.config.update', 'attachment.read', 'connector.revoke',
 ])
 const ALLOWED_CHAT_RUN_CLIENT_EVENTS = new Set([
+  'sessions.state.request',
+  'sessions.read',
   'app.events.subscribe',
   'app.events.unsubscribe',
   'run',
@@ -651,6 +653,7 @@ export class AppRelayClient {
 
     this.closeLocalSocket({ id })
     const localSocket = io(`${this.localBaseUrl}${namespace}`, {
+      forceNew: namespace === '/chat-run' && String(request.query?.session_state) === '1',
       auth: normalizeSocketAuth(request.auth),
       query: normalizeSocketQuery(request.query),
       transports: ['websocket', 'polling'],

@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { NButton, NInput } from 'naive-ui'
 import type { PersonMemory } from '@/api/person'
 import PersonPanelIcon from './PersonPanelIcon.vue'
+import { PERSON_AVATAR } from '@/utils/chat-agent-avatar'
 
 const props = defineProps<{ memories: PersonMemory[]; saving: boolean }>()
 const emit = defineEmits<{ forget: [memory: PersonMemory] }>()
@@ -23,7 +24,7 @@ const filtered = computed(() => props.memories.filter(memory => memory.content.t
       <article v-for="memory in filtered" :key="memory.id" class="panel-tile memory-tile" data-theme-surface="card">
         <div class="tile-top"><span class="tile-icon"><PersonPanelIcon name="memory" /></span><span class="tile-meta">{{ t('person.savedMemory') }}</span></div>
         <p class="memory-content">{{ memory.content }}</p>
-        <footer class="tile-footer"><span class="tile-meta">zhezhe · {{ t('person.memory') }}</span><NButton quaternary size="small" :disabled="saving" @click="emit('forget', memory)">{{ t('person.forget') }}</NButton></footer>
+        <footer class="tile-footer"><span class="tile-meta">{{ PERSON_AVATAR.label }} · {{ t('person.memory') }}</span><NButton quaternary size="small" :disabled="saving" @click="emit('forget', memory)">{{ t('person.forget') }}</NButton></footer>
       </article>
     </div>
     <div v-else class="panel-empty"><PersonPanelIcon name="memory" :size="36" /><h3>{{ t('person.empty') }}</h3><p v-if="!search">{{ t('person.memoryEmpty') }}</p></div>

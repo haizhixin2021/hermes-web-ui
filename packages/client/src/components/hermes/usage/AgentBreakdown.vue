@@ -17,6 +17,7 @@ function metadata(agent: string) {
   return agentMetadata(id)
 }
 function agentName(agent: string): string {
+  if (agent === 'zhezhe') return PERSON_AVATAR.label
   if (agent === 'unknown') return t('usage.agents.unknown')
   return metadata(agent)?.name || agent
 }

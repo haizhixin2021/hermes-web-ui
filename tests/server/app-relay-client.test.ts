@@ -647,14 +647,15 @@ describe('AppRelayClient', () => {
       id: 'relay-chat-1',
       namespace: '/chat-run',
       auth: { token: 'local-user-token' },
-      query: { profile: 'default' },
+      query: { profile: 'default', session_state: '1' },
     }, openAck)
 
     const local = sockets[1]
     expect(local.__url).toBe('http://127.0.0.1:8648/chat-run')
     expect(local.__options).toMatchObject({
       auth: { token: 'local-user-token' },
-      query: { profile: 'default' },
+      query: { profile: 'default', session_state: '1' },
+      forceNew: true,
     })
     expect(openAck).toHaveBeenCalledWith({
       id: 'relay-chat-1',

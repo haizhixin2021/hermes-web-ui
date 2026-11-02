@@ -60,6 +60,8 @@ const ALLOWED_REQUEST_HEADERS = new Set([
   'x-session-share-token',
 ])
 const ALLOWED_CHAT_RUN_CLIENT_EVENTS = new Set([
+  'sessions.state.request',
+  'sessions.read',
   'app.events.subscribe',
   'app.events.unsubscribe',
   'run',
@@ -555,6 +557,7 @@ export class LocalAppRelayServer {
 
     this.closeSocket(socket, { id })
     const localSocket = createClientSocket(`${this.localBaseUrl}${namespace}`, {
+      forceNew: namespace === '/chat-run' && String(request.query?.session_state) === '1',
       auth: {
         ...normalizeSocketAuth(request.auth),
         token: socket.data.localUserToken,

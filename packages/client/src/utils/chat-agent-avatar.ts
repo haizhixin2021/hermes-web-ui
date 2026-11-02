@@ -1,5 +1,6 @@
 import { deploymentUrl } from './deployment-url'
-import { DEFAULT_PERSON_BOT_TYPE, personBot } from '../../../shared/person-bots'
+import { personBotLabel } from './person-bot-label'
+import { DEFAULT_PERSON_BOT_TYPE, PERSON_BOTS, personBot } from '../../../shared/person-bots'
 
 export interface ChatAgentAvatar {
   label: string
@@ -15,7 +16,7 @@ interface ChatAgentSessionIdentity {
   bot_type?: string
 }
 
-export const PERSON_AVATAR = { label: 'zhezhe', src: deploymentUrl('/coding-agents/person.jpg') } as const satisfies ChatAgentAvatar
+export const PERSON_AVATAR = { get label() { return personBotLabel(PERSON_BOTS[0]) }, src: deploymentUrl('/coding-agents/person.jpg') } as const satisfies ChatAgentAvatar
 export const PERSON_ANIMATIONS = {
   idle: deploymentUrl('/person/idle.gif'),
   thinking: deploymentUrl('/person/thinking.gif'),
@@ -24,6 +25,20 @@ export const PERSON_ANIMATIONS = {
   error: deploymentUrl('/person/error.gif'),
   sleeping: deploymentUrl('/person/sleeping.gif'),
 } as const
+
+export function personAvatarAnimation(avatar: ChatAgentAvatar, state: keyof typeof PERSON_ANIMATIONS) {
+  const bot = PERSON_BOTS.find(bot => deploymentUrl(bot.avatar) === avatar.src)
+  return bot ? deploymentUrl(bot.animations[state]) : undefined
+}
+
+export function personAvatarStyle(avatar: ChatAgentAvatar, state?: 'thinking') {
+  const bot = PERSON_BOTS.find(bot => deploymentUrl(bot.avatar) === avatar.src)
+  const offset = state === 'thinking' ? bot?.thinkingOffset : bot?.avatarOffset
+  return {
+    '--person-avatar-offset-x': offset?.x ?? 0,
+    '--person-avatar-offset-y': offset?.y ?? 0,
+  }
+}
 
 const AGENT_AVATARS = {
   hermes: { label: 'Hermes', src: deploymentUrl('/coding-agents/hermes.png') },
@@ -44,11 +59,18 @@ const AGENT_AVATARS = {
   antigravity: { label: 'Antigravity', src: deploymentUrl('/coding-agents/antigravity.png') },
 } as const satisfies Record<string, ChatAgentAvatar>
 
+export function personTaskAgentAvatar(task: { selection_json: string }): ChatAgentAvatar {
+  try {
+    const selection = JSON.parse(task.selection_json || '{}')
+    return chatSessionAgentAvatar({ agent: selection?.runtime || 'ekko-agent' })
+  } catch { return chatSessionAgentAvatar({ agent: 'ekko-agent' }) }
+}
+
 export function chatSessionAgentAvatar(session?: ChatAgentSessionIdentity | null): ChatAgentAvatar {
   if (!session) return AGENT_AVATARS['ekko-agent']
   const botType = session.botType || session.bot_type || (session.id?.startsWith('person-main-') ? DEFAULT_PERSON_BOT_TYPE : '')
   const bot = personBot(botType)
-  if (bot) return { label: bot.name, src: deploymentUrl(bot.avatar) }
+  if (bot) return { label: personBotLabel(bot), src: deploymentUrl(bot.avatar) }
   const runtime = String(session?.codingAgentId || session?.agent || '').trim().toLowerCase()
   if (runtime === 'hermes') return AGENT_AVATARS.hermes
   if (runtime === 'ekko-agent' || runtime === 'ekko_agent' || runtime === 'ekko') return AGENT_AVATARS['ekko-agent']

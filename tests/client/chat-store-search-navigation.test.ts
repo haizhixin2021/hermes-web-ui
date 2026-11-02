@@ -74,11 +74,61 @@ describe('search message navigation', () => {
     await expect(store.loadOlderMessages()).resolves.toBe(false)
   })
 
+  it('advances Person raw offsets through hidden slots and retains a receipt without body text', async () => {
+    const sid = 'person-main-display'
+    const rawPage = (offset: number) => ({ ...page(offset, 150, 451), messages: page(offset, 150, 451).messages.map(m => ({
+      ...m, role: 'assistant', content: m.id === 1 ? 'Oldest visible reply' : '',
+      ...(m.id === 2 ? { person_task_return: { taskId: 't', executionId: 'e', assistantMessageId: '2', title: 'Receipt', state: 'finished', agent: 'ekko' } } : {}),
+    })) })
+    api.resumeSession.mockImplementation((id, callback) => callback({ session_id: id, messages: rawPage(0).messages,
+      messageTotal: 451, messageLoadedCount: 150, hasMoreBefore: true, isWorking: false, events: [] }))
+    api.fetchSessionMessagesPage.mockImplementation(async (_id, offset) => rawPage(offset))
+    const store = useChatStore()
+    store.sessions = [session(sid)]
+    await expect(store.switchSession(sid, '1')).resolves.toBe(true)
+    expect(api.fetchSessionMessagesPage.mock.calls.map(call => call[1])).toEqual([150, 300, 450])
+    expect(store.activeSession?.loadedMessageCount).toBe(451)
+    expect(store.messages.some(m => m.id === '1' && m.content === 'Oldest visible reply')).toBe(true)
+    expect(store.messages.find(m => m.id === '2')?.personTaskReturn?.assistantMessageId).toBe('2')
+    expect(store.messages.filter(m => m.role === 'assistant')).toHaveLength(2)
+  })
+
   it('does not request older pages for a hit in the resume page', async () => {
     const store = useChatStore()
     store.sessions = [session()]
     await expect(store.switchSession('search-session', '580')).resolves.toBe(true)
     expect(api.fetchSessionMessagesPage).not.toHaveBeenCalled()
+  })
+
+  it('confirms empty history only after a successful resume and preserves that fact across metadata refreshes', async () => {
+    const store = useChatStore()
+    store.sessions = [session()]
+    let resumed!: (data: any) => void
+    api.resumeSession.mockImplementation((_id, callback) => { resumed = callback })
+    const opening = store.switchSession('search-session')
+    expect(store.isLoadingMessages).toBe(true)
+    expect(store.activeSession?.messagesLoaded).toBe(false)
+    resumed({ session_id: 'search-session', messages: [], messageTotal: 0, isWorking: false, events: [] })
+    await opening
+    expect(store.isLoadingMessages).toBe(false)
+    expect(store.activeSession?.messagesLoaded).toBe(true)
+    store.ensureSessionLoaded({ id: 'search-session', title: 'Renamed', started_at: 1, message_count: 0 } as any)
+    expect(store.activeSession?.messagesLoaded).toBe(true)
+  })
+
+  it('does not treat a timed-out resume as an empty transcript', async () => {
+    vi.useFakeTimers()
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const store = useChatStore()
+      store.sessions = [session()]
+      api.resumeSession.mockImplementation(() => {})
+      const opening = store.switchSession('search-session')
+      await vi.advanceTimersByTimeAsync(15_001)
+      await expect(opening).resolves.toBe(false)
+      expect(store.isLoadingMessages).toBe(false)
+      expect(store.activeSession?.messagesLoaded).toBe(false)
+    } finally { log.mockRestore(); vi.useRealTimers() }
   })
 
   it('keeps ordinary history loading capped at 300 messages', async () => {

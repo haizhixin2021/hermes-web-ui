@@ -10,26 +10,35 @@ vi.mock('../../packages/server/src/modules/studio/public/chat-run', () => ({ get
 vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({ authenticateUserToken: async (token: string) =>
   /^user[12]$/.test(token) && !state.revoked.has(token) ? { id: Number(token.slice(-1)), status: 'active' } : null }))
 import { initPersonTables } from '../../packages/server/src/modules/studio/infrastructure/database/person-schema'
-import { personLastActivity, touchPersonActivity, recordPersonOutcome } from '../../packages/server/src/modules/studio/repositories/person-presence-store'
+import { personLastActivity, touchPersonActivity, recordPersonOutcome, personBackgroundTaskCount } from '../../packages/server/src/modules/studio/repositories/person-presence-store'
 import { getPersonExecution, setPersonExecution } from '../../packages/server/src/modules/studio/repositories/person-store'
 import { clearPersonPresenceRuntime, observePersonPresenceEvent, personPresenceSnapshot, PERSON_SLEEP_AFTER_MS } from '../../packages/server/src/modules/studio/services/person/presence'
 import { PersonPresenceSocketServer } from '../../packages/server/src/modules/studio/sockets/person-presence'
 
 beforeEach(() => {
   state.db = new DatabaseSync(':memory:'); state.busy.clear(); state.revoked.clear(); clearPersonPresenceRuntime()
-  state.db.exec('CREATE TABLE session_tasks(id TEXT PRIMARY KEY,owner_user_id INTEGER,bot_id TEXT,updated_at INTEGER)')
+  state.db.exec('CREATE TABLE session_tasks(id TEXT PRIMARY KEY,owner_user_id INTEGER,bot_id TEXT,updated_at INTEGER,session_id TEXT)')
   state.db.exec("CREATE TABLE sessions(id TEXT PRIMARY KEY,studio_user_id TEXT); INSERT INTO sessions VALUES ('person-main-1','1'),('person-main-2','2')")
   initPersonTables(state.db)
 })
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); clearPersonPresenceRuntime(); state.db?.close(); state.db = null })
 
-function execution(id: string, owner: number, status: string) {
-  state.db!.prepare('INSERT INTO session_tasks VALUES (?,?,?,0)').run(id, owner, `person:${owner}`)
+function execution(id: string, owner: number, status: string, sessionId = `person-main-${owner}`) {
+  state.db!.prepare('INSERT INTO session_tasks VALUES (?,?,?,0,?)').run(id, owner, `person:${owner}`, sessionId)
   state.db!.prepare(`INSERT INTO person_executions(id,task_id,owner_user_id,requirements_revision,state,session_id,selection_json,created_at,updated_at)
     VALUES (?,?,?,0,?,?,'{}',0,0)`).run(id, id, owner, status, `person-task-${id}`)
 }
 
 describe('Person account presence', () => {
+  it('counts background work only for its originating conversation', () => {
+    execution('first', 1, 'running')
+    execution('second', 1, 'queued', 'person-main-second')
+    execution('other', 2, 'running')
+    expect(personBackgroundTaskCount(1)).toBe(2)
+    expect(personBackgroundTaskCount(1, 'person-main-1')).toBe(1)
+    expect(personBackgroundTaskCount(1, 'person-main-second')).toBe(1)
+    expect(personBackgroundTaskCount(1, 'person-main-2')).toBe(0)
+  })
   it('counts all account background tasks once, including queued/waiting work and pending reports', () => {
     for (let i = 0; i < 30; i++) execution(`finished${i}`, 1, 'finished')
     for (const status of ['queued', 'starting', 'running', 'stopping', 'waiting_person', 'waiting_user', 'waiting_approval']) execution(status, 1, status)

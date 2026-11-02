@@ -22,15 +22,7 @@ describe('ChatPanel session clicks', () => {
     expect(source).toContain('<header v-if="!standalone" class="chat-header">')
   })
 
-  it('replays the whole chat surface fade without remounting the input', () => {
-    const source = readFileSync('packages/client/src/components/hermes/chat/ChatPanel.vue', 'utf8')
-
-    expect(source).toContain('ref="chatMainContentRef" class="chat-main-content"')
-    expect(source).toContain('() => chatStore.activeSessionId')
-    expect(source).toContain('sessionFadeAnimation = surface.animate(')
-    expect(source).toContain('sessionFadeAnimation?.cancel()')
-    expect(source).not.toContain(':key="chatStore.activeSessionId" class="chat-main-content"')
-  })
+  // Surface fading and composer preservation are exercised in page-loading.spec.ts.
 
   it('allows scoped coding-agent model switching but disables it for global agents', () => {
     const source = readFileSync('packages/client/src/components/hermes/chat/ChatPanel.vue', 'utf8')
@@ -102,14 +94,8 @@ describe('ChatPanel session clicks', () => {
     expect(source).toContain('codingAgentId: newChatAgent.value === "hermes" ? undefined : newChatAgent.value')
   })
 
-  it('persists Ekko API mode and offers manual selection only when the Provider mode is unknown', () => {
-    const source = readFileSync('packages/client/src/components/hermes/chat/ChatPanel.vue', 'utf8')
-
-    expect(source).toContain('apiMode: isNewChatCodingAgent.value && !isGlobalCodingAgent ? newChatApiMode.value : undefined')
-    expect(source).toContain('v-if="isNewChatCodingAgent && effectiveNewChatAgentMode === \'scoped\' && !newChatConfiguredApiMode"')
-    expect(source).toContain('if (isSessionModelScopedCodingAgent.value)')
-    expect(source).toContain('await applySessionModelSwitch(pending.model, pending.provider, sessionModelApiMode.value)')
-  })
+  // Protocol persistence, configured/unknown provider modes and confirmation are
+  // covered by the automatic relay and Provider protocol cases in new-chat-page.spec.ts.
 
   // Inline composer creation is exercised by tests/e2e/new-chat-page.spec.ts,
   // including its first message, model settings and cancellation.

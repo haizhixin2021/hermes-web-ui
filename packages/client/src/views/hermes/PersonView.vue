@@ -16,11 +16,12 @@ import PageLoading from '@/components/common/PageLoading.vue'
 import PageHeader from '@/components/layout/PageHeader.vue'
 import ChatInput from '@/components/hermes/chat/ChatInput.vue'
 import NewChatPage from '@/components/hermes/chat/NewChatPage.vue'
-import NewChatAgentCards from '@/components/hermes/chat/NewChatAgentCards.vue'
+import PersonBotPicker from '@/components/hermes/person/PersonBotPicker.vue'
 import MessageList from '@/components/hermes/chat/MessageList.vue'
 import SessionTasksDrawer from '@/components/hermes/tasks/SessionTasksDrawer.vue'
 import PersonTaskChat from '@/components/hermes/person/PersonTaskChat.vue'
-import { personTaskNavigation } from '@/components/hermes/person/task-navigation'
+import PersonWorkspaceFiles from '@/components/hermes/person/PersonWorkspaceFiles.vue'
+import { personTaskNavigation, personWorkspacePreviewContext } from '@/components/hermes/person/task-navigation'
 import PersonSchedulesPanel from '@/components/hermes/person/PersonSchedulesPanel.vue'
 import PersonFlowsPanel from '@/components/hermes/person/PersonFlowsPanel.vue'
 import PersonMemoryPanel from '@/components/hermes/person/PersonMemoryPanel.vue'
@@ -31,6 +32,10 @@ import PersonGeneralSettings from '@/components/hermes/person/PersonGeneralSetti
 import PersonTaskActivity from '@/components/hermes/person/PersonTaskActivity.vue'
 import { onPersonUpdated } from '@/api/studio/chat'
 import ModelCascader from '@/components/hermes/models/ModelCascader.vue'
+import ModelProtocolModal from '@/components/hermes/models/ModelProtocolModal.vue'
+import { useModelProtocolSelection } from '@/composables/useModelProtocolSelection'
+import { isAuthModelProvider } from '@/utils/codingAgentProviders'
+import type { ProviderApiMode } from '@/api/studio/provider-api-mode'
 import SessionTaskIcon from '@/components/common/SessionTaskIcon.vue'
 import FolderIcon from '@/components/common/FolderIcon.vue'
 import BroomIcon from '@/components/common/BroomIcon.vue'
@@ -38,12 +43,17 @@ import FolderPicker from '@/components/hermes/chat/FolderPicker.vue'
 import { useDefaultWorkspace } from '@/composables/useDefaultWorkspace'
 import { useChatStore, mapHermesSession, type Attachment } from '@/stores/hermes/chat'
 import { useSettingsStore } from '@/stores/hermes/settings'
-import { usePersonPresenceStore } from '@/stores/hermes/person-presence'
+import { useSessionReadState } from '@/composables/useSessionReadState'
+import { useChatSurfaceReveal } from '@/composables/useChatSurfaceReveal'
 import type { AvailableModelGroup } from '@/api/hermes/system'
 import { personRequest, type PersonSnapshot, type PersonModel, type PersonModelGroup, type PersonTask, type PersonSchedule, type PersonMemory, type PersonFlow } from '@/api/person'
-import { PERSON_BOTS, DEFAULT_PERSON_BOT_TYPE, personBotNameKey } from '../../../../shared/person-bots'
-import { deploymentUrl } from '@/utils/deployment-url'
+import { clientUuid } from '@/utils/secure-uuid'
+import { DEFAULT_PERSON_BOT_TYPE, personBot } from '../../../../shared/person-bots'
 import { modelReasoningEfforts } from '@/utils/model-reasoning-effort'
+import { PERSON_AVATAR, chatSessionAgentAvatar } from '@/utils/chat-agent-avatar'
+import { personBotLabel } from '@/utils/person-bot-label'
+import { deploymentUrl } from '@/utils/deployment-url'
+import { prepareAgentDeployment, type AgentDeploymentController } from '@/components/hermes/chat/agentDeployment.mjs'
 
 const { t } = useI18n()
 const message = useMessage()
@@ -55,27 +65,34 @@ const router = useRouter()
 const { expanded: showSessions, isMobile } = usePageSidebarState()
 watch(showSessions, value => appStore.setPageSidebarExpanded(value), { immediate: true })
 const selectedSessionId = computed(() => typeof route.query.session === 'string' ? route.query.session : '')
+provide('hermesWorkspaceFilePreview', computed(() => !!selectedSessionId.value))
 const conversations = ref<SessionSummary[]>([])
 const nextOffset = ref<number | null>(null)
 const showCreate = ref(false)
 const conversationName = ref('')
 const creating = ref(false)
 const showNewConversation = ref(false)
-const newConversationName = ref('')
+const newConversationName = ref(personBotLabel(personBot(DEFAULT_PERSON_BOT_TYPE)!))
 const newConversationBot = ref<string>(DEFAULT_PERSON_BOT_TYPE)
+const selectedBotName = computed(() => personBotLabel(personBot(newConversationBot.value)!))
+const personLayout = ref<HTMLElement>()
+let personDeployment: AgentDeploymentController | null = null
 const newConversationDefaults = ref<PersonSnapshot | null>(null)
 const newConversationModel = ref<PersonModel | null>(null)
 const newConversationEffort = ref('')
 const newConversationWorkspace = ref<string | null>(null)
-const conflictingBotName = ref('')
+const duplicateBotName = ref(false)
 const createdConversation = ref<SessionSummary | null>(null)
-const duplicateBotName = computed(() => {
-  const name = personBotNameKey(newConversationName.value)
-  return !!name && (name === conflictingBotName.value || conversations.value.some(session => session.id !== createdConversation.value?.id && personBotNameKey(session.title || '') === name))
-})
-watch(newConversationName, () => { conflictingBotName.value = '' })
+watch(newConversationName, () => { duplicateBotName.value = false })
 const draftLocked = computed(() => creating.value || !!createdConversation.value)
-const botOptions = PERSON_BOTS.map(bot => ({ value: bot.type, label: bot.name, avatar: deploymentUrl(bot.avatar) }))
+watch(selectedBotName, (name, previous) => {
+  if (!draftLocked.value && (!newConversationName.value.trim() || newConversationName.value === previous)) newConversationName.value = name
+})
+function selectDraftBot(type: string) {
+  if (draftLocked.value || !personBot(type)) return
+  newConversationBot.value = type
+  newConversationName.value = selectedBotName.value
+}
 const isNewConversation = computed(() => showNewConversation.value || (!!data.value && !data.value.session))
 const renameConversationId = ref<string | null>(null)
 const showConversationMenu = ref(false)
@@ -94,9 +111,9 @@ const conversationMenuOptions = computed(() => [
 ])
 const sidebarSessions = computed(() => conversations.value.map(mapHermesSession))
 function resetConversationDraft() {
-  newConversationName.value = ''; newConversationBot.value = DEFAULT_PERSON_BOT_TYPE
+  newConversationBot.value = DEFAULT_PERSON_BOT_TYPE; newConversationName.value = selectedBotName.value
   newConversationModel.value = null; newConversationEffort.value = ''
-  newConversationWorkspace.value = null; conflictingBotName.value = ''
+  newConversationWorkspace.value = null; duplicateBotName.value = false
   newConversationDefaults.value = null; createdConversation.value = null
 }
 async function openCreateConversation() {
@@ -210,25 +227,36 @@ async function saveConversationName() {
   finally { creating.value = false }
 }
 async function createDraftConversation(text?: string, attachments?: Attachment[]) {
-  if (!newConversationName.value.trim() || duplicateBotName.value || creating.value || (!text?.trim() && !attachments?.length)) return false
-  creating.value = true; error.value = ''
+  if (!newConversationWorkspace.value?.trim()) { openWorkspace(); return false }
+  if (!newConversationName.value.trim() || creating.value || (!text?.trim() && !attachments?.length)) return false
+  if (!checkExecutionAgent()) return false
+  personDeployment?.cancel()
+  const deployment = prepareAgentDeployment(personLayout.value?.querySelector('.person-bot-option.selected img'), {
+    imageSrc: deploymentUrl(personBot(newConversationBot.value)!.animations.done),
+  })
+  personDeployment = deployment
+  creating.value = true; error.value = ''; duplicateBotName.value = false
   try {
     const created = createdConversation.value ?? await personRequest<SessionSummary>('/conversations', {
       title: newConversationName.value.trim(), bot_type: newConversationBot.value,
       ...(newConversationModel.value ? { model: newConversationModel.value } : {}), reasoning_effort: newConversationEffort.value,
-      ...(newConversationWorkspace.value !== null ? { workspace: newConversationWorkspace.value, expected_revision: draftDefaults.value?.revision } : {}),
-    })
+      workspace: newConversationWorkspace.value, expected_revision: draftDefaults.value?.revision,
+    }, 'POST', lifetime.signal)
     createdConversation.value = created
     chatStore.ensureSessionLoaded(created)
     await loadConversations()
     await selectConversation(created.id)
     await chatStore.switchSession(created.id)
-    if (text || attachments?.length) await chatStore.sendMessage(text || '', attachments)
+    if (disposed) { deployment?.cancel(); return false }
+    const sent = chatStore.sendMessage(text || '', attachments)
+    deployment?.start(created.id)
+    await sent
     createdConversation.value = null
     return true
   } catch (e) {
+    deployment?.cancel()
     if (!disposed) {
-      if ((e as { code?: string }).code === 'PERSON_BOT_NAME_EXISTS') conflictingBotName.value = personBotNameKey(newConversationName.value)
+      if ((e as { code?: string }).code === 'PERSON_BOT_NAME_EXISTS') duplicateBotName.value = true
       else {
         error.value = String(e)
         if ((e as { status?: number }).status === 409 && !createdConversation.value) {
@@ -258,20 +286,51 @@ async function deleteConversation(id: string) {
 function confirmDeleteConversation() {
   return deleteConversationId.value ? deleteConversation(deleteConversationId.value) : false
 }
-const personPresence = usePersonPresenceStore()
 const data = ref<PersonSnapshot | null>(null)
+provide(personWorkspacePreviewContext, computed(() => data.value?.session
+  ? { sessionId: data.value.session.id, workspace: data.value.session.workspace } : null))
 const initializing = ref(true)
+const chatSurface = ref<HTMLElement | null>(null)
+useChatSurfaceReveal(chatSurface, () => selectedSessionId.value, () => !initializing.value
+  && chatStore.activeSessionId === selectedSessionId.value && (!chatStore.isLoadingMessages || chatStore.messages.length > 0))
+const switchingConversation = computed(() => !isNewConversation.value && !!selectedSessionId.value
+  && data.value?.session?.id !== selectedSessionId.value)
+const sessionStates = useSessionReadState(() => !initializing.value && !isNewConversation.value && !chatStore.isLoadingMessages
+  && chatStore.activeSessionId === selectedSessionId.value ? selectedSessionId.value : null)
 const error = ref('')
 const pending = ref(false)
 const tab = ref('general')
 const showTasks = ref(false)
 const showPanel = ref(false)
+const flowsPanelRef = ref<InstanceType<typeof PersonFlowsPanel> | null>(null)
+const requestedFlow = ref<{ flow: PersonFlow; request: number } | null>(null)
+let flowFocusSequence = 0
+const flowFocus = computed(() => {
+  const request = requestedFlow.value
+  if (!request) return null
+  const candidates = [...(data.value?.active_flows || []),...(data.value?.flows || [])].filter(flow => flow.id === request.flow.id)
+  const flow = candidates.reduce((current,next) => next.revision >= current.revision ? next : current,request.flow)
+  return { ...request,flow }
+})
+watch(showPanel, show => { if (!show) requestedFlow.value=null })
+const showAgentSetup = ref(false)
 const showWorkspace = ref(false)
 const showClearConfirm = ref(false)
 const workspaceValue = ref<string | null>('')
 const workspaceDirectories = useDefaultWorkspace()
 const { defaultWorkspaces, recentWorkspaces } = workspaceDirectories
 const chatTaskId = ref<string | null>(null)
+const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
+const taskChatRef = ref<InstanceType<typeof PersonTaskChat> | null>(null)
+const toolsOpen = ref(false)
+const toolsSession = computed(() => chatTaskId.value ? taskChatRef.value?.session : data.value?.session)
+function submitTools(text: string, attachments?: Attachment[]) {
+  return chatTaskId.value ? taskChatRef.value?.send(text, attachments) ?? Promise.resolve(false) : sendMessage(text, attachments)
+}
+function attachToolFile(file: File) {
+  if (chatTaskId.value) taskChatRef.value?.addFiles([file])
+  else chatInputRef.value?.addFiles([file])
+}
 const chatExecutionId = ref<string>()
 function openTask(task: PersonTask) { showTasks.value = false; chatExecutionId.value = undefined; chatTaskId.value = task.id }
 provide(personTaskNavigation, (taskId, executionId) => { showTasks.value = false; chatExecutionId.value = executionId; chatTaskId.value = taskId })
@@ -284,7 +343,7 @@ let settingsChain = Promise.resolve()
 const optimisticEffort = ref<string | null>(null)
 const { drawerWidth } = useTaskDrawerLayout()
 let bootstrapping = true
-let refreshing = false
+let snapshotRequest: { sequence: number; sessionId: string; controller: AbortController } | null = null
 let refreshAgain = false
 let deletingConversations = false
 let disposed = false
@@ -297,7 +356,21 @@ const draftConfig = computed(() => ({ ...currentModel.value, agent: 'ekko-agent'
 const draftReasoningEfforts = computed(() => newConversationModel.value
   ? modelReasoningEfforts(pickerGroups.value, pickerProvider.value, newConversationModel.value.model)
   : draftDefaults.value?.reasoning_efforts ?? [])
-const needsAgentSetup = computed(() => !!data.value && !data.value.settings.agents.length)
+const needsAgentSetup = computed(() => !(isNewConversation.value ? draftDefaults.value : data.value)?.settings.agents.length)
+function checkExecutionAgent() {
+  if (!needsAgentSetup.value) return true
+  showAgentSetup.value = true
+  return false
+}
+async function sendMessage(text: string, attachments?: Attachment[]) {
+  if (!checkExecutionAgent()) return false
+  await chatStore.sendMessage(text, attachments)
+  return true
+}
+function configureAgents() {
+  showAgentSetup.value = false
+  openPanel('agents')
+}
 const modelKey = (profile: string, provider: string) => JSON.stringify([profile, provider])
 const pickerProvider = computed(() => currentModel.value ? modelKey(currentModel.value.profile, currentModel.value.provider) : '')
 const pickerGroups = computed<AvailableModelGroup[]>(() => modelGroups.value.map(group => ({
@@ -310,41 +383,60 @@ function displayModel(model: string, provider: string) {
 }
 const modelLabel = computed(() => currentModel.value ? displayModel(currentModel.value.model, pickerProvider.value) : t('models.selectModel'))
 const reasoningEffort = computed(() => isNewConversation.value ? newConversationEffort.value : optimisticEffort.value ?? data.value?.settings.reasoningEffort ?? '')
-function openPanel(name: string) { if (name === 'tasks') { showTasks.value = true; return }; tab.value = name; showPanel.value = true; void refresh() }
+function openPanel(name: string) { requestedFlow.value=null; if (name === 'tasks') { showTasks.value = true; return }; tab.value = name; showPanel.value = true; void refresh() }
+async function openActivityFlow(flow: PersonFlow) {
+  showTasks.value=false
+  openPanel('flows')
+  const request = ++flowFocusSequence
+  requestedFlow.value={ flow,request }
+  try {
+    const result = await personRequest<{ flows: PersonFlow[] }>('/flows/query',{ flow_id:flow.id },'POST',lifetime.signal)
+    if (!disposed && requestedFlow.value?.request === request && result.flows[0]) requestedFlow.value={ flow:result.flows[0],request }
+  } catch (e) { if (!disposed && requestedFlow.value?.request === request) error.value=String(e) }
+}
 async function refresh() {
   if (disposed) return
   // Deletion broadcasts before its HTTP response; wait until the route is updated.
-  if (refreshing || deletingConversations) { refreshAgain = true; return }
-  refreshing = true; refreshAgain = false
   const sequence = snapshotSequence
   const sessionId = selectedSessionId.value
+  if (deletingConversations || (snapshotRequest?.sequence === sequence && snapshotRequest.sessionId === sessionId)) {
+    refreshAgain = true; return
+  }
+  snapshotRequest?.controller.abort()
+  const request = { sequence, sessionId, controller: new AbortController() }
+  snapshotRequest = request; refreshAgain = false
+  const isCurrent = () => !disposed && snapshotRequest === request && sequence === snapshotSequence && sessionId === selectedSessionId.value
   try {
-    const next = await personRequest<PersonSnapshot>(sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '', undefined, 'GET', lifetime.signal)
-    if (disposed) return
-    if (sequence !== snapshotSequence || sessionId !== selectedSessionId.value) { refreshAgain = true; return }
+    const next = await personRequest<PersonSnapshot>(sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '', undefined, 'GET', request.controller.signal)
+    if (!isCurrent()) return
     data.value = next
     syncSession(next)
     if (next.session && (chatStore.activeSessionId !== next.session.id || (typeof route.query.message === 'string' && chatStore.focusMessageId !== route.query.message))) void chatStore.switchSession(next.session.id, typeof route.query.message === 'string' ? route.query.message : null).catch(e => { if (!disposed && sequence === snapshotSequence && sessionId === selectedSessionId.value) error.value = String(e) })
     else if (!next.session && chatStore.activeSessionId?.startsWith('person-main-')) chatStore.clearActiveSession()
   } catch (e) {
-    if (disposed) return
-    if (sequence !== snapshotSequence || sessionId !== selectedSessionId.value) { refreshAgain = true; return }
+    if (!isCurrent()) return
     if ((e as { status?: number }).status === 404 && sessionId) {
       error.value = ''
       chatStore.forgetSession(sessionId)
       await router.replace({ name: 'hermes.person' })
     } else error.value = String(e)
   } finally {
-    refreshing = false
-    if (refreshAgain && !disposed && !deletingConversations) void refresh()
+    if (snapshotRequest === request) {
+      snapshotRequest = null
+      if (refreshAgain && !disposed && !deletingConversations) void refresh()
+    }
   }
 }
 function flowAction(flow: PersonFlow, action: 'stop' | 'resume') {
-  return act(() => personRequest('/flows/apply', { action, flow_id: flow.id, expected_revision: flow.revision, idempotency_key: crypto.randomUUID() }))
+  return act(() => personRequest('/flows/apply', { action, flow_id: flow.id, expected_revision: flow.revision, idempotency_key: clientUuid() }))
 }
 function openFlowResult(sessionId: string, messageId: number) {
   showPanel.value = false
   return router.push({ name: 'hermes.person', query: { session: sessionId, message: String(messageId) } })
+}
+function openFlowConversation(sessionId: string) {
+  showPanel.value = false
+  return router.push({ name:'hermes.person',query:{ session:sessionId } })
 }
 function openFlowTask(taskId: string) { showPanel.value = false; chatExecutionId.value = undefined; chatTaskId.value = taskId }
 async function act(work: () => Promise<unknown>) {
@@ -359,7 +451,7 @@ function syncSession(snapshot: PersonSnapshot) {
 }
 function folderName(path: string) { return path.replace(/\\/g, '/').split('/').filter(Boolean).at(-1) || path }
 function openWorkspace() {
-  workspaceValue.value = isNewConversation.value ? newConversationWorkspace.value ?? draftDefaults.value?.settings.workspace ?? '' : data.value?.settings.workspace || ''
+  workspaceValue.value = isNewConversation.value ? newConversationWorkspace.value || '' : data.value?.settings.workspace || ''
   showWorkspace.value = true
   void workspaceDirectories.init().catch(e => { error.value = String(e) })
 }
@@ -370,8 +462,7 @@ async function saveWorkspace() {
     showWorkspace.value = false
     return true
   }
-  await saveSettings({ workspace })
-  if (data.value?.settings.workspace !== workspace) return false
+  if (!await saveSettings({ workspace })) return false
   await refresh()
   showWorkspace.value = false
   return true
@@ -400,18 +491,22 @@ async function openModels(event: MouseEvent) {
   finally { modelsLoading.value = false }
 }
 function saveSettings(patch: Record<string, unknown>) {
-  const sessionId = data.value?.session?.id
-  if (!sessionId) return Promise.resolve(false)
-  let revision = data.value!.revision
+  const snapshot = isNewConversation.value ? draftDefaults.value : data.value
+  const sessionId = isNewConversation.value ? undefined : snapshot?.session?.id
+  if (!snapshot) return Promise.resolve(false)
+  let revision = snapshot.revision
   let saved = false
   settingsWrites.value++
   error.value = ''
   settingsChain = settingsChain.then(async () => {
     if (disposed) return
-    revision = data.value?.revision ?? revision
+    revision = (sessionId ? data.value : draftDefaults.value)?.revision ?? revision
     const result = await personRequest<Pick<PersonSnapshot, 'settings' | 'revision' | 'inherits_global_model' | 'reasoning_efforts' | 'compression' | 'contextTokens'>>('/settings', { ...patch, session_id: sessionId, expected_revision: revision }, 'PUT', lifetime.signal)
     saved = true
-    if (!disposed && data.value?.session?.id === sessionId && selectedSessionId.value === sessionId) {
+    if (!disposed && !sessionId) {
+      newConversationDefaults.value = { ...snapshot, ...result }
+      await refresh()
+    } else if (!disposed && data.value && data.value.session?.id === sessionId && selectedSessionId.value === sessionId) {
       snapshotSequence++
       const model = result.settings.model
       data.value = { ...data.value, ...result, session: data.value.session ? { ...data.value.session,
@@ -419,14 +514,29 @@ function saveSettings(patch: Record<string, unknown>) {
         reasoning_effort: result.settings.reasoningEffort } : null }
       syncSession(data.value)
     } else if (!disposed) await refresh()
-  }).catch(async e => { if (!disposed) { error.value = String(e); await refresh() } })
+  }).catch(async e => {
+    if (!disposed) {
+      error.value = String(e)
+      if (!sessionId) newConversationDefaults.value = await personRequest<PersonSnapshot>('', undefined, 'GET', lifetime.signal).catch(() => newConversationDefaults.value)
+      await refresh()
+    }
+  })
     .finally(() => { settingsWrites.value--; if (!settingsWrites.value) optimisticEffort.value = null })
   return settingsChain.then(() => saved)
 }
-function selectModel(selection: { provider: string; model: string }) {
+const modelProtocol = useModelProtocolSelection(applyModel, computed(() => modelsLoading.value || settingsWrites.value > 0 || busy.value || creating.value))
+const { show: showModelProtocol, apiMode: selectedModelApiMode } = modelProtocol
+watch(showModelPicker, value => { if (!value) modelProtocol.cancel() })
+function selectModel(selection: { provider: string; model: string; apiMode?: ProviderApiMode }) {
   const group = modelGroups.value.find(group => modelKey(group.profile, group.provider) === selection.provider)
   if (!group) return
-  const model = { profile: group.profile, provider: group.provider, model: selection.model }
+  if (isAuthModelProvider(group.provider)) { applyModel(selection); return }
+  modelProtocol.select(selection, currentModel.value ? { ...currentModel.value, provider: pickerProvider.value } : undefined, !!group.api_mode_by_model)
+}
+function applyModel(selection: { provider: string; model: string; apiMode?: ProviderApiMode }) {
+  const group = modelGroups.value.find(group => modelKey(group.profile, group.provider) === selection.provider)
+  if (!group) return
+  const model = { profile: group.profile, provider: group.provider, model: selection.model, apiMode: selection.apiMode }
   if (isNewConversation.value) {
     newConversationModel.value = model
     if (!draftReasoningEfforts.value.includes(newConversationEffort.value)) newConversationEffort.value = ''
@@ -443,36 +553,53 @@ function inheritModel() {
   showModelPicker.value = false
 }
 function memoryForget(memory: PersonMemory) { return act(() => personRequest('/memory', { id: memory.id, expected_revision: memory.revision, forget: true })) }
-function scheduleAction(schedule: PersonSchedule, action: string) { return act(() => personRequest('/schedules/apply', { schedule_id: schedule.id, action, expected_revision: schedule.revision, idempotency_key: crypto.randomUUID() })) }
+function scheduleAction(schedule: PersonSchedule, action: string) { return act(() => personRequest('/schedules/apply', { schedule_id: schedule.id, action, expected_revision: schedule.revision, idempotency_key: clientUuid() })) }
 function saveSchedule(input: Record<string, unknown>) { return act(() => personRequest('/schedules/apply', input)) }
 
 watch(busy, (running, wasRunning) => { if (wasRunning && !running) void refresh() })
 watch(selectedSessionId, id => {
-  optimisticEffort.value = null; showModelPicker.value = false
+  requestedFlow.value=null
+  optimisticEffort.value = null; showModelPicker.value = false; showAgentSetup.value = false
   if (!id) resetConversationDraft()
 })
 const stopPersonUpdates = onPersonUpdated(() => { void loadConversations().catch(() => {}); void refresh() })
+function resumeSelectedConversation() {
+  const sessionId = selectedSessionId.value
+  const focus = typeof route.query.message === 'string' ? route.query.message : null
+  const cached = conversations.value.find(session => session.id === sessionId)
+  if (!cached || (chatStore.activeSessionId === sessionId && chatStore.focusMessageId === focus)) return
+  const sequence = snapshotSequence
+  chatStore.ensureSessionLoaded(cached)
+  void chatStore.switchSession(sessionId, focus)
+    .catch(e => { if (!disposed && sequence === snapshotSequence) error.value = String(e) })
+}
 watch([selectedSessionId, () => route.query.message], async () => {
   if (bootstrapping) return
-  snapshotSequence++; data.value = null; chatTaskId.value = null; showTasks.value = false
+  snapshotSequence++
+  chatTaskId.value = null; showTasks.value = false
+  // Keep the shared message list and composer mounted, as ordinary chat does.
+  resumeSelectedConversation()
   await refresh()
 })
 onMounted(async () => {
   try {
     chatStore.setRuntimeMode('default')
-    await Promise.all([settingsStore.fetchSettings(), loadConversations()])
-    if (!selectedSessionId.value && conversations.value.length) await router.replace({ name: 'hermes.person', query: { session: conversations.value[0].id } })
-    await nextTick()
-    bootstrapping = false
-    await refresh()
+    await Promise.all([settingsStore.fetchSettings(), loadConversations().then(async () => {
+      if (disposed) return
+      if (!selectedSessionId.value && conversations.value.length) await router.replace({ name: 'hermes.person', query: { session: conversations.value[0].id } })
+      await nextTick()
+      bootstrapping = false
+      resumeSelectedConversation()
+      await refresh()
+    })])
   } catch (e) { if (!disposed) error.value = String(e) }
   finally { bootstrapping = false; if (!disposed) initializing.value = false }
 })
-onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() })
+onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; personDeployment?.cancel(); snapshotRequest?.controller.abort(); lifetime.abort() })
 </script>
 
 <template>
-  <div class="person-layout">
+  <div ref="personLayout" class="person-layout">
     <SessionListSidebar class="person-sidebar" :expanded="showSessions" :aria-label="t('person.conversations')">
       <template #header>
         <PageSidebarNav active="person" :primary-label="t('person.newConversation')" @primary="openCreateConversation">
@@ -487,19 +614,24 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
           @select-all="selectAllConversations" @delete="deleteSelectedConversations" @cancel="toggleBatchMode" />
       </template>
       <template #default>
-            <SessionListItem v-for="session in sidebarSessions" :key="session.id" :session="session" :active="session.id === selectedSessionId" :pinned="false" :can-delete="!pending && !isMobile"
+            <SessionListItem v-for="session in sidebarSessions" :key="session.id" :session="session" :active="session.id === selectedSessionId" :pinned="false" :can-delete="!isMobile" :delete-disabled="pending"
               :selectable="batchMode" :selected="selectedConversationIds.has(session.id)" @toggle-select="toggleConversationSelection(session.id)"
-              single-line :show-profile="false" :streaming="chatStore.isSessionLive(session.id)" :to="router.resolve({ name: 'hermes.person', query: { session: session.id } }).href"
+              single-line :show-profile="false" :show-time="false" :streaming="sessionStates.isWorking(session.id, chatStore.isSessionWorking(session.id))"
+              :completed-unread="sessionStates.isUnread(session.id)" :to="router.resolve({ name: 'hermes.person', query: { session: session.id } }).href"
               :delete-confirm-text="t('person.deleteConversationConfirm')" @select="selectConversation(session.id)" @delete="deleteConversation(session.id)" @contextmenu="openConversationMenu($event, session.id)" />
             <NButton v-if="nextOffset !== null" quaternary block @click="loadConversations(nextOffset!)">{{ t('person.older') }}</NButton>
       </template>
     </SessionListSidebar>
-  <PageLoading :show="initializing || (!isNewConversation && chatStore.isLoadingMessages)" initial-only class="person-view">
+  <PageLoading :show="initializing || (!isNewConversation && chatStore.isLoadingMessages)" :inert="switchingConversation || undefined" initial-only class="person-view"
+    data-agent-deployment-surface :data-agent-deployment-session="selectedSessionId"
+    :data-agent-deployment-active="!isNewConversation && !!selectedSessionId"
+    :data-agent-deployment-status-session="selectedSessionId"
+    :data-agent-deployment-status="chatStore.isLoadingMessages || chatStore.activeSessionId !== selectedSessionId ? 'pending' : chatStore.isRunActive ? 'working' : 'settled'">
     <PageHeader>
       <header class="person-header">
         <div class="header-left">
           <HeaderSidebarToggle class="header-sidebar-toggle" :expanded="showSessions" @toggle="showSessions = !showSessions" />
-          <span class="person-title">{{ isNewConversation ? t('person.newConversation') : data?.session?.title || t('person.title') }}</span>
+          <span class="person-title">{{ isNewConversation ? t('person.newConversation') : conversations.find(session => session.id === selectedSessionId)?.title || data?.session?.title || t('person.title') }}</span>
         </div>
         <div v-if="!isNewConversation" class="person-header-actions">
           <NTooltip trigger="hover">
@@ -507,9 +639,12 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
             {{ t('person.tasks') }}
           </NTooltip>
           <NTooltip trigger="hover">
-            <template #trigger><NButton quaternary circle size="small" :disabled="!data?.can_clear || busy || pending || settingsWrites > 0" :aria-label="t('chat.workspace')" :aria-expanded="showWorkspace" @click="openWorkspace"><FolderIcon /></NButton></template>
+            <template #trigger><NButton quaternary circle size="small" :disabled="busy || pending || settingsWrites > 0" :aria-label="t('chat.workspace')" :aria-expanded="showWorkspace" @click="openWorkspace"><FolderIcon /></NButton></template>
             {{ data?.settings.workspace || t('chat.workspace') }}
           </NTooltip>
+          <PersonWorkspaceFiles panel-target="#person-tools-target" :reserved-width="chatTaskId ? taskChatRef?.panelWidth || 0 : 0"
+            :session-id="toolsSession?.id" :workspace="toolsSession?.workspace" :submit="submitTools"
+            :active="data?.session?.id === selectedSessionId" @attach="attachToolFile" @update:show="toolsOpen = $event" />
           <NPopconfirm v-model:show="showClearConfirm" :positive-text="t('common.confirm')" :negative-text="t('common.cancel')" :positive-button-props="{ loading: pending }" :disabled="!data?.can_clear || busy || pending || settingsWrites > 0" @positive-click="clearHistory">
             <template #trigger>
               <NTooltip trigger="hover">
@@ -530,28 +665,28 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
     <template v-if="data">
       <NewChatPage v-if="isNewConversation" :title="t('person.newConversation')" :subtitle="t('person.welcome')">
         <template #cards>
-          <NewChatAgentCards v-model:value="newConversationBot" :options="botOptions" :disabled="draftLocked" />
+          <PersonBotPicker :value="newConversationBot" :disabled="draftLocked" @update:value="selectDraftBot" />
         </template>
         <div class="person-new-name">
           <div class="person-new-name-input">
             <NInput v-model:value="newConversationName" :maxlength="100" :disabled="draftLocked" :placeholder="t('person.botNamePlaceholder')" :status="duplicateBotName ? 'error' : undefined"
               :input-props="{ id: 'person-conversation-name', 'aria-label': t('person.botName'), 'aria-invalid': duplicateBotName, 'aria-describedby': duplicateBotName ? 'person-bot-name-error' : undefined }" />
             <NTooltip trigger="hover">
-              <template #trigger><NButton quaternary circle :disabled="draftLocked" :aria-label="t('chat.workspace')" :aria-expanded="showWorkspace" @click="openWorkspace"><FolderIcon /></NButton></template>
-              {{ (newConversationWorkspace ?? draftDefaults?.settings.workspace) || t('chat.workspace') }}
+              <template #trigger><NButton quaternary :disabled="draftLocked" :aria-label="t('chat.workspace')" :aria-expanded="showWorkspace" @click="openWorkspace"><FolderIcon /><span class="person-workspace-label">{{ newConversationWorkspace ? folderName(newConversationWorkspace) : t('chat.workspace') }}</span></NButton></template>
+              {{ newConversationWorkspace || t('person.workspaceHint') }}
             </NTooltip>
           </div>
           <span v-if="duplicateBotName" id="person-bot-name-error" class="person-name-error" role="alert">{{ t('person.botNameExists') }}</span>
         </div>
         <ChatInput draft hide-settings managed-reasoning-effort :persist-draft="false" :draft-config="draftConfig"
-          :send-disabled="!newConversationName.trim() || duplicateBotName || !currentModel || creating" :submit="createDraftConversation"
+          :send-disabled="!newConversationName.trim() || !newConversationWorkspace?.trim() || !currentModel || creating || settingsWrites > 0" :submit="createDraftConversation"
           :model-label="modelLabel" :model-disabled="draftLocked" :model-expanded="showModelPicker"
           :reasoning-effort="reasoningEffort" :reasoning-effort-disabled="draftLocked || !currentModel"
           :scoped-reasoning-efforts="draftReasoningEfforts" :default-effort-label="t('person.defaultEffort')"
           @update:reasoning-effort="selectEffort" @model-click="openModels" />
       </NewChatPage>
       <NModal v-model:show="showWorkspace" preset="dialog" :title="t('chat.setWorkspaceTitle')" :positive-text="t('common.ok')" :negative-text="t('common.cancel')"
-        :positive-button-props="{ loading: settingsWrites > 0, disabled: isNewConversation ? draftLocked : busy || pending || !data?.can_clear }" style="width: var(--studio-workspace-picker-width)" @positive-click="saveWorkspace">
+        :positive-button-props="{ loading: settingsWrites > 0, disabled: !workspaceValue?.trim() || (isNewConversation ? draftLocked : busy || pending) }" style="width: var(--studio-workspace-picker-width)" @positive-click="saveWorkspace">
         <p>{{ t('person.workspaceHint') }}</p>
         <div v-if="defaultWorkspaces.length" class="person-workspace-shortcuts">
           <NButton v-for="path in defaultWorkspaces" :key="path" size="tiny" :title="path" @click="workspaceValue = path">{{ folderName(path) }}</NButton>
@@ -562,29 +697,43 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
           <NButton v-for="entry in recentWorkspaces" :key="entry.path" size="tiny" :title="entry.path" @click="workspaceValue = entry.path">{{ folderName(entry.path) }}</NButton>
         </div>
       </NModal>
-      <template v-if="!isNewConversation">
-      <PersonTaskActivity :count="personPresence.backgroundTaskCount" :expanded="showTasks" @open="openPanel('tasks')" />
+      <div v-if="!isNewConversation" id="person-tools-target" class="person-chat-layout">
+      <div ref="chatSurface" class="person-chat-surface" :inert="isMobile && (!!chatTaskId || toolsOpen) || undefined">
+      <div v-if="data.session" class="person-chat-messages">
+      <PersonTaskActivity :key="selectedSessionId" :session-id="data.session.id" :count="sessionStates.backgroundCount(selectedSessionId)" :agent-count="data.active_agent_task_count" :tasks="data.tasks" :flows="data.active_flows || data.flows || []" :flow-count="data.active_flow_count"
+        :avatar="chatSessionAgentAvatar(chatStore.activeSession)" :name="data.session.title || undefined"
+        @refresh="refresh" @open-task="openTask" @open-flow="openActivityFlow" />
       <MessageList v-if="data.session" :user-label="t('person.you')" hide-tool-calls hide-run-usage hide-reasoning :activity-label="t('person.executing')" />
+      </div>
       <div v-if="data.session" class="person-compose">
-        <button v-if="needsAgentSetup" type="button" class="person-model-hint" @click="openPanel('agents')">{{ t('person.configureAgents') }}</button>
         <button v-if="!currentModel" type="button" class="person-model-hint" @click="openModels">{{ t('person.defaultUnavailable') }}</button>
-        <ChatInput hide-settings managed-reasoning-effort :send-disabled="!currentModel || pending || settingsWrites > 0"
+        <ChatInput ref="chatInputRef" hide-settings managed-reasoning-effort :send-disabled="!currentModel || pending || settingsWrites > 0" :submit="sendMessage"
           :model-label="modelLabel" :model-disabled="busy || settingsWrites > 0" :model-expanded="showModelPicker"
           :reasoning-effort="reasoningEffort" :reasoning-effort-disabled="busy || !currentModel"
           :default-effort-label="t('person.defaultEffort')"
           :scoped-reasoning-efforts="data.reasoning_efforts" @update:reasoning-effort="selectEffort" @model-click="openModels" />
       </div>
-      </template>
+      </div>
+      <PersonTaskChat v-if="chatTaskId && data.session" ref="taskChatRef" :inert="isMobile && toolsOpen || undefined"
+        :key="`${chatTaskId}:${chatExecutionId || ''}`" :execution-id="chatExecutionId" :task-id="chatTaskId" :main-session-id="data.session.id" @close="chatTaskId = null; refresh()" />
+      </div>
+      <NModal v-model:show="showAgentSetup" preset="dialog" :title="t('person.agentSetupTitle')" :aria-label="t('person.agentSetupTitle')"
+        :positive-text="t('person.configureAgents')" :negative-text="t('common.cancel')"
+        :closable="true" :close-on-esc="true" @positive-click="configureAgents">
+        {{ t('person.agentSetupHint') }}
+      </NModal>
       <ModelCascader v-model:show="showModelPicker" :groups="pickerGroups" :custom-models="{}" :display-name="displayModel"
         :provider="pickerProvider" :model="currentModel?.model" :loading="modelsLoading || settingsWrites > 0" :trigger-element="modelTrigger"
-        :title="t('chat.setModelTitle')" @select="selectModel">
+        :close-on-select="false" :title="t('chat.setModelTitle')" @select="selectModel">
         <template #footer>
           <NButton size="small" quaternary :disabled="creating || (!isNewConversation && (busy || settingsWrites > 0))" @click="inheritModel">{{ (isNewConversation ? !newConversationModel : data.inherits_global_model) ? t('person.followingGlobalModel') : t('person.useGlobalModel') }}</NButton>
         </template>
       </ModelCascader>
-      <NDrawer v-model:show="showPanel" :width="drawerWidth" placement="right" :close-on-esc="true" class="person-workspace-drawer">
+      <ModelProtocolModal v-model:show="showModelProtocol" v-model:value="selectedModelApiMode"
+        @confirm="modelProtocol.confirm" @cancel="modelProtocol.cancel" />
+      <NDrawer v-model:show="showPanel" :width="drawerWidth" placement="right" :close-on-esc="true" class="person-workspace-drawer" @after-enter="flowsPanelRef?.revealFocus()">
         <NDrawerContent closable :native-scrollbar="false" :body-content-style="{ padding: '0' }">
-          <template #header><div class="workspace-heading"><span class="workspace-brand">zhezhe</span><span class="workspace-divider">/</span><span>{{ t('person.title') }}</span></div></template>
+          <template #header><div class="workspace-heading"><span class="workspace-brand">{{ PERSON_AVATAR.label }}</span><span class="workspace-divider">/</span><span>{{ t('person.title') }}</span></div></template>
           <div class="person-workspace">
             <NAlert v-if="error && !['general', 'agents'].includes(tab)" class="workspace-error" type="error" closable @close="error = ''">{{ error }}</NAlert>
             <NTabs v-model:value="tab" type="line" size="large" animated>
@@ -598,7 +747,7 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
               </NTabPane>
               <NTabPane name="flows" :tab-props="{ role: 'tab', 'aria-selected': tab === 'flows' }">
                 <template #tab><span class="workspace-tab"><SessionTaskIcon :size="17" />{{ t('person.flows') }}</span></template>
-                <PersonFlowsPanel :flows="data.flows || []" :saving="pending" @action="flowAction" @open-result="openFlowResult" @open-task="openFlowTask" />
+                <PersonFlowsPanel ref="flowsPanelRef" :flows="data.flows || []" :focus="flowFocus" :saving="pending" @action="flowAction" @open-result="openFlowResult" @open-task="openFlowTask" @open-conversation="openFlowConversation" />
               </NTabPane>
               <NTabPane name="schedules" :tab-props="{ role: 'tab', 'aria-selected': tab === 'schedules' }">
                 <template #tab><span class="workspace-tab"><PersonPanelIcon name="schedule" :size="17" />{{ t('person.schedules') }}<span class="workspace-tab-count">{{ data.schedules.length }}</span></span></template>
@@ -613,7 +762,6 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
         </NDrawerContent>
       </NDrawer>
       <SessionTasksDrawer v-if="data.session" v-model:show="showTasks" person :person-session-id="data.session.id" @open-person-task="openTask" />
-      <PersonTaskChat v-if="chatTaskId && data.session" :key="`${chatTaskId}:${chatExecutionId || ''}`" :execution-id="chatExecutionId" :task-id="chatTaskId" :main-session-id="data.session.id" @close="chatTaskId = null; refresh()" />
     </template>
   </PageLoading>
     <NDropdown trigger="manual" placement="bottom-start" :show="showConversationMenu" :x="conversationMenuX" :y="conversationMenuY" :options="conversationMenuOptions"
@@ -638,6 +786,7 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
 .person-name-error { color: $error; }
 .person-new-name-input { display: flex; align-items: center; gap: 8px; }
 .person-new-name-input :deep(.n-input) { flex: 1; min-width: 0; }
+.person-workspace-label { max-width: min(160px, 30vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .person-view { flex: 1; display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; color: $text-primary; background: var(--card-container-bg, var(--bg-main-surface)); }
 .person-header { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; padding: calc(21px * var(--spacing-scale, 1)) calc(20px * var(--spacing-scale, 1)); border-bottom: var(--border-width, 1px) solid $border-color; }
 .header-left { display: flex; align-items: center; gap: calc(8px * var(--spacing-scale, 1)); overflow: hidden; flex: 1; min-width: 0; }
@@ -646,6 +795,9 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
 .person-workspace-shortcuts { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .person-alert { margin: 12px; width: auto; }
 .person-compose { flex-shrink: 0; min-width: 0; }
+.person-chat-layout { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.person-chat-surface { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.person-chat-messages { position: relative; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .person-model-hint { display: block; margin: 0 auto; border: 0; background: transparent; color: $accent-primary; cursor: pointer; font: inherit; font-size: 12px; padding: 8px; }
 .person-workspace { padding: 0 24px 28px; min-width: 0; }
 .workspace-heading { display: flex; align-items: center; gap: 12px; font-size: 13px; font-weight: 400; color: $text-secondary; }
@@ -657,6 +809,8 @@ onBeforeUnmount(() => { stopPersonUpdates(); disposed = true; lifetime.abort() }
 .person-workspace :deep(.n-tab-pane) { padding-top: 28px; }
 @media (max-width: 640px) { .person-workspace { padding: 0 16px 24px; } .workspace-tab { gap: 6px; } .workspace-tab-count { display: none; } }
 @media (max-width: 768px) {
+  .person-chat-layout:has(.person-task-chat, .person-tools-panel) .person-chat-surface { visibility: hidden; }
+  .person-chat-layout:has(.person-tools-panel) :deep(.person-task-chat) { visibility: hidden; }
   .person-sidebar :deep(.session-item) { -webkit-touch-callout: none; user-select: none; }
   .person-header { padding: calc(16px + env(safe-area-inset-top, 0px)) 12px 16px 52px; }
   .person-title { font-size: 14px; }

@@ -13,6 +13,7 @@ import { copyToClipboard } from '@/utils/clipboard'
 import { playCompletionSound } from '@/utils/completion-sound'
 import { showSystemNotification } from '@/utils/completion-notification'
 import { workflowApprovalKey } from '@/utils/workflow-approval-key'
+import { PERSON_AVATAR } from '@/utils/chat-agent-avatar'
 import { PENDING_INTERACTION_EXPIRED_EVENT } from '@/utils/pending-interaction'
 import { approveWorkflowNode, type WorkflowRecord } from '@/api/studio/workflows'
 import { listWorkflowsSocket, onWorkflowStatusUpdated, subscribeWorkflowStatuses, disconnectWorkflowSocket, type WorkflowRuntimeStatus } from '@/api/studio/workflow-socket'
@@ -112,7 +113,7 @@ function normalizePendingSourceTitle(title: string): string {
 }
 
 function sessionTitle(sessionId: string): string {
-  if (sessionId.startsWith('person-main-')) return 'zhezhe'
+  if (sessionId.startsWith('person-main-')) return PERSON_AVATAR.label
   return normalizePendingSourceTitle(chatStore.sessions.find(session => session.id === sessionId)?.title || sessionId)
 }
 
