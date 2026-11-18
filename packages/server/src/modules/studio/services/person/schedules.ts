@@ -1,3 +1,4 @@
+import { logger } from '../../public/logging'
 import { randomUUID } from 'node:crypto'
 import { personError, personText, personRevision } from '../../contracts/person'
 import type { PersonSchedule } from '../../contracts/person'
@@ -8,12 +9,14 @@ import { enqueuePersonScheduledStage, personTaskStage, PERSON_STAGE_PENDING_WORK
 import { personRequirements } from '../../contracts/person-flow'
 
 export function applyPersonSchedule(userId: number, input: Record<string, unknown>) {
+  if (Object.hasOwn(input,'acceptance')) throw personError('Configure acceptance on a worker task; assistant schedules do not support direct acceptance')
   const key = personText(input.idempotency_key, 'idempotency_key', 200)
   return personOperation(userId, `schedule:${key}`, input, () => {
     const db = personDb(); const now = Date.now()
     if (input.action === 'create') {
       if (!['assistant','worker'].includes(String(input.mode))) throw personError('Choose assistant or worker scheduling mode')
       const task = input.mode === 'worker' ? getPersonTask(userId, personText(input.task_id, 'task_id', 100)) : undefined
+      if (task && JSON.parse(task.requirements_json).verification_for) throw personError('Verification tasks are dispatched by Bot; they cannot be scheduled independently')
       if (task && (personRequirements(task).flow || personTaskStage(userId,task.id))) throw personError('Flow stages are advanced explicitly; schedules are not supported')
       if (task && task.status !== 'open') throw personError('Task must be open')
       if (input.mode === 'assistant' && input.task_id) throw personError('Assistant schedules use a goal, not a worker task')
@@ -74,7 +77,17 @@ export function applyPersonSchedule(userId: number, input: Record<string, unknow
 export function tickPersonSchedules(now = Date.now()) {
   const due = personDb().prepare("SELECT * FROM person_schedules WHERE state='active' AND next_at<=? ORDER BY next_at LIMIT 20").all(now) as unknown as PersonSchedule[]
   for (const schedule of due) {
-    const next = schedule.kind === 'once' ? schedule.next_at : nextWorkflowScheduleAt(schedule.expression, schedule.timezone, now)
+    let next = schedule.next_at
+    if (schedule.kind === 'cron') {
+      try {
+        next = nextWorkflowScheduleAt(schedule.expression, schedule.timezone, now)
+      } catch (error) {
+        personDb().prepare("UPDATE person_schedules SET state='paused', revision=revision+1 WHERE id=? AND revision=? AND next_at=? AND state='active'")
+          .run(schedule.id, schedule.revision, schedule.next_at)
+        logger.warn(error, '[person-schedule] invalid schedule %s', schedule.id)
+        continue
+      }
+    }
     personTransaction(() => {
       const db = personDb()
       const claimed = db.prepare("UPDATE person_schedules SET next_at=?,state=? WHERE id=? AND revision=? AND next_at=? AND state='active'")
@@ -84,6 +97,8 @@ export function tickPersonSchedules(now = Date.now()) {
       let state = 'skipped'; let execution: string | null = null; let flow: string | null = null
       requirePersonSession(schedule.owner_user_id, schedule.session_id)
       const active = db.prepare("SELECT id FROM person_executions WHERE task_id=? AND state IN ('pending','queued','starting','stopping','running','waiting_person','waiting_user','waiting_approval')").get(schedule.task_id)
+        || db.prepare("SELECT 1 FROM person_task_redirects WHERE task_id=? AND state IN ('waiting','cancelling')").get(schedule.task_id)
+        || db.prepare("SELECT 1 FROM person_acceptance a JOIN person_executions e ON e.id=a.execution_id WHERE a.task_id=? AND a.orchestration='bot_tasks' AND a.state NOT IN ('passed','failed','blocked','interrupted') AND e.rowid=(SELECT MAX(rowid) FROM person_executions WHERE task_id=a.task_id)").get(schedule.task_id)
       const task = schedule.task_id ? getPersonTask(schedule.owner_user_id, schedule.task_id) : undefined
       const activeFlow = db.prepare(`SELECT 1 FROM person_occurrences o JOIN person_flows f ON f.id=o.flow_id WHERE o.schedule_id=?
         AND (f.state='active' OR (f.state='failed' AND EXISTS(SELECT 1 FROM person_stages s

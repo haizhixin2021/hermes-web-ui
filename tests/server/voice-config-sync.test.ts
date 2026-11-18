@@ -1,225 +1,179 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join } from 'path'
-import YAML from 'js-yaml'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Context } from 'koa'
+import { DatabaseSync } from 'node:sqlite'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-const originalHermesHome = process.env.HERMES_HOME
-const originalWebUiHome = process.env.HERMES_WEB_UI_HOME
-const originalAuthToken = process.env.AUTH_TOKEN
-let db: any = null
-let hermesHome = ''
-let webUiHome = ''
+let root: string
+let db: DatabaseSync
+const runtime = vi.hoisted(() => ({ port: 18647, localUsable: true }))
+vi.mock('../../packages/server/src/modules/studio/infrastructure/database', () => ({ getDb: () => db }))
+vi.mock('../../packages/server/src/modules/studio/public/config', () => ({
+  config: { get appHome() { return root }, get port() { return runtime.port } },
+}))
+vi.mock('../../packages/server/src/modules/studio/public/auth', () => ({ getToken: async () => 'synthetic-loopback-token' }))
+vi.mock('../../packages/server/src/modules/studio/public/logging', () => ({ logger: { warn: vi.fn() } }))
+vi.mock('../../packages/server/src/modules/studio/public/profile-config', () => ({
+  updateConfigYamlForProfile: (profile: string, updater: Parameters<typeof safeFileStore.updateYaml>[1]) =>
+    safeFileStore.updateYaml(profilePath(profile), updater, { backup: true }),
+}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/stt/local-model-manager', () => ({
+  isLocalSttModelUsable: () => runtime.localUsable,
+  getLocalSttModelStatus: () => ({ usable: runtime.localUsable }),
+  LOCAL_STT_MODEL_ID: 'synthetic-local-model',
+}))
+// Settings controllers use the real repositories and sync service; speech/run
+// boundaries are unused here and must not load audio models or application state.
+vi.mock('../../packages/server/src/modules/studio/services/session-shares/access', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/public/mcu-voice', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/global-agent/mcu-agent-runtime', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/mcu/prompts', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/stt', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/stt/audio-convert', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/tts/core', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/tts/providers', () => ({}))
+vi.mock('../../packages/server/src/modules/studio/services/voice/tts/providers/url-safety', () => ({}))
 
-beforeEach(async () => {
-  vi.resetModules()
-  hermesHome = await mkdtemp(join(tmpdir(), 'hermes-voice-sync-'))
-  webUiHome = join(hermesHome, 'web-ui')
-  process.env.HERMES_HOME = hermesHome
-  process.env.HERMES_WEB_UI_HOME = webUiHome
-  process.env.AUTH_TOKEN = 'studio-server-token'
-  await mkdir(hermesHome, { recursive: true })
-  await writeFile(join(hermesHome, 'config.yaml'), 'model:\n  default: keep/model\n', 'utf-8')
-  await writeFile(join(hermesHome, '.env'), 'KEEP_SECRET=keep\n', 'utf-8')
-  await import('../../packages/server/src/bootstrap/agent-profile-adapter')
+import * as schemas from '../../packages/server/src/modules/studio/infrastructure/database/schemas'
+import * as settings from '../../packages/server/src/modules/studio/public/voice-settings'
+import { safeFileStore } from '../../packages/server/src/modules/studio/public/safe-file-store'
+import * as stt from '../../packages/server/src/modules/studio/controllers/stt'
+import * as tts from '../../packages/server/src/modules/studio/controllers/tts'
+import { syncVoiceConfigToHermesProfile } from '../../packages/server/src/modules/studio/services/voice/config-sync'
 
-  const { DatabaseSync } = await import('node:sqlite')
-  db = new DatabaseSync(':memory:')
-  vi.doMock('../../packages/server/src/modules/studio/infrastructure/database/index', () => ({
-    getDb: () => db,
-    getStoragePath: () => ':memory:',
-  }))
-
-  const schemas = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
-  schemas.initAllHermesTables()
-})
-
-afterEach(async () => {
-  db?.close()
-  db = null
-  vi.doUnmock('../../packages/server/src/modules/studio/infrastructure/database/index')
-  vi.doUnmock('../../packages/server/src/modules/studio/services/voice/stt/local-model-manager')
-  vi.resetModules()
-  if (originalHermesHome === undefined) delete process.env.HERMES_HOME
-  else process.env.HERMES_HOME = originalHermesHome
-  if (originalWebUiHome === undefined) delete process.env.HERMES_WEB_UI_HOME
-  else process.env.HERMES_WEB_UI_HOME = originalWebUiHome
-  if (originalAuthToken === undefined) delete process.env.AUTH_TOKEN
-  else process.env.AUTH_TOKEN = originalAuthToken
-  await rm(hermesHome, { recursive: true, force: true })
-})
-
-async function readConfig(): Promise<Record<string, any>> {
-  return YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as Record<string, any>
+const profilePath = (profile = 'work') => join(root, `${profile}.yaml`)
+const readProfile = (profile = 'work') => safeFileStore.readYaml(profilePath(profile))
+const controllers = { stt, tts }
+const customBlock = { type: 'command', command: 'local-transcriber --url http://127.0.0.1:8000/v1', timeout: 42, custom: 'keep' }
+const nativeConfig = {
+  model: { default: 'unrelated-model' },
+  stt: { provider: 'native-stt', enabled: false, providers: { 'native-stt': { model: 'keep-stt' } } },
+  tts: { provider: 'native-tts', providers: { 'native-tts': { voice: 'keep-tts' } } },
 }
 
-describe('Hermes voice config sync', () => {
-  it('registers one Ekko Studio provider while keeping upstream settings and secrets in Web UI storage', async () => {
-    const sttStore = await import('../../packages/server/src/modules/studio/repositories/stt-settings-store')
-    const ttsStore = await import('../../packages/server/src/modules/studio/repositories/tts-settings-store')
-    sttStore.saveSttProviderSetting('default', 'openai', {
-      settings: {
-        baseUrl: 'https://api.openai.com/v1/audio/transcriptions',
-        model: 'gpt-4o-transcribe',
-        language: 'zh',
-        prompt: 'Studio-only prompt remains in the database',
-      },
-      secrets: { apiKey: 'stt-secret' },
-    })
-    sttStore.saveActiveSttProvider('default', 'openai')
-    ttsStore.saveTtsProviderSetting('default', 'custom', {
-      settings: {
-        baseUrl: 'https://voice.example/v1/audio/speech',
-        model: 'custom-tts',
-        voice: 'nova',
-        rate: 1.25,
-        pitch: 4,
-      },
-      secrets: { apiKey: 'tts-secret' },
-    })
-    ttsStore.saveActiveTtsProvider('default', 'custom')
+function context(provider: string, body: object = {}, profile = 'work'): Context {
+  return {
+    state: { user: { id: 1 }, profile: { name: profile } },
+    params: { provider, secretName: 'apiKey' }, request: { body }, query: {},
+  } as unknown as Context
+}
 
-    const { syncVoiceConfigToHermesProfile } = await import('../../packages/server/src/modules/studio/services/voice/config-sync')
-    await expect(syncVoiceConfigToHermesProfile('default')).resolves.toEqual({
-      stt: 'hermes-studio',
-      tts: 'hermes-studio',
-    })
+beforeEach(async () => {
+  root = await mkdtemp(join(tmpdir(), 'voice-config-sync-'))
+  runtime.port = 18647
+  runtime.localUsable = true
+  db = new DatabaseSync(':memory:')
+  for (const prefix of ['STT_PROFILE_PROVIDER_SETTINGS', 'STT_PROFILE_SETTINGS', 'TTS_PROFILE_PROVIDER_SETTINGS', 'TTS_PROFILE_SETTINGS'] as const) {
+    db.exec(`CREATE TABLE ${schemas[`${prefix}_TABLE`]} (${Object.entries(schemas[`${prefix}_SCHEMA`]).map(([key, value]) => `${key} ${value}`).join(', ')})`)
+  }
+  for (const sql of Object.values({ ...schemas.STT_PROFILE_PROVIDER_SETTINGS_INDEXES, ...schemas.TTS_PROFILE_PROVIDER_SETTINGS_INDEXES })) db.exec(sql)
+  settings.saveSttProviderSetting('work', 'custom', { secrets: { apiKey: 'synthetic-stt-key' } })
+  settings.saveActiveSttProvider('work', 'custom')
+  settings.saveTtsProviderSetting('work', 'custom', { secrets: { apiKey: 'synthetic-tts-key' } })
+  settings.saveActiveTtsProvider('work', 'custom')
+  await safeFileStore.writeYaml(profilePath(), nativeConfig)
+  await writeFile(profilePath('other'), '# Another profile must stay byte-identical\nstt:\n  provider: local\n')
+})
+afterEach(async () => { db.close(); await rm(root, { recursive: true, force: true }); vi.restoreAllMocks() })
 
-    const config = await readConfig()
-    expect(config.model).toEqual({ default: 'keep/model' })
-    expect(config.stt.provider).toBe('hermes-studio')
-    expect(config.tts.provider).toBe('hermes-studio')
-    expect(config.stt.providers['hermes-studio']).toMatchObject({
-      type: 'command',
-      output_format: 'txt',
-    })
-    expect(config.tts.providers['hermes-studio']).toMatchObject({
-      type: 'command',
-      output_format: 'mp3',
-      voice_compatible: true,
-    })
-    expect(config.stt.providers['hermes-studio'].command).toContain(
-      '/api/studio/voice/proxy/default/v1/audio/transcriptions',
-    )
-    expect(config.tts.providers['hermes-studio'].command).toContain(
-      '/api/studio/voice/proxy/default/v1/tts',
-    )
-    expect(JSON.stringify(config)).not.toContain('stt-secret')
-    expect(JSON.stringify(config)).not.toContain('tts-secret')
-    expect(await readFile(join(hermesHome, '.env'), 'utf-8')).toBe('KEEP_SECRET=keep\n')
+it.each(['stt', 'tts'] as const)('selecting/saving %s changes only that section of the requested profile', async section => {
+  const otherSection = section === 'stt' ? 'tts' : 'stt'
+  const otherProfile = await readFile(profilePath('other'), 'utf8')
+  await controllers[section].saveSettings(context('custom', { settings: { model: 'new-model' } }))
+  let saved = await readProfile()
+  expect(saved[section]).toMatchObject({ provider: 'hermes-studio', providers: nativeConfig[section].providers })
+  expect(saved[section].providers['hermes-studio'].command).toContain(`/voice/proxy/work/v1/${section === 'stt' ? 'audio/transcriptions' : 'tts'}`)
+  expect(saved[otherSection]).toEqual(nativeConfig[otherSection])
+  expect(saved.model).toEqual(nativeConfig.model)
+  expect(JSON.stringify(saved)).not.toMatch(/synthetic-.*-key|synthetic-loopback-token/)
+  runtime.port = 18648
+  await controllers[section].saveActiveProvider(context('', { provider: 'custom' }))
+  saved = await readProfile()
+  expect(saved[section].providers['hermes-studio'].command).toContain(':18648/')
+  expect(saved[otherSection]).toEqual(nativeConfig[otherSection])
+  expect(await readFile(profilePath('other'), 'utf8')).toBe(otherProfile)
+  const curlrc = join(root, 'runtime', 'hermes-studio-voice.curlrc')
+  expect(await readFile(curlrc, 'utf8')).toContain('Bearer synthetic-loopback-token')
+  if (process.platform !== 'win32') expect((await stat(curlrc)).mode & 0o777).toBe(0o600)
+})
 
-    const curlConfig = await readFile(join(webUiHome, 'runtime', 'hermes-studio-voice.curlrc'), 'utf-8')
-    expect(curlConfig).toContain('Authorization: Bearer studio-server-token')
-    expect(curlConfig).not.toContain('stt-secret')
-    expect(curlConfig).not.toContain('tts-secret')
-  })
+it.each(['stt', 'tts'] as const)('preserves an edited %s command block on explicit selection and settings saves', async section => {
+  const yaml = await readProfile()
+  yaml[section].providers['hermes-studio'] = customBlock
+  await safeFileStore.writeYaml(profilePath(), yaml)
+  await controllers[section].saveActiveProvider(context('', { provider: 'custom' }))
+  await controllers[section].saveSettings(context('custom', { settings: { model: 'updated' } }))
+  expect((await readProfile())[section]).toMatchObject({ provider: 'hermes-studio', providers: { 'hermes-studio': customBlock } })
+})
 
-  it('maps browser STT to Hermes local and preserves provider-specific config', async () => {
-    await writeFile(join(hermesHome, 'config.yaml'), [
-      'stt:',
-      '  provider: openai',
-      '  local:',
-      '    model: small',
-      'tts:',
-      '  provider: openai',
-      '  edge:',
-      '    voice: old-voice',
-      '',
-    ].join('\n'), 'utf-8')
+it.each(['stt', 'tts'] as const)('deleting an inactive %s provider or secret does not write YAML', async section => {
+  if (section === 'stt') settings.saveSttProviderSetting('work', 'openai', { secrets: { apiKey: 'inactive-key' } })
+  else settings.saveTtsProviderSetting('work', 'openai', { secrets: { apiKey: 'inactive-key' } })
+  await controllers[section].saveActiveProvider(context('', { provider: 'custom' }))
+  const yaml = await readProfile()
+  yaml[section].providers['hermes-studio'] = customBlock
+  await safeFileStore.writeYaml(profilePath(), yaml)
+  const before = '# Preserve comments as well as values\n' + await readFile(profilePath(), 'utf8')
+  await writeFile(profilePath(), before)
+  await controllers[section].deleteSecret(context('openai'))
+  expect(section === 'stt' ? settings.getSttProviderSetting('work', 'openai')?.secrets : settings.getTtsProviderSetting('work', 'openai')?.secrets).toEqual({})
+  await controllers[section].deleteProvider(context('openai'))
+  expect(section === 'stt' ? settings.getSttProviderSetting('work', 'openai') : settings.getTtsProviderSetting('work', 'openai')).toBeNull()
+  expect(await readFile(profilePath(), 'utf8')).toBe(before)
+})
 
-    const sttStore = await import('../../packages/server/src/modules/studio/repositories/stt-settings-store')
-    const ttsStore = await import('../../packages/server/src/modules/studio/repositories/tts-settings-store')
-    sttStore.saveActiveSttProvider('default', 'browser')
-    ttsStore.saveTtsProviderSetting('default', 'edge', {
-      settings: { voice: 'zh-CN-XiaoxiaoNeural', rate: 1.1 },
-    })
-    ttsStore.saveActiveTtsProvider('default', 'edge')
+it.each(['stt', 'tts'] as const)('active %s secret removal falls back only for a Studio-owned selection', async section => {
+  await controllers[section].saveActiveProvider(context('', { provider: 'custom' }))
+  const before = await readProfile()
+  await controllers[section].deleteSecret(context('custom'))
+  const after = await readProfile()
+  expect(after[section].provider).toBe(section === 'stt' ? 'local' : 'edge')
+  expect(after[section].providers).toEqual(before[section].providers)
+  expect(after[section === 'stt' ? 'tts' : 'stt']).toEqual(before[section === 'stt' ? 'tts' : 'stt'])
+})
 
-    const { syncVoiceConfigToHermesProfile } = await import('../../packages/server/src/modules/studio/services/voice/config-sync')
-    await syncVoiceConfigToHermesProfile('default')
+it.each(['stt', 'tts'] as const)('active %s provider removal uses its fallback without changing the other type', async section => {
+  await controllers[section].saveActiveProvider(context('', { provider: 'custom' }))
+  const otherSection = section === 'stt' ? 'tts' : 'stt'
+  const before = (await readProfile())[otherSection]
+  const ctx = context('custom')
+  await controllers[section].deleteProvider(ctx)
+  expect(ctx.body).toMatchObject({ success: true, deleted: true, activeProvider: section === 'stt' ? 'browser' : 'edge' })
+  expect((await readProfile())[section].provider).toBe(section === 'stt' ? 'local' : 'hermes-studio')
+  expect((await readProfile())[otherSection]).toEqual(before)
+})
 
-    const config = await readConfig()
-    expect(config.stt).toEqual({
-      provider: 'local',
-      local: { model: 'small' },
-    })
-    expect(config.tts.provider).toBe('hermes-studio')
-    expect(config.tts.edge).toEqual({ voice: 'old-voice' })
-    expect(config.tts.providers['hermes-studio'].output_format).toBe('mp3')
-  })
+it.each(['stt', 'tts'] as const)('active %s removal preserves native selections and edited Studio commands', async section => {
+  for (const edited of [false, true]) {
+    const yaml = structuredClone(nativeConfig) as Record<string, any>
+    if (edited) { yaml[section].provider = 'hermes-studio'; yaml[section].providers['hermes-studio'] = customBlock }
+    await safeFileStore.writeYaml(profilePath(), yaml)
+    const before = '# Hand-maintained config\n' + await readFile(profilePath(), 'utf8')
+    await writeFile(profilePath(), before)
+    await controllers[section].deleteSecret(context('custom'))
+    await controllers[section].deleteProvider(context('custom'))
+    expect(await readFile(profilePath(), 'utf8')).toBe(before)
+    if (section === 'stt') settings.saveActiveSttProvider('work', 'custom')
+    else settings.saveActiveTtsProvider('work', 'custom')
+  }
+})
 
-  it('routes an available Studio local model through the non-streaming voice proxy', async () => {
-    vi.doMock('../../packages/server/src/modules/studio/services/voice/stt/local-model-manager', () => ({
-      isLocalSttModelUsable: () => true,
-    }))
-    const sttStore = await import('../../packages/server/src/modules/studio/repositories/stt-settings-store')
-    sttStore.saveSttProviderSetting('default', 'local', {
-      settings: { model: 'local-model' },
-      secrets: {},
-    })
-    sttStore.saveActiveSttProvider('default', 'local')
+it('keeps local/browser STT selection and Gemini output formats working', async () => {
+  await stt.saveActiveProvider(context('', { provider: 'local' }))
+  const local = (await readProfile()).stt.providers['hermes-studio']
+  expect(local).toMatchObject({ type: 'command', output_format: 'txt' })
+  await stt.saveActiveProvider(context('', { provider: 'browser' }))
+  expect((await readProfile()).stt).toMatchObject({ provider: 'local', providers: { 'hermes-studio': local } })
+  await tts.saveSettings(context('gemini', { secrets: { apiKey: 'synthetic-gemini-key' } }))
+  expect((await readProfile()).tts.providers['hermes-studio']).toMatchObject({ output_format: 'wav' })
+  await tts.saveActiveProvider(context('', { provider: 'edge' }))
+  expect((await readProfile()).tts.providers['hermes-studio']).toMatchObject({ output_format: 'mp3' })
+})
 
-    const { syncVoiceConfigToHermesProfile } = await import('../../packages/server/src/modules/studio/services/voice/config-sync')
-    await expect(syncVoiceConfigToHermesProfile('default')).resolves.toMatchObject({ stt: 'hermes-studio' })
-
-    const config = await readConfig()
-    expect(config.stt.provider).toBe('hermes-studio')
-    expect(config.stt.providers['hermes-studio']).toMatchObject({
-      type: 'command',
-      output_format: 'txt',
-    })
-  })
-
-  it('hides Groq and MiMo behind the same Ekko Studio provider', async () => {
-    const sttStore = await import('../../packages/server/src/modules/studio/repositories/stt-settings-store')
-    const ttsStore = await import('../../packages/server/src/modules/studio/repositories/tts-settings-store')
-    sttStore.saveSttProviderSetting('default', 'custom', {
-      settings: {
-        baseUrl: 'https://api.groq.com/openai/v1/audio/transcriptions',
-        model: 'whisper-large-v3-turbo',
-      },
-      secrets: { apiKey: 'groq-secret' },
-    })
-    sttStore.saveActiveSttProvider('default', 'custom')
-    ttsStore.saveTtsProviderSetting('default', 'mimo', {
-      settings: { model: 'mimo-v2.5-tts', voice: '冰糖' },
-      secrets: { apiKey: 'mimo-secret' },
-    })
-    ttsStore.saveActiveTtsProvider('default', 'mimo')
-
-    const { syncVoiceConfigToHermesProfile } = await import('../../packages/server/src/modules/studio/services/voice/config-sync')
-    await expect(syncVoiceConfigToHermesProfile('default')).resolves.toEqual({
-      stt: 'hermes-studio',
-      tts: 'hermes-studio',
-    })
-
-    const config = await readConfig()
-    expect(config.stt.provider).toBe('hermes-studio')
-    expect(config.tts.provider).toBe('hermes-studio')
-    expect(JSON.stringify(config)).not.toContain('groq-secret')
-    expect(JSON.stringify(config)).not.toContain('mimo-secret')
-    expect(await readFile(join(hermesHome, '.env'), 'utf-8')).toBe('KEEP_SECRET=keep\n')
-  })
-
-  it('uses a WAV command output for Gemini PCM audio', async () => {
-    const ttsStore = await import('../../packages/server/src/modules/studio/repositories/tts-settings-store')
-    ttsStore.saveTtsProviderSetting('default', 'gemini', {
-      settings: {
-        model: 'gemini-2.5-flash-preview-tts',
-        voice: 'Kore',
-      },
-      secrets: { apiKey: 'gemini-secret' },
-    })
-    ttsStore.saveActiveTtsProvider('default', 'gemini')
-
-    const { syncVoiceConfigToHermesProfile } = await import('../../packages/server/src/modules/studio/services/voice/config-sync')
-    await syncVoiceConfigToHermesProfile('default')
-
-    const config = await readConfig()
-    expect(config.tts.provider).toBe('hermes-studio')
-    expect(config.tts.providers['hermes-studio']).toMatchObject({
-      output_format: 'wav',
-      voice_compatible: true,
-    })
-  })
+it('reports skipped sections unchanged and contains profile-write failures', async () => {
+  expect(await syncVoiceConfigToHermesProfile('work', 'stt')).toEqual({ stt: 'unchanged', tts: 'unchanged' })
+  vi.spyOn(safeFileStore, 'updateYaml').mockRejectedValueOnce(new Error('synthetic write failure'))
+  expect(await syncVoiceConfigToHermesProfile('work', 'tts', { selectProvider: true })).toEqual({ stt: 'unchanged', tts: 'unchanged' })
+  expect(await readProfile()).toEqual(nativeConfig)
 })

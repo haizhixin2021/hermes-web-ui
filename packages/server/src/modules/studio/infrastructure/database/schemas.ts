@@ -619,6 +619,13 @@ export const USER_PROFILES_INDEXES = {
 }
 
 export const USER_THEMES_TABLE = 'user_themes'
+export const USER_NAVIGATION_TABLE = 'user_navigation'
+export const USER_NAVIGATION_SCHEMA: Record<string, string> = {
+  user_id: 'INTEGER PRIMARY KEY',
+  items_json: "TEXT NOT NULL DEFAULT '[]'",
+  schema_version: 'INTEGER NOT NULL DEFAULT 0',
+  updated_at: 'INTEGER NOT NULL',
+}
 export const USER_THEME_PRESETS_TABLE = 'user_theme_presets'
 
 export const USER_THEME_PRESETS_SCHEMA: Record<string, string> = {
@@ -1649,9 +1656,18 @@ function migrateSessionTaskSchema(db: NonNullable<ReturnType<typeof getDb>>): vo
         .replace(/^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:"session_tasks"|session_tasks)(?=\s*\()/i, `$1${quoteIdentifier(temporary)}`)
       db.exec(createSql)
       db.exec(`INSERT INTO ${quoteIdentifier(temporary)} (${columns}) SELECT ${columns} FROM ${quoteIdentifier(SESSION_TASKS_TABLE)}`)
+      // This cross-table gate references session_tasks from person_executions.
+      // SQLite validates all triggers during RENAME, including the short gap after DROP.
+      // Retire and restore only our gate inside this same transaction; rollback preserves it on failure.
+      const acceptanceGate = db.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='person_acceptance_execution_gate'").get() as { sql: string } | undefined
+      const acceptanceView = db.prepare("SELECT sql FROM sqlite_master WHERE type='view' AND name='person_acceptance_passes'").get() as {sql:string} | undefined
+      if (acceptanceGate) db.exec('DROP TRIGGER person_acceptance_execution_gate')
+      if (acceptanceView) db.exec('DROP VIEW person_acceptance_passes')
       db.exec(`DROP TABLE ${quoteIdentifier(SESSION_TASKS_TABLE)}`)
       db.exec(`ALTER TABLE ${quoteIdentifier(temporary)} RENAME TO ${quoteIdentifier(SESSION_TASKS_TABLE)}`)
       for (const object of objects) db.exec(object.sql)
+      if (acceptanceView) db.exec(acceptanceView.sql)
+      if (acceptanceGate) db.exec(acceptanceGate.sql)
     }
     db.exec('COMMIT')
   } catch (error) { db.exec('ROLLBACK'); throw error }
@@ -1772,6 +1788,8 @@ export function initAllHermesTables(): void {
     syncTable(MESSAGES_TABLE, MESSAGES_SCHEMA)
     initSessionStateTables(db)
     db.exec(MESSAGES_INDEX)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_messages_session_run ON messages(session_id,run_marker,id)')
+    db.exec("CREATE INDEX IF NOT EXISTS idx_messages_person_timeline ON messages(session_id,timestamp*1000,printf('%020d',id))")
     syncTable(SKILL_USAGE_EVENTS_TABLE, SKILL_USAGE_EVENTS_SCHEMA, {
       indexes: SKILL_USAGE_EVENTS_INDEXES,
     })
@@ -1827,6 +1845,7 @@ export function initAllHermesTables(): void {
       indexes: USER_PROFILES_INDEXES,
     })
     syncTable(USER_THEMES_TABLE, USER_THEMES_SCHEMA)
+    syncTable(USER_NAVIGATION_TABLE, USER_NAVIGATION_SCHEMA)
     syncTable(USER_THEME_PRESETS_TABLE, USER_THEME_PRESETS_SCHEMA, {
       indexes: { idx_user_theme_presets_user: 'CREATE INDEX IF NOT EXISTS idx_user_theme_presets_user ON user_theme_presets(user_id)' },
     })

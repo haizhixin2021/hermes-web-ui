@@ -1,10 +1,18 @@
 import type { PersonFlow } from '@/api/person'
 
 export type PersonFlowStage = PersonFlow['stages'][number]
-export type PersonFlowStatus = 'completed' | 'active' | 'running' | 'queued' | 'waiting_dependencies' | 'waiting_user' | 'waiting_person' | 'waiting_approval' | 'waiting_reply' | 'interrupted' | 'blocked'
+export type PersonFlowStatus = 'completed' | 'active' | 'running' | 'queued' | 'waiting_dependencies' | 'waiting_user' | 'waiting_person' | 'waiting_approval' | 'waiting_reply' | 'confirming' | 'interrupted' | 'blocked'
+
+export function personFlowParticipants(flow: PersonFlow) {
+  const bots = new Map<string,{id:string;title?:string | null;bot_type?:string}>()
+  if (flow.creator_session_id) bots.set(flow.creator_session_id,{id:flow.creator_session_id,title:flow.creator_session_title,bot_type:flow.creator_bot_type || undefined})
+  for (const stage of flow.stages) bots.set(stage.session_id,{id:stage.session_id,title:stage.session_title,bot_type:stage.bot_type || undefined})
+  return [...bots.values()]
+}
 
 export function personFlowVisibleInActivity(flow: PersonFlow, sessionId: string) {
-  return !!sessionId && flow.creator_session_id === sessionId && flow.state === 'active' && !flow.error
+  return !!sessionId && flow.creator_session_id === sessionId
+    && flow.state === 'active' && !flow.error
     && !flow.stages.some(stage => stage.state === 'failed' || stage.delivery_error
       || (stage.state !== 'completed' && stage.tasks.some(task => task.status === 'open' && ['failed','interrupted'].includes(task.execution_state || ''))))
 }
@@ -31,6 +39,7 @@ export function personFlowStageStatus(flow: PersonFlow, stage: PersonFlowStage):
   if (stage.state === 'pending') return 'waiting_dependencies'
   if (flow.state === 'stopped') return 'interrupted'
   if (stage.state === 'failed' || stage.delivery_error) return 'blocked'
+  if (stage.confirmation?.decision_pending) return 'waiting_user'
   const tasks = stage.tasks.filter(task => task.status !== 'closed')
   for (const state of ['waiting_user','waiting_approval','waiting_person'] as const) {
     if (tasks.some(task => task.execution_state === state)) return state
@@ -38,6 +47,7 @@ export function personFlowStageStatus(flow: PersonFlow, stage: PersonFlowStage):
   if (tasks.some(task => ['starting','running','stopping'].includes(task.execution_state || ''))) return 'running'
   if (tasks.some(task => task.status === 'open' && ['failed','interrupted'].includes(task.execution_state || ''))) return 'blocked'
   if (tasks.some(task => ['pending','queued'].includes(task.execution_state || '')) || stage.delivery_state === 'pending') return 'queued'
+  if (['pending','confirming'].includes(stage.confirmation?.state || '')) return 'confirming'
   if (stage.delivery_state === 'delivered') return 'waiting_reply'
   return 'active'
 }
@@ -59,5 +69,5 @@ export function personFlowState(flow: PersonFlow): PersonFlowStatus {
 }
 
 export function personFlowStatusKey(status: PersonFlowStatus) {
-  return ({ active:'person.flowInProgress',waiting_dependencies:'person.flowWaitingDependencies',waiting_reply:'person.flowWaitingReply',blocked:'person.flowBlocked' })[status as 'active' | 'waiting_dependencies' | 'waiting_reply' | 'blocked'] || `person.states.${status}`
+  return ({ confirming:'person.flowConfirming',active:'person.flowInProgress',waiting_dependencies:'person.flowWaitingDependencies',waiting_reply:'person.flowWaitingReply',blocked:'person.flowBlocked' })[status as 'confirming' | 'active' | 'waiting_dependencies' | 'waiting_reply' | 'blocked'] || `person.states.${status}`
 }

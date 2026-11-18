@@ -24,7 +24,9 @@ export interface PersonModelCall {
   onPrepared?: (request: ModelRequest) => void
 }
 export interface PersonChatAgentOptions extends Pick<PersonModelCall, 'selection' | 'tools' | 'systemPrompt' | 'maxSteps' | 'contextTokens' | 'compression' | 'beforeRequest' | 'summaryCache' | 'onSummaryUsage'> {
+  taskWaitState?: () => Array<{ executionId: string; ready: boolean }>
   returnExecutionId?: string
+  acceptanceReturnId?: string
   stage?: import('../contracts/person-stage').PersonStageContext
   workspace: string
   memory?: { service: MemoryService; identity: MemoryRuntimeIdentity }
@@ -41,11 +43,15 @@ export interface PersonResultDelivery {
   status: string
   output: string
   error: string
+  /** User adjustment bound to one execution, including on its linked review callback. */
+  manualFollowup?: { executionId: string; input: import('../contracts/runs/session').ContentBlock[] }
+  acceptance?: Record<string, unknown>
   returnExpectation?: string
   flow?: { index: number; total: number; stopped: boolean; completed: boolean; next_session_id: string | null }
 }
 export interface PersonRuntimePort {
-  deliver(input: PersonResultDelivery): Promise<void>
+  createDefaultWorkspace?(profile: string, sessionId: string): string
+  deliver(input: PersonResultDelivery & { claimId: string }): Promise<void>
   deliverStage?(input: { user: AuthenticatedUser; context: import('../contracts/person-stage').PersonStageContext; sessionId: string; input: string }): Promise<void>
   chatAgent?(input: PersonChatAgentOptions): {
     sessionWorkspaceDirectory(sessionId: string): string
@@ -58,8 +64,8 @@ export interface PersonRuntimePort {
     model_meta?: Record<string, { alias?: string; disabled?: boolean; reasoning?: boolean; reasoning_efforts?: string[] }>
   }> }>
   model(input: PersonModelCall): Promise<string>
-  nativeModels(runtime: string): Promise<{ status: string; models: Array<{ id: string; name: string; isDefault?: boolean; reasoningEffort?: string; reasoningEfforts?: string[] }> }>
-  execute(input: { user: AuthenticatedUser; selection: PersonSelection; sessionId: string; workspace: string; taskTimeoutMinutes: number; prompt: string | import('../contracts/runs/session').ContentBlock[]; displayInput?: string; signal: AbortSignal; onEvent(event: string, payload: Record<string, unknown>): void }): Promise<{ ok: boolean; output?: string; error?: string; interrupted?: boolean; stop_reason?: string }>
+  nativeModels(runtime: string, identity: { userId: number; profile: string }): Promise<{ status: string; models: Array<{ id: string; name: string; isDefault?: boolean; reasoningEffort?: string; reasoningEfforts?: string[] }> }>
+  execute(input: { purpose?: 'development' | 'verification'; waitForTermination?: boolean; user: AuthenticatedUser; selection: PersonSelection; sessionId: string; workspace: string; taskTimeoutMinutes: number; prompt: string | import('../contracts/runs/session').ContentBlock[]; displayInput?: string | import('../contracts/runs/session').ContentBlock[]; signal: AbortSignal; onEvent(event: string, payload: Record<string, unknown>): void }): Promise<{ ok: boolean; output?: string; error?: string; interrupted?: boolean; stop_reason?: string }>
   interruptForInsertion?(sessionId: string, expectedRunId: string, expectedRunMarker?: string): Promise<{ status: string; phase?: string }>
   answer(sessionId: string, id: string, response: string, approval: boolean): Promise<boolean>
   stop(sessionId: string): Promise<void>

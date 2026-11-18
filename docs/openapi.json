@@ -3,7 +3,7 @@
   "info": {
     "title": "Ekko Studio API",
     "description": "Ekko Studio API — chat sessions, scheduled jobs, platform channels, model management, skills, memory, logs, file browser, group chat, and terminal.",
-    "version": "0.8.12"
+    "version": "0.8.28"
   },
   "servers": [
     {
@@ -133,6 +133,14 @@
       "description": "Cross-agent workflow orchestration"
     },
     {
+      "name": "Studio Plugins",
+      "description": "Studio plugin installation, lifecycle, configuration, frontend API bridge, tools, commands, events and automation actions"
+    },
+    {
+      "name": "Studio Agents",
+      "description": "Native and plugin Agent availability, settings, engine installation, removal and automatic update policy"
+    },
+    {
       "name": "Sessions",
       "description": "Cross-agent chat session management"
     },
@@ -223,6 +231,10 @@
     {
       "name": "Theme",
       "description": "Per-user appearance settings and background image"
+    },
+    {
+      "name": "Navigation",
+      "description": "Per-user navigation entries, ordering and explicit plugin opt-in"
     },
     {
       "name": "Announcements",
@@ -3498,7 +3510,7 @@
           "Coding Agents"
         ],
         "summary": "Create install",
-        "description": "POST /api/coding-agents/:id/install",
+        "description": "Install or update a coding agent. npm-managed agents accept an exact target version or latest. DSH candidates use isolated prefixes and must pass ACP compatibility/startup checks before activation; empty DSH options honor the current pin. Rollback is DSH-only.",
         "operationId": "install",
         "security": [
           {
@@ -3525,7 +3537,27 @@
               "type": "string"
             }
           }
-        ]
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "description": "Exact npm version or latest for npm-managed agents. For DSH, latest explicitly removes a pin after successful activation."
+                  },
+                  "rollback": {
+                    "type": "boolean",
+                    "description": "DSH only: revalidate and restore the previous working graph, then pin it. Mutually exclusive with version."
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/coding-agents/{id}/launch/native": {
@@ -4125,13 +4157,284 @@
         }
       }
     },
+    "/api/ekko-studio/models/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Request a model using OpenAI Chat Completions",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiChatCompletions",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "model",
+                  "messages"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ekko-studio/models/v1/messages": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Request a model using Anthropic Messages",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiMessages",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "model",
+                  "messages"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ekko-studio/models/v1/messages/count_tokens": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Count message input tokens (native or explicitly estimated)",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiCountTokens",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Input count. x-studio-token-count-estimated=true marks a conservative estimate for non-Anthropic upstreams; no inference usage is recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "model",
+                  "messages"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/ekko-studio/models/v1/models": {
       "get": {
         "tags": [
           "Model API"
         ],
         "summary": "List configured models with provider-qualified IDs",
-        "description": "Model API keys see only their explicitly allowed model IDs; Studio user JWTs see the full account catalog. Aggregates all accessible Profiles as provider/model and deduplicates IDs, preserving slashes inside native model IDs. Callable configurations win over disabled/unsupported duplicates, then default Profile, then Profile names in lexical order. Caller Profile selectors are ignored. Never returns credentials. MoA presets and self-referencing Model API providers using a locally issued Model API key are excluded from this catalog. responses_supported=false marks disabled models and providers requiring Bedrock or Codex app-server runtimes.",
+        "description": "Model API keys see only their explicitly allowed model IDs; Studio user JWTs see the full account catalog. Providers are stored once per account and shared by all Profiles, preserving slashes inside model IDs. Identical imported Providers merge; same-name Providers with different configurations retain separate stable IDs and credentials. Earlier Profile-derived model IDs remain compatibility aliases. Caller Profile selectors are ignored. Never returns credentials. MoA presets and self-referencing Model API providers using a locally issued Model API key are excluded from this catalog. responses_supported=false marks disabled models and providers requiring Bedrock or Codex app-server runtimes.",
         "operationId": "modelApiModels",
         "security": [
           {
@@ -4219,11 +4522,17 @@
           "Model API"
         ],
         "summary": "Request a configured model using OpenAI Responses format",
-        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. Every attempted upstream request records external usage under the authenticated user. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations.",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
         "operationId": "modelApiResponses",
         "security": [
           {
             "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
           }
         ],
         "responses": {
@@ -4307,6 +4616,7 @@
             "description": "Upstream model request failed"
           }
         },
+        "parameters": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -4345,9 +4655,6 @@
                   },
                   "store": {
                     "type": "boolean",
-                    "enum": [
-                      false
-                    ],
                     "default": false
                   },
                   "max_output_tokens": {
@@ -4409,20 +4716,24 @@
                           "type": "object"
                         },
                         "strict": {
-                          "type": "boolean",
-                          "enum": [
-                            false
-                          ]
+                          "type": "boolean"
                         }
                       }
                     }
                   },
                   "tool_choice": {
-                    "type": "string",
-                    "enum": [
-                      "auto",
-                      "none",
-                      "required"
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "auto",
+                          "none",
+                          "required"
+                        ]
+                      },
+                      {
+                        "type": "object"
+                      }
                     ]
                   },
                   "metadata": {
@@ -4437,8 +4748,7 @@
               }
             }
           }
-        },
-        "parameters": []
+        }
       }
     },
     "/api/ekko/config": {
@@ -11723,6 +12033,125 @@
         ]
       }
     },
+    "/api/navigation": {
+      "get": {
+        "tags": [
+          "Navigation"
+        ],
+        "summary": "Read the signed-in user navigation settings; plugins are excluded by default",
+        "description": "GET /api/navigation",
+        "operationId": "getNavigation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account-scoped navigation settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "maxItems": 201,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Ordered built-in IDs or plugin:<pluginId>/<viewId>. New plugin selections must target active registered navigation.main entries."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Studio login required; shared sessions cannot change navigation"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Navigation"
+        ],
+        "summary": "Save the signed-in user navigation selection and ordering",
+        "description": "PUT /api/navigation",
+        "operationId": "updateNavigation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account-scoped navigation settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "maxItems": 201,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Ordered built-in IDs or plugin:<pluginId>/<viewId>. New plugin selections must target active registered navigation.main entries."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid, duplicate or unregistered navigation entry"
+          },
+          "401": {
+            "description": "Studio login required; shared sessions cannot change navigation"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "items"
+                ],
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "maxItems": 201,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Ordered built-in IDs or plugin:<pluginId>/<viewId>. New plugin selections must target active registered navigation.main entries."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/openapi.json": {
       "get": {
         "tags": [
@@ -12290,6 +12719,489 @@
         }
       }
     },
+    "/api/studio/agents": {
+      "get": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "List agents",
+        "description": "GET /api/studio/agents",
+        "operationId": "list",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/studio/agents/{id}/check-update": {
+      "post": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Create check-update",
+        "description": "POST /api/studio/agents/:id/check-update",
+        "operationId": "checkUpdate",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/models": {
+      "get": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Get models",
+        "description": "GET /api/studio/agents/:id/models",
+        "operationId": "models",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/remove": {
+      "post": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Remove an Agent engine",
+        "description": "Interactive super administrator only. Remove the managed Agent engine, retaining the plugin, configuration and conversation data. Active runs, concurrent maintenance and stale versions are rejected.",
+        "operationId": "remove",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Agent engine removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "removed"
+                  ],
+                  "properties": {
+                    "removed": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Removal is unsupported or the request is invalid."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Interactive super administrator login required."
+          },
+          "409": {
+            "description": "Agent is busy or its installed version changed."
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "expectedVersion"
+                ],
+                "properties": {
+                  "expectedVersion": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/settings": {
+      "post": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Create settings",
+        "description": "POST /api/studio/agents/:id/settings",
+        "operationId": "settings",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/status": {
+      "get": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Get status",
+        "description": "GET /api/studio/agents/:id/status",
+        "operationId": "status",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/update-policy": {
+      "get": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Read Agent automatic update capability and preference",
+        "description": "Interactive super administrator only. Returns autoUpdate, autoUpdateSupported, status, currentVersion, latestVersion, checkedAt and optional error. Unsupported installations cannot enable automatic updates. Policy is host-wide; scheduled updates use the plugin activation identity and wait for a full idle grace period.",
+        "operationId": "updatePolicy",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Agent update policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "autoUpdate",
+                    "autoUpdateSupported",
+                    "status",
+                    "currentVersion",
+                    "latestVersion",
+                    "checkedAt"
+                  ],
+                  "properties": {
+                    "autoUpdate": {
+                      "type": "boolean"
+                    },
+                    "autoUpdateSupported": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "unknown",
+                        "checking",
+                        "current",
+                        "available",
+                        "waiting",
+                        "updating",
+                        "failed"
+                      ]
+                    },
+                    "currentVersion": {
+                      "type": "string"
+                    },
+                    "latestVersion": {
+                      "type": "string"
+                    },
+                    "checkedAt": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid preference or automatic updates are unsupported."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Interactive super administrator login required."
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Agent plugin is disabled or unavailable."
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Set Agent automatic update preference",
+        "description": "Interactive super administrator only. Returns autoUpdate, autoUpdateSupported, status, currentVersion, latestVersion, checkedAt and optional error. Unsupported installations cannot enable automatic updates. Policy is host-wide; scheduled updates use the plugin activation identity and wait for a full idle grace period.",
+        "operationId": "setUpdatePolicy",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current Agent update policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "autoUpdate",
+                    "autoUpdateSupported",
+                    "status",
+                    "currentVersion",
+                    "latestVersion",
+                    "checkedAt"
+                  ],
+                  "properties": {
+                    "autoUpdate": {
+                      "type": "boolean"
+                    },
+                    "autoUpdateSupported": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "unknown",
+                        "checking",
+                        "current",
+                        "available",
+                        "waiting",
+                        "updating",
+                        "failed"
+                      ]
+                    },
+                    "currentVersion": {
+                      "type": "string"
+                    },
+                    "latestVersion": {
+                      "type": "string"
+                    },
+                    "checkedAt": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid preference or automatic updates are unsupported."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Interactive super administrator login required."
+          },
+          "409": {
+            "description": "Agent plugin is disabled or unavailable."
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "autoUpdate"
+                ],
+                "properties": {
+                  "autoUpdate": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/studio/agents/{id}/upgrade": {
+      "post": {
+        "tags": [
+          "Studio Agents"
+        ],
+        "summary": "Create upgrade",
+        "description": "POST /api/studio/agents/:id/upgrade",
+        "operationId": "upgrade",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/studio/announcements": {
       "get": {
         "tags": [
@@ -12559,8 +13471,8 @@
         "tags": [
           "Chat Run"
         ],
-        "summary": "Run chat and wait for completion",
-        "description": "Starts a Ekko Studio chat run through the chat-run transport and waits for a terminal result. Use this from HTTP/MCP callers that cannot consume Socket.IO streams.\nApp session sharing: requires the claimed recipient identity and input permission; scope is fixed to the shared session. workspace-file/content with download=1 requires download instead. Agent and terminal execution retain existing host permissions.",
+        "summary": "Start or queue a chat run, optionally waiting for completion",
+        "description": "Starts an Ekko Studio chat run through the authenticated chat-run transport. By default waits for a terminal result; wait=false returns HTTP 202 once started or queued. Existing sessions must belong to the selected Profile. Existing agent and model settings are used when omitted. Use this from HTTP/MCP callers that cannot consume Socket.IO streams.\nApp session sharing: requires the claimed recipient identity and input permission; scope is fixed to the shared session. workspace-file/content with download=1 requires download instead. Agent and terminal execution retain existing host permissions.",
         "operationId": "runChatOnce",
         "security": [
           {
@@ -12724,6 +13636,11 @@
                     "default": 300000,
                     "description": "Maximum time to wait for run.completed or run.failed."
                   },
+                  "wait": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Set false to return when the run starts or queues. Response includes session_id, run_id when started, and queue_id when available. Observe events or history for later results."
+                  },
                   "include_events": {
                     "type": "boolean",
                     "default": false,
@@ -12774,6 +13691,9 @@
                 }
               }
             }
+          },
+          "202": {
+            "description": "Run accepted or queued; JSON includes status, session_id and available run_id/queue_id"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -12845,6 +13765,9 @@
                   "method": {
                     "type": "string",
                     "enum": [
+                      "cdp.attach",
+                      "cdp.send",
+                      "cdp.events",
                       "state",
                       "tabs.list",
                       "tabs.create",
@@ -13181,6 +14104,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "The destination already exists."
           }
         },
         "requestBody": {
@@ -13301,6 +14227,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "A file or directory already exists at this path."
           }
         },
         "requestBody": {
@@ -13313,12 +14242,18 @@
                   "content": {
                     "type": "string"
                   },
+                  "createOnly": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Reject an existing destination instead of editing it."
+                  },
                   "path": {
                     "type": "string"
                   }
                 },
                 "required": [
-                  "path"
+                  "path",
+                  "content"
                 ]
               }
             }
@@ -15577,6 +16512,169 @@
         ]
       }
     },
+    "/api/studio/group-chat/rooms/{roomId}/messages": {
+      "get": {
+        "tags": [
+          "Group Chat"
+        ],
+        "operationId": "listGroupChatMessages",
+        "summary": "Read persisted group messages with room readership authorization",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Studio login required"
+          },
+          "403": {
+            "description": "Profile, room or operation access denied"
+          },
+          "404": {
+            "description": "Session or room not found"
+          },
+          "409": {
+            "description": "Use the owning workflow or group operation"
+          },
+          "503": {
+            "description": "Runtime unavailable"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Group Chat"
+        ],
+        "operationId": "sendGroupChatMessage",
+        "summary": "Send a message as the authenticated human member; mention routing uses the normal group transport and permissions",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Studio login required"
+          },
+          "403": {
+            "description": "Profile, room or operation access denied"
+          },
+          "404": {
+            "description": "Session or room not found"
+          },
+          "409": {
+            "description": "Use the owning workflow or group operation"
+          },
+          "503": {
+            "description": "Runtime unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": true
+                        }
+                      }
+                    ]
+                  },
+                  "mentions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "required": [
+                  "content"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/studio/group-chat/rooms/{roomId}/messages/delete": {
       "post": {
         "tags": [
@@ -15675,6 +16773,79 @@
                     "pattern": "^[a-f0-9]{64}$"
                   }
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/group-chat/rooms/{roomId}/stop": {
+      "post": {
+        "tags": [
+          "Group Chat"
+        ],
+        "operationId": "stopGroupChatAgent",
+        "summary": "Interrupt one named Agent using the same ownership checks as the group chat UI",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Studio login required"
+          },
+          "403": {
+            "description": "Profile, room or operation access denied"
+          },
+          "404": {
+            "description": "Session or room not found"
+          },
+          "409": {
+            "description": "Use the owning workflow or group operation"
+          },
+          "503": {
+            "description": "Runtime unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agentName": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "agentName"
+                ]
               }
             }
           }
@@ -15864,7 +17035,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "boolean"
+              "type": "boolean",
+              "enum": [
+                "1"
+              ]
             }
           },
           {
@@ -15880,7 +17054,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "boolean"
+              "type": "boolean",
+              "enum": [
+                "1"
+              ]
             }
           }
         ]
@@ -16137,6 +17314,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "The destination already exists."
           }
         },
         "parameters": [
@@ -16193,6 +17373,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "A file or directory already exists at this path."
           }
         },
         "parameters": [
@@ -16213,14 +17396,21 @@
                 "type": "object",
                 "properties": {
                   "content": {
-                    "type": "object",
-                    "additionalProperties": true
+                    "type": "string"
+                  },
+                  "createOnly": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Reject an existing destination instead of editing it."
                   },
                   "path": {
-                    "type": "object",
-                    "additionalProperties": true
+                    "type": "string"
                   }
-                }
+                },
+                "required": [
+                  "path",
+                  "content"
+                ]
               }
             }
           }
@@ -18680,7 +19870,7 @@
           "Model API"
         ],
         "summary": "Create an account-wide Model API key",
-        "description": "Requires Studio user authentication. Key allows model listing and Responses inference only for the explicitly selected models; valid until revoked. Only the hash is persisted. Limit: 50 keys per account. Cache-Control: no-store.",
+        "description": "Requires Studio user authentication. Key allows model listing and supported protocol inference only for the explicitly selected models; valid until revoked. Only the hash is persisted. Limit: 50 keys per account. Cache-Control: no-store.",
         "operationId": "modelApiCreateKey",
         "security": [
           {
@@ -19285,6 +20475,15 @@
               "type": "string"
             },
             "description": "Selected owned conversation; omitted returns shared settings with session=null and creates no conversation."
+          },
+          {
+            "name": "include_flows",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": true
+            },
+            "description": "Include collaboration history and activity. Studio uses false because resume and person.updated deliver personFlows with the conversation."
           }
         ]
       }
@@ -19443,7 +20642,7 @@
           "Person"
         ],
         "summary": "Create conversations",
-        "description": "Create an account-owned, user-named conversation with a generated session ID and a persisted bot_type (defaults to zhezhe). Duplicate BOT names return HTTP 409 with code PERSON_BOT_NAME_EXISTS; concurrent creates are checked in the insertion transaction. Optional model and reasoning_effort apply only to the new conversation. Optional workspace changes the account-shared workspace atomically with creation and requires current expected_revision and idle work. Unknown bot types are rejected. Memory and Agent presets remain shared across the account.",
+        "description": "Create an account-owned, user-named conversation with a generated session ID and a persisted bot_type (defaults to zhezhe). Duplicate BOT names return HTTP 409 with code PERSON_BOT_NAME_EXISTS; concurrent creates are checked in the insertion transaction. Optional model and reasoning_effort apply only to the new conversation. Omitted, null or blank workspace creates an independent default directory using the Ekko single-chat directory manager. A nonblank workspace must be an existing accessible absolute directory. Its real path is persisted only for this Bot; old bindings and account settings are unchanged. Directory provisioning or access failures return HTTP 409 with code WORKSPACE_UNAVAILABLE. Workspace files survive conversation deletion; running an existing Bot never silently changes or recreates its bound directory. Optional expected_revision is checked before creation. Unknown bot types are rejected. Memory and Agent presets remain shared across the account.",
         "operationId": "conversationCreate",
         "security": [
           {
@@ -19503,13 +20702,14 @@
                   },
                   "workspace": {
                     "type": "string",
+                    "nullable": true,
                     "maxLength": 4000,
-                    "description": "Optional account-shared absolute workspace; empty restores the account private workspace. A change requires expected_revision and idle replies, tasks and deliveries, and commits atomically with BOT creation."
+                    "description": "Optional existing absolute directory for this Bot. Omitted, null or blank creates an independent per-session workspace using the Ekko single-chat directory manager. The effective real path is persisted; invalid manual paths and default provisioning failures return WORKSPACE_UNAVAILABLE without creating a Bot. Other Bot bindings and account settings are unchanged."
                   },
                   "expected_revision": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Current account settings revision, required when workspace changes."
+                    "description": "Optional current account settings revision; when supplied, stale values return HTTP 409 before creation."
                   }
                 },
                 "required": [
@@ -19615,7 +20815,7 @@
           "Person"
         ],
         "summary": "Create apply",
-        "description": "Create a flow with session_id (creator), title, goal and stages (session_id, goal, return_expectation). Omit group on all stages for serial execution, or set ordered contiguous group numbers from zero on every stage: 0,0,1 runs A and B in parallel then C. Each role appears once per group; the creator may join a first parallel group. The next group receives every previous-group result only after all are saved. No execution preset is required. Stop/resume require flow_id and current expected_revision. Stop cancels all stage turns, deliveries and workers; resume requeues only unfinished branches with a new generation, preserving completed results. Only an assigned live model turn may prepare its branch completion; its stage and generation fence the operation, so peer revision changes do not require retries. The host commits it after saving its final result. Route and creator are immutable.",
+        "description": "Create a flow with session_id (creator), title, goal and stages (session_id, goal, return_expectation). Omit group on all stages for serial execution, or set ordered contiguous group numbers from zero on every stage: 0,0,1 runs A and B in parallel then C. Each role appears once per group; the creator may join a first parallel group. The next group receives every previous-group result only after all are saved. No execution preset is required. Stop/resume require flow_id and current expected_revision. Stop cancels all stage turns, deliveries and workers; resume requeues only unfinished branches with a new generation, preserving completed results. Only an assigned live model turn may prepare its branch completion; its stage and generation fence the operation, so peer revision changes do not require retries. The host commits it after saving its final result. Route and creator are immutable. Optional rounds defaults to 1; 2–1000 repeats that many rounds, while 0 repeats until explicitly stopped. Each round preserves result message references and passes its last group to the next round’s first group. Stop/resume retain the current round. Completion alone does not create an unread notification or wake the creator; save a later recipient stage when a return is requested. If a saved reply omits completion with no outstanding work or decision, the host makes at most two persisted status-only confirmation attempts with the same Bot, without task tools or a second result. Exhaustion, missing input and execution failures block downstream progression and retain original results; explicit resume confirms saved candidates rather than rerunning them. Claims are fenced by stage, generation, original run/message and a durable lease.",
         "operationId": "flowApply",
         "security": [
           {
@@ -19671,6 +20871,13 @@
                     "type": "string",
                     "maxLength": 8000
                   },
+                  "rounds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "default": 1,
+                    "description": "Total rounds; 0 repeats until explicitly stopped. Opt in only when requested."
+                  },
                   "stages": {
                     "type": "array",
                     "minItems": 1,
@@ -19684,6 +20891,11 @@
                         "return_expectation"
                       ],
                       "properties": {
+                        "group": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 12
+                        },
                         "session_id": {
                           "type": "string",
                           "description": "Owning Person conversation ID. Required for new work; continuations preserve the existing task conversation."
@@ -19759,6 +20971,61 @@
             }
           }
         }
+      }
+    },
+    "/api/studio/person/flows/{id}/messages": {
+      "get": {
+        "tags": [
+          "Person"
+        ],
+        "summary": "Get messages",
+        "description": "Read the original visible messages of one account-owned collaboration in a unified conversation. Correlates exact creator/stage run identities across rounds and resume generations; never includes unrelated turns from the same Bot. Older flows use their exact persisted confirmations and result references. Returns flow metadata, chronological messages with source Bot identity, has_more, next_before_id and history_key. Hidden reasoning, tool payloads and system prompts are projected out as in ordinary Bot chat. Cleared/deleted creator history is unavailable. Read-only; does not copy messages, mark participant chats read, send messages or wake any Bot.",
+        "operationId": "flowConversation",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_id",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Exclusive message ID cursor for earlier entries; omit for the latest page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            }
+          }
+        ]
       }
     },
     "/api/studio/person/interactions/{id}/answer": {
@@ -20256,7 +21523,7 @@
           "Person"
         ],
         "summary": "Create apply",
-        "description": "Studio user login required. Account isolation is enforced by the server. Mutations use current revisions; task and schedule operations require an idempotency key. Worker question answers are delivered through their original interactive runtime.",
+        "description": "Studio user login required. Account isolation is enforced by the server. Mutations use current revisions; task and schedule operations require an idempotency key. Worker question answers are delivered through their original interactive runtime. Optional acceptance is off by default. Configure on create/adopt or configure_acceptance before the first execution. Development finishes while the goal stays open. Newly configured acceptance uses host-owned automatic progression: the host dispatches a linked acceptance task, continues the original developer after a recorded product failure, and reuses the SAME acceptance task and Agent with a fresh execution for re-verification. Existing Bot-driven cycles retain explicit verify and continue: verify uses task_id, expected_revision and idempotency_key. Invalid review evidence can be corrected in the decision or rechecked through the existing acceptance task without rerunning development. Attempt and total-time budgets survive repair rounds. The host blocks unaccepted goal completion in SQLite. Existing legacy executions retain their old receipts. Direct stages, assistant schedules and legacy next_steps do not support direct acceptance. During a Bot acceptance cycle, development follow-up queuing and queue insertion are rejected explicitly. Due worker occurrences treat unsettled acceptance as busy and use the existing skip policy. Verification tasks cannot be independently scheduled or reconfigured. Independent Agents receive readable requirement/checklist briefs and return ordinary written reports without a fixed format. A successful verification execution enters awaiting_review, keeping both goals open. Bot reads the report and records its evidence-backed per-criterion decision with action=record_acceptance on the development task, task_id, expected_revision, expected_execution_id, verification_execution_id, report and idempotency_key. The host checks current identities, deadline and actual evidence before allowing completion. Missing evidence can be corrected in the decision arguments or rechecked using verify; newly configured acceptance automatically dispatches verification, continues the same developer for recorded product defects and re-verifies the repaired result using the same linked task. Missing Bot decisions are retried at most three decision turns per verification attempt, then blocked; overall round and deadline budgets are preserved. Environment blockers, stop and interruption do not retry development. Persisted earlier cycles retain their prior callback contract. Runtime success and report keywords never complete acceptance. reviewer_session_id binds an explicitly named reviewing Bot, independently of verifier_agent_id. Its decision is returned durably to the original developer Bot without a duplicate role flow. Every decision check reconciles issues: unresolved in-scope issues normalize passed into failed and trigger repair; non-blocking labels do not waive defects. Resolved/out_of_scope requires a reason. Versioned decision receipts preserve historical validated results and fence stale return callbacks.",
         "operationId": "taskApply",
         "security": [
           {
@@ -20294,7 +21561,10 @@
                       "start",
                       "stop",
                       "close",
-                      "reopen"
+                      "reopen",
+                      "configure_acceptance",
+                      "verify",
+                      "record_acceptance"
                     ]
                   },
                   "idempotency_key": {
@@ -20330,6 +21600,175 @@
                   "start": {
                     "type": "boolean",
                     "default": true
+                  },
+                  "acceptance": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "enabled"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "criteria": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 2000
+                        }
+                      },
+                      "verifier_agent_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100
+                      },
+                      "reviewer_session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100,
+                        "description": "Optional named reviewing Bot conversation. Its linked review task and decision callback belong to this Bot; decisions return to the original developer Bot for repair/reporting. Worker preset identity does not replace Bot identity."
+                      },
+                      "max_attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "default": 3
+                      },
+                      "timeout_minutes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "default": 30
+                      }
+                    }
+                  },
+                  "verification_execution_id": {
+                    "type": "string",
+                    "description": "record_acceptance: exact current finished verification execution."
+                  },
+                  "report": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "verdict",
+                      "summary",
+                      "checks"
+                    ],
+                    "description": "Bot decision tool arguments after reading an ordinary verifier report; never a required Agent response format.",
+                    "properties": {
+                      "verdict": {
+                        "type": "string",
+                        "enum": [
+                          "passed",
+                          "failed",
+                          "blocked"
+                        ]
+                      },
+                      "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000
+                      },
+                      "checks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "criterion_id",
+                            "status",
+                            "findings",
+                            "evidence",
+                            "issues"
+                          ],
+                          "properties": {
+                            "criterion_id": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 100
+                            },
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "passed",
+                                "failed",
+                                "blocked"
+                              ]
+                            },
+                            "findings": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 4000
+                            },
+                            "evidence": {
+                              "type": "array",
+                              "maxItems": 10,
+                              "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "path",
+                                  "description"
+                                ],
+                                "properties": {
+                                  "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 4000
+                                  },
+                                  "description": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 2000
+                                  }
+                                }
+                              }
+                            },
+                            "issues": {
+                              "type": "array",
+                              "maxItems": 20,
+                              "description": "Explicit product issue reconciliation. Unresolved in-scope defects require repair even when non-blocking. Resolved/out_of_scope needs a concrete reason.",
+                              "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                  "description",
+                                  "disposition",
+                                  "reason"
+                                ],
+                                "properties": {
+                                  "description": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 2000
+                                  },
+                                  "disposition": {
+                                    "type": "string",
+                                    "enum": [
+                                      "repair",
+                                      "resolved",
+                                      "out_of_scope"
+                                    ]
+                                  },
+                                  "reason": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 2000
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
                   }
                 },
                 "required": [
@@ -20419,7 +21858,7 @@
           "Person"
         ],
         "summary": "Get chat",
-        "description": "Open the selected account-owned execution conversation. Each fresh task start and scheduled occurrence has an independent session. Returns recent executions, task and session metadata for standard socket resume. It stays excluded from ordinary session lists. Read-only history is permitted to its owner; direct run, abort and other session mutations remain forbidden.",
+        "description": "Open the selected account-owned execution conversation. Each fresh task start and scheduled occurrence has an independent session. Returns recent conversation entries, task and session metadata for standard socket resume. Corrections reuse the original conversation, preserving its messages and native session identity. It stays excluded from ordinary session lists. Read-only history is permitted to its owner; direct run, abort and other session mutations remain forbidden. Enabled tasks also return acceptance with immutable snapshot, state/reason/deadline and ordered attempts containing actual verifier session/run IDs, ordinary report text, Bot decision/actor receipt, errors and host-computed evidence path/size/SHA-256. Statuses include pending, developing, awaiting_dispatch, verification_pending, awaiting_review, repair_required, passed, failed, blocked and interrupted. No independent verification is claimed when the native run identity or evidence is missing.",
         "operationId": "taskChat",
         "security": [
           {
@@ -20460,8 +21899,8 @@
         "tags": [
           "Person"
         ],
-        "summary": "Create chat",
-        "description": "Continue a non-closed task in the conversation selected by execution_id, or the current execution when omitted. Background schedules start fresh conversations; follow-ups retain the selected conversation. Running work queues follow-ups durably in FIFO order; completed tasks reopen. Stopping, stale revisions and a full queue return 409. Results return to the task-owning Person conversation, including cross-conversation instructions.",
+        "summary": "Send a natural-language task follow-up",
+        "description": "The server compares this user input with the saved goal and conversation. Compatible additions queue normally; a replacement instruction updates the goal and title, invalidates obsolete pending work/results, and waits for confirmed termination before continuing. No intent/mode parameter is needed. Rejected or unclear classification never silently starts replacement work; retry with the same idempotency key. Observed revision and execution checks remain authoritative. Corrections stop the current execution, then send the latest complete requirements in the SAME task conversation after native termination. Earlier execution links retain historical receipts in this same conversation; fresh task controls target the current execution. A separate obsolete conversation remains readable but cannot receive new work. An explicit stop-only instruction uses the existing stop operation without creating a replacement.",
         "operationId": "taskContinue",
         "security": [
           {
@@ -20969,6 +22408,779 @@
                 },
                 "required": [
                   "slug"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins": {
+      "get": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "listStudioPlugins",
+        "summary": "List globally installed plugins and registered tools, commands and actions for every account; no Profile selection required",
+        "parameters": [],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/development": {
+      "get": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "listStudioDevelopmentPlugins",
+        "summary": "List locally registered development projects and build status; super administrator login required",
+        "parameters": [],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/events": {
+      "get": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "pollStudioPluginEvents",
+        "summary": "Poll user/profile-scoped plugin events with generation and cursor",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Execution context only; installations and enablement are global. Managed run credentials remain bound to their run Profile."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pluginId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sessionId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/install": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "installStudioPlugin",
+        "summary": "Install or upgrade a trusted compiled plugin; requires a super administrator login",
+        "parameters": [],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "description": "Absolute local directory, package@exact-version, github:owner/repo#40-character-commit, or git+https GitLab.com/Gitee repository pinned to a full commit"
+                  },
+                  "revision": {
+                    "type": "integer"
+                  },
+                  "trusted": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  },
+                  "pluginId": {
+                    "type": "string",
+                    "description": "Existing plugin id when upgrading"
+                  },
+                  "expectedVersion": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Optional exact manifest version; a mismatch leaves the existing installation unchanged"
+                  }
+                },
+                "required": [
+                  "source",
+                  "revision",
+                  "trusted"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}": {
+      "patch": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "updateStudioPlugin",
+        "summary": "Globally enable, disable, configure, reload, roll back or uninstall a plugin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "revision": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "config": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "reload",
+                      "rollback",
+                      "uninstall",
+                      "stop-development"
+                    ]
+                  }
+                },
+                "required": [
+                  "revision"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/api": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "requestStudioPluginApi",
+        "summary": "Call an existing Studio JSON API using the plugin capabilities and current user permissions",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Execution context only; installations and enablement are global. Managed run credentials remain bound to their run Profile."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "options": {
+                    "type": "object",
+                    "properties": {
+                      "method": {
+                        "type": "string",
+                        "enum": [
+                          "GET",
+                          "POST",
+                          "PUT",
+                          "PATCH",
+                          "DELETE"
+                        ]
+                      },
+                      "query": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "body": {}
+                    }
+                  },
+                  "sessionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/browser": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "summary": "Call the plugin SDK v1 Desktop browser module",
+        "description": "Requires an enabled SDK v1 plugin declaring browser.cdp. Uses the actual caller account/Profile and the original authorized Desktop binding. CDP is scoped to a tab and known iframe sessions; browser-process Browser/Target commands are unavailable. Existing control leases, user takeover, cancellation and remote-control revocation apply. No Studio authentication token or debugging endpoint is returned.",
+        "operationId": "browser",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The method result directly: tabs, attach cursor/sessions, raw CDP result, paginated events or release status."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Missing browser.cdp permission or account/Profile access."
+          },
+          "409": {
+            "description": "Plugin/Desktop unavailable, original target lost, tab owned by another client or control revoked."
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "method"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "method": {
+                    "type": "string",
+                    "enum": [
+                      "tabs.list",
+                      "tabs.create",
+                      "tabs.close",
+                      "cdp.attach",
+                      "cdp.send",
+                      "cdp.events",
+                      "lease.release"
+                    ]
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "description": "Optional accessible Studio session; never a CDP frame session."
+                  },
+                  "params": {
+                    "type": "object",
+                    "properties": {
+                      "tab_id": {
+                        "type": "string"
+                      },
+                      "url": {
+                        "type": "string"
+                      },
+                      "method": {
+                        "type": "string",
+                        "description": "Tab CDP Domain.command, such as Runtime.evaluate."
+                      },
+                      "params": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "session_id": {
+                        "type": "string",
+                        "description": "Known child-frame CDP session returned by attach."
+                      },
+                      "cursor": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64,
+                        "default": 32
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/client": {
+      "get": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "getStudioPluginClient",
+        "summary": "Read the enabled plugin frontend module as JSON {source}",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Execution context only; installations and enablement are global. Managed run credentials remain bound to their run Profile."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/development": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "startStudioPluginDevelopment",
+        "summary": "Trust, build, enable and watch a registered project; existing configuration and data are preserved",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "revision": {
+                    "type": "integer"
+                  },
+                  "trusted": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                },
+                "required": [
+                  "revision",
+                  "trusted"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "summary": "Unlink development plugin",
+        "description": "Super administrator only. Remove the development registration and stop watching source changes. Source files, the installed snapshot and plugin data are retained.",
+        "operationId": "developmentUnlink",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Interactive super administrator login required."
+          },
+          "409": {
+            "description": "Catalog revision changed; refresh before retrying."
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Current global plugin catalog revision."
+          }
+        ]
+      }
+    },
+    "/api/studio/plugins/{id}/invoke": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "invokeStudioPlugin",
+        "summary": "Invoke an enabled plugin RPC, tool, command or automation action",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Execution context only; installations and enablement are global. Managed run credentials remain bound to their run Profile."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "rpc",
+                      "tool",
+                      "command",
+                      "action"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "input": {},
+                  "sessionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/logs": {
+      "get": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "getStudioPluginLogs",
+        "summary": "Read the latest plugin logs; requires a super administrator login",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        }
+      }
+    },
+    "/api/studio/plugins/{id}/storage": {
+      "post": {
+        "tags": [
+          "Studio Plugins"
+        ],
+        "operationId": "accessStudioPluginStorage",
+        "summary": "Access global plugin JSON storage with optional developer namespaces; requires storage.client; missing keys return present=false",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Execution context only; installations and enablement are global. Managed run credentials remain bound to their run Profile."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "403": {
+            "description": "User, Profile or capability denied"
+          },
+          "409": {
+            "description": "Plugin unavailable, dependency failure or stale revision"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "get",
+                      "set",
+                      "delete",
+                      "keys"
+                    ]
+                  },
+                  "key": {
+                    "type": "string"
+                  },
+                  "value": {},
+                  "namespace": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    }
+                  },
+                  "sessionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "action"
                 ]
               }
             }
@@ -21911,6 +24123,78 @@
             }
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "Sessions"
+        ],
+        "operationId": "createEmptyStudioSession",
+        "summary": "Create an empty session without starting a model run",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "JSON result"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Studio login required"
+          },
+          "403": {
+            "description": "Profile, room or operation access denied"
+          },
+          "404": {
+            "description": "Session or room not found"
+          },
+          "409": {
+            "description": "Use the owning workflow or group operation"
+          },
+          "503": {
+            "description": "Runtime unavailable"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "agent": {
+                    "type": "string",
+                    "default": "ekko-agent"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "scoped",
+                      "global"
+                    ]
+                  }
+                },
+                "required": []
+              }
+            }
+          }
+        }
       }
     },
     "/api/studio/sessions/batch-delete": {
@@ -22126,7 +24410,7 @@
           "Sessions"
         ],
         "summary": "Get paginated",
-        "description": "GET /api/studio/sessions/conversations/:id/messages/paginated\nApp session sharing: requires the claimed recipient identity and read permission; scope is fixed to the shared session. workspace-file/content with download=1 requires download instead. Agent and terminal execution retain existing host permissions.",
+        "description": "GET /api/studio/sessions/conversations/:id/messages/paginated\nWith timeline=true, personFlows.cards contains lightweight cards and personFlows.timeline contains ordered item references, per-item cursors, before, has_more, history_revision and reset. Resume supplies the same first page. Replies inside a collaboration remain separately paginated.\nApp session sharing: requires the claimed recipient identity and read permission; scope is fixed to the shared session. workspace-file/content with download=1 requires download instead. Agent and terminal execution retain existing host permissions.",
         "operationId": "getConversationMessagesPaginated",
         "security": [
           {
@@ -22172,6 +24456,23 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "name": "timeline",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Studio Person chat: page message and collaboration-card references together (at most 150 combined items). Omit to retain raw-message OFFSET pagination."
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque personFlows.timeline.before cursor from the preceding page. Used only with timeline=true; a changed history revision resets the page."
           }
         ],
         "x-session-share-permission": "read"
@@ -23682,6 +25983,72 @@
         "x-session-share-permission": "switchWorkspace"
       }
     },
+    "/api/studio/sessions/{id}/stop": {
+      "post": {
+        "tags": [
+          "Sessions"
+        ],
+        "operationId": "stopStudioSession",
+        "summary": "Stop the current run without deleting the session; returns ok, session_id and stopped. Uses the same queue behavior as the chat UI. Workflow/group runs must use their own stop operations.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON result"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Studio login required"
+          },
+          "403": {
+            "description": "Profile, room or operation access denied"
+          },
+          "404": {
+            "description": "Session or room not found"
+          },
+          "409": {
+            "description": "Use the owning workflow or group operation"
+          },
+          "503": {
+            "description": "Runtime unavailable"
+          }
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/studio/sessions/{id}/tasks": {
       "get": {
         "tags": [
@@ -24058,7 +26425,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "boolean"
+              "type": "boolean",
+              "enum": [
+                "1"
+              ]
             }
           },
           {
@@ -24074,7 +26444,10 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "boolean"
+              "type": "boolean",
+              "enum": [
+                "1"
+              ]
             }
           }
         ],
@@ -24361,6 +26734,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "The destination already exists."
           }
         },
         "parameters": [
@@ -24422,6 +26798,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "A file or directory already exists at this path."
           }
         },
         "parameters": [
@@ -24442,14 +26821,21 @@
                 "type": "object",
                 "properties": {
                   "content": {
-                    "type": "object",
-                    "additionalProperties": true
+                    "type": "string"
+                  },
+                  "createOnly": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Reject an existing destination instead of editing it."
                   },
                   "path": {
-                    "type": "object",
-                    "additionalProperties": true
+                    "type": "string"
                   }
-                }
+                },
+                "required": [
+                  "path",
+                  "content"
+                ]
               }
             }
           }
@@ -25917,192 +28303,6 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview": {
-      "get": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Get preview",
-        "description": "GET /api/studio/update/preview",
-        "operationId": "previewStatus",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview/install": {
-      "post": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Create install",
-        "description": "POST /api/studio/update/preview/install",
-        "operationId": "installPreview",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview/prepare": {
-      "post": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Create prepare",
-        "description": "POST /api/studio/update/preview/prepare",
-        "operationId": "preparePreview",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "tag": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview/start": {
-      "post": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Create start",
-        "description": "POST /api/studio/update/preview/start",
-        "operationId": "startPreview",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "tag": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview/stop": {
-      "post": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Create stop",
-        "description": "POST /api/studio/update/preview/stop",
-        "operationId": "stopPreview",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
-    "/api/studio/update/preview/tags": {
-      "get": {
-        "tags": [
-          "Update"
-        ],
-        "summary": "Get tags",
-        "description": "GET /api/studio/update/preview/tags",
-        "operationId": "previewTags",
-        "security": [
-          {
-            "BearerAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "404": {
-            "description": "Not found"
           }
         }
       }
@@ -29225,6 +31425,410 @@
           }
         }
       }
+    },
+    "/api/ekko-studio/models/gemini/v1beta/models/{model}:generateContent": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Generate Gemini Contents through the account gateway",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiGeminiAliasgenerateContent",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "description": "Complete Provider/model route, including native model slashes.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "contents"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "contents": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ekko-studio/models/gemini/v1beta/models/{model}:streamGenerateContent": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Generate Gemini Contents through the account gateway",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiGeminiAliasstreamGenerateContent",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "description": "Complete Provider/model route, including native model slashes.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "contents"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "contents": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ekko-studio/models/v1beta/models/{model}:generateContent": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Generate Gemini Contents through the account gateway",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiGeminigenerateContent",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "description": "Complete Provider/model route, including native model slashes.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "contents"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "contents": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ekko-studio/models/v1beta/models/{model}:streamGenerateContent": {
+      "post": {
+        "tags": [
+          "Model API"
+        ],
+        "summary": "Generate Gemini Contents through the account gateway",
+        "description": "Model API keys enforce their saved lifetime USD budget against settled request costs. Exhausted keys and limited keys with unpriced requests return 429 before inference; already-running calls can exceed the cap. Costs follow the usage ledger pricing rules. Studio user JWTs are outside key budgets. Model API key requests must name an allowed model; ungranted IDs return 404 before any provider request. Stateless JSON or SSE inference through existing provider adapters. Supports text, base64 images on vision models, reasoning and function-tool continuations. Send full input history, including returned reasoning encrypted_content, unchanged. Protocol and credentials resolve server-side from the same unified catalog as GET /models. No Profile selector is required. External requests record usage once under the authenticated user. Internal Agent credentials retain existing run accounting. Does not execute tools or create chat sessions. See docs/model-api.md for supported features and limitations. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md. Same-protocol vendor fields are retained; translated features depend on the selected upstream adapter. See docs/model-api.md.",
+        "operationId": "modelApiGeministreamGenerateContent",
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ModelApiKey": []
+          },
+          {
+            "GeminiApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Native protocol JSON or incremental SSE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unsupported Responses feature"
+          },
+          "401": {
+            "description": "Missing, invalid or revoked Model API key, or expired Studio user JWT"
+          },
+          "403": {
+            "description": "User or Profile access denied"
+          },
+          "404": {
+            "description": "Profile or configured model not found"
+          },
+          "429": {
+            "description": "Model API key budget exhausted (insufficient_quota), or request costs are unknown (quota_cost_unknown)"
+          },
+          "501": {
+            "description": "Provider requires an unsupported direct-request runtime"
+          },
+          "502": {
+            "description": "Upstream model request failed"
+          }
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "description": "Complete Provider/model route, including native model slashes.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "contents"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "example": "deepseek/deepseek-v4"
+                  },
+                  "contents": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -29245,6 +31849,16 @@
         "in": "header",
         "name": "X-Session-Share-Token",
         "description": "sst1_ invitation secret; never accepted as a Studio login JWT."
+      },
+      "ModelApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key"
+      },
+      "GeminiApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-goog-api-key"
       }
     },
     "schemas": {

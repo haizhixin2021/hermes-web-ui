@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import PluginWorkspaceSidebar from "@/components/layout/PluginWorkspaceSidebar.vue";
+import { usePluginCatalog, pluginPages } from "@/composables/usePluginCatalog";
+import PluginNotifications from '@/components/plugins/PluginNotifications.vue'
+import NavigationSettingsModal from '@/components/layout/NavigationSettingsModal.vue'
+import { useNavigationStore } from '@/stores/navigation'
 import { ensureRemoteBrowserRelay, stopRemoteBrowserRelay } from '@/composables/useRemoteBrowserRelay'
 import { deploymentUrl } from '@/utils/deployment-url'
 import {
@@ -107,9 +112,20 @@ const { t, locale } = useI18n();
 const naiveLocale = computed(() => naiveLocaleFor(locale.value));
 const naiveRtl = computed(() => naiveRtlFor(locale.value));
 const appStore = useAppStore();
+const navigation = useNavigationStore();
 const profilesStore = useProfilesStore();
 watch(() => profilesStore.activeProfileName, async () => { await stopRemoteBrowserRelay(); await ensureRemoteBrowserRelay() });
 const route = useRoute();
+const isPluginPage = computed(() => ['studio.pluginPage', 'studio.pluginSettings', 'studio.pluginAgentSettings'].includes(String(route.name)));
+const { snapshot: pluginSnapshot, profile: pluginProfile } = usePluginCatalog(computed(() => ['studio.pluginPage', 'studio.pluginAgentSettings'].includes(String(route.name))));
+const workspacePlugin = computed(() => {
+  if (!['studio.pluginPage', 'studio.pluginAgentSettings'].includes(String(route.name))) return undefined;
+  const plugin = pluginSnapshot.value.plugins.find(plugin => plugin.manifest.id === route.params.pluginId && plugin.status === 'active');
+  const views = plugin ? pluginPages(plugin).filter(view => route.name === 'studio.pluginAgentSettings' ? view.slot === 'agent-settings' : ['page', 'workspace'].includes(view.slot)) : [];
+  const view = route.params.viewId ? views.find(view => view.id === route.params.viewId) : views[0];
+  return view && ['workspace', 'agent-settings'].includes(view.slot) ? plugin : undefined;
+});
+const usesPluginSidebar = computed(() => Boolean(workspacePlugin.value));
 const { sessionSearchOpen } = useSessionSearch();
 
 const themeOverrides = computed(() =>
@@ -152,7 +168,7 @@ provide(mobileNavigationKey, {
   target: computed(() => !isWideViewport.value && hasNavigationRail.value ? mobileSidebarHost.value : null),
 });
 const hasMobileContextSidebar = computed(() =>
-  !['hermes.connections', 'hermes.agentManager', 'hermes.models', 'hermes.usage', 'hermes.apiRelay'].includes(String(route.name)),
+  usesPluginSidebar.value || !['studio.plugins', 'studio.pluginPage', 'studio.pluginAgentSettings', 'hermes.connections', 'hermes.agentManager', 'hermes.models', 'hermes.usage', 'hermes.apiRelay'].includes(String(route.name)),
 );
 watch([hasNavigationRail, isWideViewport], () => { mobileNavigationOpen.value = false; });
 watch(sessionSearchOpen, (open) => { if (open) mobileNavigationOpen.value = false; });
@@ -166,6 +182,9 @@ function handleWideViewportChange(event: MediaQueryListEvent) {
 }
 const usesPageSidebar = computed(() =>
   [
+    "studio.plugins",
+    "studio.pluginPage",
+    "studio.pluginAgentSettings",
     "hermes.person",
     "hermes.chat",
     "hermes.session",
@@ -199,10 +218,10 @@ const showAppSidebar = computed(
     !usesPageSidebar.value &&
     !usesHermesConfigSidebar.value &&
     !usesEkkoConfigSidebar.value &&
-    !usesCodingAgentConfigSidebar.value,
+    !usesCodingAgentConfigSidebar.value && !usesPluginSidebar.value,
 );
 const usesShellSidebar = computed(() =>
-  showAppSidebar.value || usesHermesConfigSidebar.value || usesEkkoConfigSidebar.value || usesCodingAgentConfigSidebar.value,
+  showAppSidebar.value || usesHermesConfigSidebar.value || usesEkkoConfigSidebar.value || usesCodingAgentConfigSidebar.value || usesPluginSidebar.value,
 );
 const showMobileMenuButton = computed(
   () =>
@@ -240,7 +259,7 @@ const desktopTitleBarLeft = computed(() => {
     return appStore.sidebarCollapsed ? 64 : sidebarLayoutWidth.value;
   if (usesEkkoConfigSidebar.value)
     return appStore.sidebarCollapsed ? 64 : sidebarLayoutWidth.value;
-  if (usesCodingAgentConfigSidebar.value)
+  if (usesCodingAgentConfigSidebar.value || usesPluginSidebar.value)
     return appStore.sidebarCollapsed ? 64 : sidebarLayoutWidth.value;
   return appStore.pageSidebarExpanded ? sidebarLayoutWidth.value : 10;
 });
@@ -320,6 +339,8 @@ useKeyboard();
     :rtl="naiveRtl"
   >
     <NMessageProvider>
+      <PluginNotifications />
+      <NavigationSettingsModal v-model:show="navigation.settingsOpen" />
       <AuthEventListener />
       <NDialogProvider>
         <NNotificationProvider>
@@ -363,8 +384,9 @@ useKeyboard();
                 v-if="showDesktopTitleBar && showNavigationRail"
                 flush
               />
+              <!-- Keep the control before headers teleported while sidebar metadata is loading. -->
               <HeaderSidebarToggle
-                v-if="showNavigationRail && usesShellSidebar"
+                v-show="showNavigationRail && usesShellSidebar"
                 class="header-sidebar-toggle"
                 :expanded="!appStore.sidebarCollapsed"
                 @toggle="appStore.toggleSidebarCollapsed()"
@@ -384,10 +406,13 @@ useKeyboard();
               <div
                 class="app-layout"
                 :class="{
+                  'app-layout--shell-sidebar': usesShellSidebar,
+                  'app-layout--plugin': isPluginPage,
                   'no-sidebar': isLoginPage || !showAppSidebar,
                   'has-hermes-config-sidebar': usesHermesConfigSidebar,
                   'has-ekko-config-sidebar': usesEkkoConfigSidebar,
                   'has-coding-agent-config-sidebar': usesCodingAgentConfigSidebar,
+                  'has-plugin-config-sidebar': usesPluginSidebar,
                 }"
               >
                 <button
@@ -412,10 +437,11 @@ useKeyboard();
                 <CodingAgentConfigSidebar
                   v-if="!isLoginPage && usesCodingAgentConfigSidebar"
                 />
+                <PluginWorkspaceSidebar v-if="workspacePlugin" :plugin="workspacePlugin" :profile="pluginProfile" :agent-settings="route.name === 'studio.pluginAgentSettings'" />
                 <main
                   class="app-main"
                   :class="{
-                    'app-main--card': showAppSidebar || usesHermesConfigSidebar || usesEkkoConfigSidebar || usesCodingAgentConfigSidebar,
+                    'app-main--card': usesShellSidebar,
                   }"
                 >
                   <router-view />
@@ -519,7 +545,7 @@ useKeyboard();
       display: flex;
     }
 
-    &.has-coding-agent-config-sidebar {
+    &.has-coding-agent-config-sidebar, &.has-plugin-config-sidebar {
       display: flex;
     }
   }
@@ -532,6 +558,7 @@ useKeyboard();
   :deep(.hermes-config-sidebar),
   :deep(.ekko-config-sidebar),
   :deep(.coding-agent-config-sidebar),
+  :deep(.plugin-config-sidebar),
   :deep(.session-list),
   :deep(.room-sidebar),
   :deep(.workflow-sidebar),
@@ -547,7 +574,7 @@ useKeyboard();
   overflow-y: auto;
   background-color: $bg-primary;
 
-  .no-sidebar:not(.has-hermes-config-sidebar):not(.has-ekko-config-sidebar):not(.has-coding-agent-config-sidebar) & {
+  .no-sidebar:not(.has-hermes-config-sidebar):not(.has-ekko-config-sidebar):not(.has-coding-agent-config-sidebar):not(.has-plugin-config-sidebar) & {
     height: 100%;
   }
 
@@ -717,6 +744,31 @@ useKeyboard();
     border-radius: 0;
     box-shadow: none;
   }
+
+  // The shell sidebar and page form one surface with a straight inner seam.
+  .app-layout--shell-sidebar {
+    --studio-layout-start-radius: var(--theme-sidebar-radius, var(--studio-content-radius));
+    --studio-layout-end-radius: var(--theme-content-radius, var(--studio-content-radius));
+    --studio-layout-clip: inset(0 round var(--studio-layout-start-radius) var(--studio-layout-end-radius) var(--studio-layout-end-radius) var(--studio-layout-start-radius));
+    border-radius: 0;
+    clip-path: var(--studio-layout-clip);
+
+    &:dir(rtl) {
+      --studio-layout-clip: inset(0 round var(--studio-layout-end-radius) var(--studio-layout-start-radius) var(--studio-layout-start-radius) var(--studio-layout-end-radius));
+    }
+
+    > :deep(:is(.sidebar, .hermes-config-sidebar, .ekko-config-sidebar, .coding-agent-config-sidebar, .plugin-config-sidebar)) {
+      border-radius: 0;
+      border-start-start-radius: var(--studio-layout-start-radius);
+      border-end-start-radius: var(--studio-layout-start-radius);
+    }
+
+    > .app-main--card {
+      border-radius: 0;
+      border-start-end-radius: var(--studio-layout-end-radius);
+      border-end-end-radius: var(--studio-layout-end-radius);
+    }
+  }
 }
 
 .app-shell--custom-background {
@@ -733,7 +785,7 @@ useKeyboard();
       // Composite the image and surfaces before rounding them together. Separate
       // rounded clips leave antialiased pixels that expose the unfiltered image.
       border-radius: 0;
-      clip-path: inset(0 round var(--studio-content-radius));
+      clip-path: var(--studio-layout-clip, inset(0 round var(--studio-content-radius)));
     }
   }
 
@@ -772,6 +824,7 @@ useKeyboard();
   :deep(.hermes-config-sidebar),
   :deep(.ekko-config-sidebar),
   :deep(.coding-agent-config-sidebar),
+  :deep(.plugin-config-sidebar),
   :deep(.chat-panel > .session-list),
   :deep(.person-layout > .person-sidebar),
   :deep(.history-panel > .page-loading-content > .session-list),
@@ -923,7 +976,8 @@ useKeyboard();
   .app-layout > :deep(.sidebar),
   .app-layout > :deep(.hermes-config-sidebar),
   .app-layout > :deep(.ekko-config-sidebar),
-  .app-layout > :deep(.coding-agent-config-sidebar) {
+  .app-layout > :deep(.coding-agent-config-sidebar),
+  .app-layout > :deep(.plugin-config-sidebar) {
     padding-top: calc(40px * var(--spacing-scale, 1));
   }
 

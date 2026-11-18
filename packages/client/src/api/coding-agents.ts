@@ -1,7 +1,8 @@
 import { request } from './client'
+import { agentMetadata } from '../utils/agent-catalog'
 import type { ProviderApiMode } from './studio/provider-api-mode'
 
-export type CodingAgentId = 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh' | 'cursor' | 'antigravity' | 'qwen' | 'kimi' | 'codebuddy' | 'qoder' | 'copilot' | 'zcode'
+export type CodingAgentId = `plugin:${string}/${string}` | 'claude-code' | 'codex' | 'pi' | 'grok' | 'opencode' | 'dsh' | 'cursor' | 'antigravity' | 'qwen' | 'kimi' | 'codebuddy' | 'qoder' | 'copilot' | 'zcode'
 export type ChatCodingAgentId = CodingAgentId | 'ekko-agent'
 export const CODING_AGENT_API_MODES = [
   'chat_completions',
@@ -62,6 +63,7 @@ export interface CodingAgentToolStatus {
   source?: 'user-cli' | 'not-installed'
   path?: string
   error?: string
+  compatibility?: { pinnedVersion: string; previousVersion: string; adapterRevision: number; verifiedVersion: string }
 }
 
 export interface CodingAgentsStatus {
@@ -95,7 +97,11 @@ export interface CodingAgentModelCatalog {
   cached: boolean
 }
 
-export async function fetchCodingAgentModels(options: { agent?: CodingAgentId; refresh?: boolean } = {}) {
+export async function fetchCodingAgentModels(options: { agent?: CodingAgentId; refresh?: boolean; profile?: string } = {}) {
+  if (options.agent?.startsWith('plugin:')) {
+    const catalog = await request<CodingAgentModelCatalog>(`/api/studio/agents/${encodeURIComponent(options.agent)}/models?refresh=${options.refresh === true}`, options.profile ? { headers: { 'X-Hermes-Profile': options.profile } } : {})
+    return { agents: [{ ...catalog, agentId: options.agent, name: agentMetadata(options.agent)?.name || options.agent, source: 'sdk' as const, checkedAt: new Date().toISOString(), cached: false }] }
+  }
   const params = new URLSearchParams()
   if (options.agent) params.set('agent', options.agent)
   if (options.refresh !== undefined) params.set('refresh', String(options.refresh))
@@ -178,8 +184,8 @@ export async function fetchCodingAgentsStatus(): Promise<CodingAgentsStatus> {
   return request<CodingAgentsStatus>('/api/coding-agents')
 }
 
-export async function installCodingAgent(id: CodingAgentId): Promise<CodingAgentMutationResult> {
-  return request<CodingAgentMutationResult>(`/api/coding-agents/${id}/install`, { method: 'POST' })
+export async function installCodingAgent(id: CodingAgentId, options: { version?: string; rollback?: boolean } = {}): Promise<CodingAgentMutationResult> {
+  return request<CodingAgentMutationResult>(`/api/coding-agents/${id}/install`, { method: 'POST', body: JSON.stringify(options) })
 }
 
 export async function checkCodingAgentUpdate(id: CodingAgentId): Promise<CodingAgentUpdateResult> {

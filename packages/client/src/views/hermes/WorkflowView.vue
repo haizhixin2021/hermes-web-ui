@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { agentMetadata, isGlobalOnlyCodingAgent } from '@/utils/agent-catalog'
+import { agentMetadata, agentSupportsSurface, isGlobalOnlyCodingAgent } from '@/utils/agent-catalog'
 import { useCodingAgentModels } from '@/composables/useCodingAgentModels'
 import { nativeModelLabel } from '@/utils/native-model-families'
 import PageSidebar from "@/components/layout/PageSidebar.vue"
@@ -150,7 +150,7 @@ const chatStore = useChatStore()
 const profilesStore = useProfilesStore()
 const message = useMessage()
 const {
-  screenToFlowCoordinate, getViewport, setViewport, setNodes, setEdges, updateNodeInternals,
+  nodes: canvasNodes, screenToFlowCoordinate, getViewport, setViewport, setNodes, setEdges, updateNodeInternals,
   findNode, addSelectedNodes, removeSelectedElements,
 } = useVueFlow('hermes-workflow')
 const defaultViewport: WorkflowViewport = { x: 80, y: 80, zoom: 0.75 }
@@ -428,9 +428,9 @@ const workflowSchedulePendingIds = ref<Set<string>>(new Set())
 let edgePreviewTimer: number | null = null
 let workflowBudgetClock: number | null = null
 
-const workflowAgentDefinitions = AGENT_OPTIONS
+const workflowAgentDefinitions = computed(() => AGENT_OPTIONS.filter(option => agentSupportsSurface(option.value, 'workflow')))
 
-const agentOptions = computed<WorkflowSelectOption[]>(() => workflowAgentDefinitions.filter(option =>
+const agentOptions = computed<WorkflowSelectOption[]>(() => workflowAgentDefinitions.value.filter(option =>
   isAgentAvailable(agentAvailabilitySnapshot.value, option.value),
 ))
 
@@ -439,7 +439,7 @@ const firstAvailableWorkflowAgent = computed(() =>
 )
 
 function workflowAgentDisplayName(agent: string): string {
-  return String(workflowAgentDefinitions.find(option => option.value === agent)?.label || agent)
+  return String(workflowAgentDefinitions.value.find(option => option.value === agent)?.label || agent)
 }
 
 async function refreshAgentAvailability() {
@@ -589,6 +589,7 @@ function withRuntimeNodeData(data: WorkflowAgentNodeData): WorkflowAgentNodeData
     skillOptions: skillOptionsForAgent(data.agent),
     skillsLoading: skillsLoadingForAgent(data.agent),
     modelGroups: modelGroups.value,
+    profile: activeWorkflowProfile.value,
     onUpdate: updateNodeData,
     onUploadImages: uploadNodeImages,
   }
@@ -657,8 +658,10 @@ function makeNode(
     style: { width: `${WORKFLOW_NODE_DEFAULT_WIDTH}px`, height: `${WORKFLOW_NODE_DEFAULT_HEIGHT}px` },
     data: {
       title,
+      pluginAction: data.pluginAction,
+      pluginInput: data.pluginInput,
       agent,
-      agentMode: isGlobalOnlyCodingAgent(agent) || (data.agentMode === 'global' && ['claude-code', 'codex', 'pi', 'grok', 'opencode', 'dsh', 'cursor', 'antigravity', 'qwen', 'kimi', 'codebuddy', 'qoder', 'copilot', 'zcode'].includes(agent)) ? 'global' : 'scoped',
+      agentMode: isGlobalOnlyCodingAgent(agent) || (data.agentMode === 'global' && (agent.startsWith('plugin:') || ['claude-code', 'codex', 'pi', 'grok', 'opencode', 'dsh', 'cursor', 'antigravity', 'qwen', 'kimi', 'codebuddy', 'qoder', 'copilot', 'zcode'].includes(agent))) ? 'global' : 'scoped',
       priorAgentMode: data.priorAgentMode === 'global' || data.priorAgentMode === 'scoped' ? data.priorAgentMode : undefined,
       provider: usesGlobal ? '' : data.provider || defaultModelSelection.value.provider,
       model: usesGlobal ? (hasLegacyGlobalSelection ? '' : data.model || '') : data.model || defaultModelSelection.value.model,
@@ -675,6 +678,7 @@ function makeNode(
       skillOptions: skillOptionsForAgent(agent),
       skillsLoading: skillsLoadingForAgent(agent),
       modelGroups: modelGroups.value,
+      profile: activeWorkflowProfile.value,
       onUpdate: updateNodeData,
       onUploadImages: uploadNodeImages,
     },
@@ -685,11 +689,27 @@ function makeInitialNodes(): WorkflowNode[] {
   return []
 }
 
-const nodes = ref<WorkflowNode[]>(makeInitialNodes())
+// Keep an authored-only input for Vue Flow's initial mount and workflow switches.
+// Read live nodes from its store so edits never replay stale measurements or geometry.
+const nodeDefinitions = ref<WorkflowNode[]>(makeInitialNodes())
+const nodes = computed<WorkflowNode[]>({
+  get: () => canvasNodes.value as WorkflowNode[],
+  set: (value) => {
+    nodeDefinitions.value = value.map(node => ({
+      id: node.id,
+      type: node.type,
+      position: node.position,
+      dragHandle: node.dragHandle,
+      style: node.style,
+      data: node.data,
+    }))
+    setNodes(nodeDefinitions.value)
+  },
+})
 const edges = ref<WorkflowEdge[]>([])
 
 function unavailableWorkflowAgent() {
-  return nodes.value.find(node => !isAgentAvailable(agentAvailabilitySnapshot.value, node.data.agent))
+  return nodes.value.find(node => !node.data.pluginAction && !isAgentAvailable(agentAvailabilitySnapshot.value, node.data.agent))
 }
 
 const edgeEditorEdge = computed(() => edges.value.find(edge => edge.id === edgeEditorId.value) || null)
@@ -897,6 +917,7 @@ const { catalog: workflowChatNativeCatalog } = useCodingAgentModels(
   },
   () => workflowChatPanelVisible.value && chatStore.activeSession?.id === workflowChatPanelSessionId.value
     && chatStore.activeSession?.codingAgentMode === 'global',
+  () => chatStore.activeSession?.profile,
 )
 const workflowChatPanelModelLabel = computed(() => {
   const session = chatStore.activeSession
@@ -1105,6 +1126,8 @@ function serializeWorkflowNodes(source: WorkflowNode[]): unknown[] {
     style: { ...node.style },
     data: {
       title: node.data.title,
+      pluginAction: node.data.pluginAction,
+      pluginInput: node.data.pluginInput,
       ...workflowSavedAgentFields({
         agent: node.data.agent,
         agentMode: node.data.agentMode,
@@ -1169,6 +1192,8 @@ function normalizeStoredNode(raw: unknown, index: number): WorkflowNode {
     position,
     {
       agent: data.agent,
+      pluginAction: data.pluginAction,
+      pluginInput: data.pluginInput,
       agentMode: data.agentMode === 'global' ? 'global' : 'scoped',
       priorAgentMode: data.priorAgentMode === 'global' || data.priorAgentMode === 'scoped' ? data.priorAgentMode : undefined,
       provider: data.provider,
@@ -2601,9 +2626,14 @@ function workflowValidationError(): string | null {
 
   for (const node of nodes.value) {
     const label = workflowNodeLabel(node)
+    if (node.data.pluginAction) {
+      try { const args = JSON.parse(node.data.pluginInput || '{}'); if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error() }
+      catch { return t('studioPlugins.arguments') }
+      continue
+    }
     if (node.data.agent === 'dsh' && (!node.data.agentPreset || node.data.agentPresetReady === false)) return t('dshPresets.selectMode')
     if (!node.data.title.trim()) return t('workflow.validation.nodeNameRequired', { node: node.id })
-    const usesGlobalCodingAgent = ['claude-code', 'codex', 'pi', 'grok', 'opencode', 'dsh', 'cursor', 'antigravity', 'qwen', 'kimi', 'codebuddy', 'qoder', 'copilot', 'zcode'].includes(node.data.agent)
+    const usesGlobalCodingAgent = Boolean(agentMetadata(node.data.agent)?.modes.includes('global'))
       && node.data.agentMode === 'global'
     if (!usesGlobalCodingAgent && !node.data.provider.trim()) return t('workflow.validation.providerRequired', { node: label })
     if (!usesGlobalCodingAgent && !node.data.model.trim()) return t('workflow.validation.modelRequired', { node: label })
@@ -2929,13 +2959,12 @@ async function handleConnectEnd(event?: MouseEvent | TouchEvent) {
   transaction.after.edges[transaction.after.edges.length - 1] = {
     ...transaction.after.edges[transaction.after.edges.length - 1], animated: false, markerEnd: MarkerType.ArrowClosed,
   }
-  setNodes(transaction.after.nodes)
+  nodes.value = transaction.after.nodes
   await nextTick()
   updateNodeInternals([nodeId])
   setEdges(transaction.after.edges)
   await nextTick()
-  // Selection lives in Vue Flow's internal store, not in our definition
-  // array. Apply it after the release gesture has committed Node + Edge.
+  // Apply selection after the release gesture has committed Node + Edge.
   window.setTimeout(() => {
     removeSelectedElements()
     const createdNode = findNode(nodeId)
@@ -2949,7 +2978,7 @@ async function handleConnectEnd(event?: MouseEvent | TouchEvent) {
 function undoLastCanvasTransaction() {
   const transaction = lastCanvasTransaction.value
   if (!transaction || selectedWorkflowRunId.value) return
-  setNodes(transaction.before.nodes)
+  nodes.value = transaction.before.nodes
   setEdges(transaction.before.edges)
   nextNodeIndex.value = Math.max(1, nextNodeIndex.value - 1)
   lastCanvasTransaction.value = null
@@ -3790,7 +3819,7 @@ function nodeColor(node: { data: WorkflowAgentNodeData }) {
         <VueFlow
           :key="workflowFlowKey"
           id="hermes-workflow"
-          v-model:nodes="nodes"
+          :nodes="nodeDefinitions"
           v-model:edges="renderedEdges"
           :fit-view-on-init="false"
           :default-viewport="defaultViewport"

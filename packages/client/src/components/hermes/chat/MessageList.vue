@@ -18,6 +18,7 @@ import { useI18n } from "vue-i18n";
 import VirtualMessageList from "./VirtualMessageList.vue";
 import MessageItem from "./MessageItem.vue";
 import { positionTaskPlansAtTurnEnd } from "@/utils/task-plan";
+import { parseContentBlocks, blocksQueuePreview } from "@/utils/content-blocks";
 import LiveReasoningStatus from "./LiveReasoningStatus.vue";
 import ToolRunCard from "./ToolRunCard.vue";
 import MessageQueueFloatPanel from "./MessageQueueFloatPanel.vue";
@@ -33,6 +34,9 @@ import { groupCompletedToolsByRun } from "./tool-run-grouping";
 import { useMessageSelection } from './useMessageSelection';
 import type { MessageSelectionRow } from './message-selection';
 import { desktopBridge } from '@/utils/desktop-bridge';
+import type { PersonFlow } from '@/api/person';
+import PersonFlowConversationCard from '../person/PersonFlowConversationCard.vue';
+import { personFlowMessageRows } from '../person/person-flow-message-rows';
 
 const props = withDefaults(defineProps<{
   userLabel?: string
@@ -43,12 +47,14 @@ const props = withDefaults(defineProps<{
   approvalPortalToBody?: boolean
   scrollScope?: string
   selectionActionsTarget?: HTMLElement | null
+  collaborations?: PersonFlow[]
 }>(), {
   approvalPortalToBody: false,
   hideToolCalls: false,
   scrollScope: "chat",
   selectionActionsTarget: null,
 })
+const emit = defineEmits<{openCollaboration:[flow:PersonFlow]}>()
 
 const chatStore = useChatStore();
 const profilesStore = useProfilesStore();
@@ -220,7 +226,8 @@ const showEmptyConversation = computed(() => {
   const session = chatStore.activeSession;
   return !chatStore.isLoadingMessages && !isRunIndicatorActive.value
     && !!session && (session.messagesLoaded === true || session.isLocalOnly === true)
-    && chatStore.messages.length === 0 && (session.messageTotal ?? session.messageCount ?? 0) === 0;
+    && !session.hasMoreBefore
+    && chatStore.messages.length === 0 && !props.collaborations?.length && (session.messageTotal ?? session.messageCount ?? 0) === 0;
 });
 
 function assistantMessageBody(message: Message): string {
@@ -297,9 +304,10 @@ const displayMessagesWithForkDivider = computed<Message[]>(() => {
 
 const {
   selecting, loading: selectionLoading, deleting: deletingMessages, selected: selectedMessages,
-  supported: supportsMessageSelection, unavailable: selectionUnavailable, rows: messageRows,
+  supported: supportsMessageSelection, unavailable: selectionUnavailable, rows: selectionRows,
   start: startSelection, cancel: cancelSelection, toggle: toggleSelection, remove: deleteSelectedMessages,
 } = useMessageSelection(displayMessagesWithForkDivider);
+const messageRows = computed(() => personFlowMessageRows(selectionRows.value,props.collaborations || [],!chatStore.activeSession?.personFlows?.timeline && !!chatStore.activeSession?.hasMoreBefore));
 const showDeleteConfirmation = ref(false);
 watch(selecting, value => { if (!value) showDeleteConfirmation.value = false; });
 const selectionMenu = ref({ show: false, x: 0, y: 0 });
@@ -407,7 +415,7 @@ const queuedMessages = computed(() => {
 });
 const queuedFloatItems = computed(() => queuedMessages.value.map(message => ({
   id: message.id,
-  text: queuedPreview(message.content),
+  text: queuedPreview(message),
 })));
 const activeQueueInsertion = computed(() => {
   const sid = chatStore.activeSessionId;
@@ -430,6 +438,7 @@ const clarifyResponse = ref("");
 watch(
   () => visibleClarify.value?.clarifyId,
   () => { clarifyResponse.value = visibleClarify.value?.initialResponse || ""; },
+  { immediate: true },
 );
 const hasFloatingPrompt = computed(() => !!visibleApproval.value || !!visibleClarify.value);
 const virtualListPadding = computed(() => {
@@ -452,7 +461,7 @@ const activeSessionScrollKey = computed(() => {
 
 const showHistoryArchiveLink = computed(() => {
   const session = chatStore.activeSession;
-  return !!session?.hasMoreBefore && (session.loadedMessageCount || 0) >= LIVE_CHAT_MAX_LOADED_MESSAGES;
+  return !session?.personFlows?.timeline && !!session?.hasMoreBefore && (session.loadedMessageCount || 0) >= LIVE_CHAT_MAX_LOADED_MESSAGES;
 });
 
 const historyArchiveHref = computed(() => {
@@ -486,18 +495,26 @@ async function openForkParent(event?: MouseEvent) {
   window.location.hash = lineage.parentHref.replace(/^#/, "");
 }
 
-function handleApproval(choice: "once" | "session" | "always" | "deny") {
-  chatStore.respondApproval(choice);
+async function handleApproval(choice: "once" | "session" | "always" | "deny") {
+  try {
+    await chatStore.respondApproval(choice);
+  } catch {
+    // The store keeps the request visible and retryable on delivery failure.
+  }
 }
 
-function handleClarify(response?: string) {
+async function handleClarify(response?: string) {
   const finalResponse = response !== undefined
     ? response
     : visibleClarify.value?.responseMode === "editor"
       ? clarifyResponse.value
       : clarifyResponse.value.trim();
-  chatStore.respondToClarify(finalResponse);
-  clarifyResponse.value = "";
+  clarifyResponse.value = finalResponse;
+  try {
+    await chatStore.respondToClarify(finalResponse);
+  } catch {
+    // The store retains the answer and exposes the failure for retry.
+  }
 }
 
 function removeQueuedMessage(messageId: string) {
@@ -520,11 +537,16 @@ function queueInsertionTitle(messageId: string): string {
   return t("chat.queueInsertionStopping");
 }
 
-function queuedPreview(content: string): string {
-  const reference = parseMessageReference(content);
-  const visibleContent = reference?.reply || reference?.content || content;
-  const normalized = visibleContent.replace(/\s+/g, " ").trim();
+function queuedPreview(message: Message): string {
+  const blocks = parseContentBlocks(message.content);
+  if (blocks) return blocksQueuePreview(blocks);
+  const normalized = plainQueueText(message.content).replace(/\s+/g, " ").trim();
   return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
+}
+
+function plainQueueText(content: string): string {
+  const reference = parseMessageReference(content);
+  return reference?.reply || reference?.content || content;
 }
 
 function shouldAutoFollowBottom(threshold = 100): boolean {
@@ -554,14 +576,15 @@ async function scrollToAnchor(messageId: string, anchorId: string) {
 }
 
 function updateScrollBottomButton() {
-  showScrollBottomButton.value = displayMessages.value.length > 0 && !(listRef.value?.isNearBottom(1000) ?? true);
+  showScrollBottomButton.value = !!chatStore.activeSession?.personFlows?.timeline?.has_newer || messageRows.value.length > 0 && !(listRef.value?.isNearBottom(1000) ?? true);
 }
 
 function handleListScroll() {
   updateScrollBottomButton();
 }
 
-function handleScrollBottomClick() {
+async function handleScrollBottomClick() {
+  if (chatStore.activeSession?.personFlows?.timeline?.has_newer && !await chatStore.refreshActiveSession({ latest:true })) return;
   scrollToBottom({ frames: 4, keepAliveMs: 600 });
 }
 
@@ -608,11 +631,13 @@ async function handleTopReach() {
   if (chatStore.isLoadingMessages || isSearchLoading.value) return;
   const session = chatStore.activeSession;
   if (!session?.hasMoreBefore || session.isLoadingOlderMessages || showHistoryArchiveLink.value) return;
-  const snapshot = listRef.value?.captureScrollPosition() ?? null;
+  const viewport = session.personFlows?.timeline ? listRef.value?.captureViewportPosition() : null;
+  const snapshot = viewport ? null : listRef.value?.captureScrollPosition() ?? null;
   const loaded = await chatStore.loadOlderMessages(session.id);
   if (!loaded) return;
   await nextTick();
-  listRef.value?.restoreScrollPosition(snapshot);
+  if (viewport) listRef.value?.restoreViewportPosition({ ...viewport,wasNearBottom:false });
+  else listRef.value?.restoreScrollPosition(snapshot);
   updateScrollBottomButton();
 }
 
@@ -639,7 +664,7 @@ watch(
 );
 
 watch(
-  () => displayMessages.value.length,
+  () => messageRows.value.length,
   () => {
     void nextTick(updateScrollBottomButton);
   },
@@ -817,11 +842,13 @@ defineExpose({
           v-else-if="chatStore.activeSession?.hasMoreBefore || chatStore.activeSession?.isLoadingOlderMessages"
           class="history-loader"
         >
+          <NButton v-if="!messageRows.length && chatStore.activeSession?.personFlows?.timeline && !chatStore.activeSession.isLoadingOlderMessages" quaternary @click="handleTopReach">{{ t('person.older') }}</NButton>
           <span v-if="chatStore.activeSession?.isLoadingOlderMessages" class="history-loader-spinner" role="status" :aria-label="t('common.loading')"></span>
         </div>
       </template>
       <template #item="{ message: row }">
-        <div @contextmenu="openSelectionMenu" @click.capture="handleSelectionRowClick($event, row)" :class="{
+        <PersonFlowConversationCard v-if="row.flow" :flow="row.flow" @open="emit('openCollaboration',$event)" />
+        <div v-else @contextmenu="openSelectionMenu" @click.capture="handleSelectionRowClick($event, row)" :class="{
           'message-selection-row': selecting && row.group,
           'message-selection-user': selecting && row.group?.kind === 'message' && ['user', 'command'].includes(row.messages[0]?.role),
           'is-selected': row.group && selectedMessages.has(row.group.id),
@@ -1131,6 +1158,7 @@ defineExpose({
           </div>
           <div class="approval-float-title">{{ t("chat.approvalTitle") }}</div>
           <div class="approval-float-desc">{{ visibleApproval.description }}</div>
+          <div v-if="visibleApproval.submissionFailed" role="alert">{{ t('chat.approvalSendFailed') }}</div>
           <code class="approval-float-command">{{ visibleApproval.command }}</code>
           <div class="approval-float-actions">
             <NButton
@@ -1138,6 +1166,7 @@ defineExpose({
               size="small"
               type="primary"
               @click="handleApproval('once')"
+              :disabled="visibleApproval.submitting"
             >
               {{ t("chat.approvalAgree") }}
             </NButton>
@@ -1146,6 +1175,7 @@ defineExpose({
               size="small"
               type="primary"
               @click="handleApproval('once')"
+              :disabled="visibleApproval.submitting"
             >
               {{ t("chat.approvalAllowOnce") }}
             </NButton>
@@ -1154,6 +1184,7 @@ defineExpose({
               size="small"
               secondary
               @click="handleApproval('session')"
+              :disabled="visibleApproval.submitting"
             >
               {{ t("chat.approvalAllowSession") }}
             </NButton>
@@ -1162,6 +1193,7 @@ defineExpose({
               size="small"
               secondary
               @click="handleApproval('always')"
+              :disabled="visibleApproval.submitting"
             >
               {{ t("chat.approvalAlways") }}
             </NButton>
@@ -1171,6 +1203,7 @@ defineExpose({
               type="error"
               secondary
               @click="handleApproval('deny')"
+              :disabled="visibleApproval.submitting"
             >
               {{ t("chat.approvalDeny") }}
             </NButton>
@@ -1202,17 +1235,19 @@ defineExpose({
           </div>
           <div class="approval-float-title">{{ t("chat.clarifyTitle") }}</div>
           <div class="approval-float-desc">{{ visibleClarify.question }}</div>
+          <div v-if="visibleClarify.submissionFailed" role="alert">{{ t('chat.clarifySendFailed') }}</div>
           <div v-if="visibleClarify.choices && visibleClarify.choices.length" class="approval-float-actions">
             <NButton
               v-for="choice in visibleClarify.choices"
               :key="choice"
               size="small"
               type="primary"
+              :disabled="visibleClarify.submitting"
               @click="handleClarify(choice)"
             >
               {{ choice }}
             </NButton>
-            <NButton size="small" type="error" secondary @click="handleClarify('')">
+            <NButton size="small" type="error" secondary :disabled="visibleClarify.submitting" @click="handleClarify('')">
               {{ t("chat.clarifyDismiss") }}
             </NButton>
           </div>
@@ -1222,8 +1257,9 @@ defineExpose({
               size="small"
               :type="visibleClarify.responseMode === 'editor' ? 'textarea' : 'text'"
               :placeholder="t('chat.clarifyPlaceholder')"
+              :disabled="visibleClarify.submitting"
             />
-            <NButton size="small" type="primary" @click="handleClarify()">
+            <NButton size="small" type="primary" :loading="visibleClarify.submitting" @click="handleClarify()">
               {{ t("chat.clarifySubmit") }}
             </NButton>
           </div>

@@ -1,6 +1,6 @@
 import { config } from '../../studio/public/config'
-import { AgentUpdatePolicy } from './update-policy'
-import { getCodingAgentDefinitions, checkUpdateAgent, installCodingAgent } from './index'
+import { AgentUpdatePolicy } from '../../studio/public/agent-update-policy'
+import { getCodingAgentDefinitions, checkUpdateAgent, installCodingAgent, type CodingAgentInstallOptions } from './index'
 import { codingAgentRunManager } from './runtime/run-manager'
 import { lockAgentUpdate, agentPreparing, agentActivityRevision } from './update-lock'
 const policy = new AgentUpdatePolicy(config.appHome, {
@@ -33,13 +33,13 @@ export async function getAgentUpdateManager():Promise<AgentUpdatePolicy>{
  await started;return policy
 }
 
-export async function installAgentAndPublish(id: string) {
+export async function installAgentAndPublish(id: string, options: CodingAgentInstallOptions = {}) {
   await loadPolicy()
   return policy.installAndRefresh(id, async () => {
     const release = lockAgentUpdate(id)
     try {
       if (codingAgentRunManager.isAgentBusyForUpdate(id)) throw Object.assign(new Error('Agent session is active; stop it before updating'), { status: 409 })
-      return await installCodingAgent(id)
+      return await installCodingAgent(id, options)
     } finally { release() }
   })
 }

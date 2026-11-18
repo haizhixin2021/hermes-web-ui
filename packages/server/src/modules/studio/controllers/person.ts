@@ -1,10 +1,12 @@
+import { ensureBuiltinPlugins } from '../services/plugins/host'
 import { forgetPersonMemory } from '../services/person/memory'
 import { personDisplayResponse } from '../services/chat-run/person-display'
 import type { Context } from 'koa'
 import { personError, personRevision, personText } from '../contracts/person'
 import { personSnapshot, configurePerson } from '../services/person/service'
 import { personUser, personCapabilities, personModelCatalog } from '../services/person/catalog'
-import { personTaskChat, continuePersonTask } from '../services/person/task-chat'
+import { personTaskChat } from '../services/person/task-chat'
+import { submitPersonTaskInput } from '../services/person/task-input'
 import { insertPersonTaskMessage, removePersonTaskMessage } from '../services/person/task-queue'
 import { applyPersonTask } from '../services/person/tasks'
 import { applyPersonSchedule } from '../services/person/schedules'
@@ -16,6 +18,7 @@ import { personConversations, createPersonConversation, deletePersonConversation
 import { requirePersonSession } from '../services/person/service'
 import { controlPersonFlow, createPersonFlow } from '../services/person/stage-flows'
 import { getPersonFlow, listPersonFlows } from '../services/person/service'
+import { personFlowConversation } from '../services/person/flow-conversation'
 
 async function handle(ctx: Context, work: (id: number, body: Record<string, unknown>) => unknown) {
   ctx.set('Cache-Control', 'no-store')
@@ -30,18 +33,22 @@ async function handle(ctx: Context, work: (id: number, body: Record<string, unkn
       ...(['PERSON_BOT_NAME_EXISTS', 'BOT_WORKSPACE_REQUIRED', 'WORKSPACE_UNAVAILABLE'].includes(String((error as { code?: string }).code)) ? { code: (error as { code: string }).code } : {}) }
   }
 }
-export const snapshot = (ctx: Context) => handle(ctx, id => personSnapshot(id, String(ctx.query.session_id || '')))
+export const snapshot = (ctx: Context) => handle(ctx, id => {
+  if (ctx.query.include_flows !== undefined && !['true', 'false'].includes(String(ctx.query.include_flows))) throw personError('include_flows must be true or false')
+  return personSnapshot(id, String(ctx.query.session_id || ''), { includeFlows: ctx.query.include_flows !== 'false' })
+})
 export const clear = (ctx: Context) => handle(ctx, (id, body) => clearPerson(id, body))
 export const settings = (ctx: Context) => handle(ctx, (id, body) => configurePerson(id, body))
-export const capabilities = (ctx: Context) => handle(ctx, id => ({ agents: personCapabilities(id), native_allowed: personUser(id).role === 'super_admin' }))
+export const capabilities = (ctx: Context) => handle(ctx, async id => { await ensureBuiltinPlugins(); return { agents: await personCapabilities(id), native_allowed: personUser(id).role === 'super_admin' } })
 export const modelCatalog = (ctx: Context) => handle(ctx, id => personModelCatalog(id))
 export const executionModelCatalog = (ctx: Context) => handle(ctx, id => personExecutionModelCatalog(id))
 export const tasks = (ctx: Context) => handle(ctx, (id, body) => ({ tasks: listPersonTasks(id, String(body.search || '').slice(0,200), Math.max(0, Number(body.offset) || 0), { sessionId: body.session_id ? requirePersonSession(id, String(body.session_id)).id : undefined, status: ['open','completed','closed'].includes(String(body.status)) ? String(body.status) : '', order: String(body.order || ''), limit: Number(body.limit) }) }))
 export const taskApply = (ctx: Context) => handle(ctx, (id, body) => applyPersonTask(id, body))
 export const flows = (ctx: Context) => handle(ctx,(id,body)=>({ flows:body.flow_id ? [getPersonFlow(id,personText(body.flow_id,'flow_id',100))] : listPersonFlows(id,String(body.session_id || ''),Math.max(0,Number(body.offset)||0)) }))
 export const flowApply = (ctx: Context) => handle(ctx,(id,body)=>body.action === 'create' ? createPersonFlow(id,body) : controlPersonFlow(id,body))
+export const flowConversation = (ctx: Context) => handle(ctx,id => personFlowConversation(id,ctx.params.id,ctx.query))
 export const taskChat = (ctx: Context) => handle(ctx, id => personTaskChat(id, ctx.params.id, String(ctx.query.execution_id || '')))
-export const taskContinue = (ctx: Context) => handle(ctx, (id, body) => continuePersonTask(id, ctx.params.id, body))
+export const taskContinue = (ctx: Context) => handle(ctx, (id, body) => submitPersonTaskInput(id, ctx.params.id, body))
 export const taskInsert = (ctx: Context) => handle(ctx, (id, body) => insertPersonTaskMessage(id, ctx.params.id, body))
 export const taskRemove = (ctx: Context) => handle(ctx, (id, body) => removePersonTaskMessage(id, ctx.params.id, body))
 export const executions = (ctx: Context) => handle(ctx, id => ({ executions: taskPersonExecutions(id, ctx.params.id) }))

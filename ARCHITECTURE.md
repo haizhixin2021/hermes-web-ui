@@ -13,8 +13,8 @@ Ekko Agent, Hermes Agent, and coding agents for chat, coding, and workflows.
 | Ekko Agent | `packages/ekko-agent` | Canonical Ekko runtime, profile facade, providers, tools, memory, skills, conversations, and package API. |
 | Desktop | `packages/desktop` | Electron shell, local Web UI server bootstrap, updater, bundled Python/Hermes runtime. |
 | MCU | `packages/mcu` | ESP32-C3 source projects and release firmware; board-specific ESP32-S3 firmware. |
-| Tests | `tests` | Vitest unit/integration tests and Playwright browser tests. |
-| CI | `.github/workflows` | Build, e2e, lockfile, Docker, and desktop release automation. |
+| Tests | `tests` | Required focused tests for new features; the legacy suite has been removed. |
+| CI | `.github/workflows` | Independent Build, Test and E2E checks, lockfile, Docker, and desktop release automation. |
 
 ## Request Flow
 
@@ -36,6 +36,7 @@ should not duplicate server persistence rules.
 - Uploads default to `config.uploadDir`, which is derived from the Web UI home unless `UPLOAD_DIR` is set.
 - Runtime data directories must also live under the Web UI home, not beside built `dist` assets.
 - Profile-scoped Hermes data should use existing profile helpers instead of manually joining paths.
+- Studio Provider state is isolated by account under `providers/users/<user-id>`; all of an account's Profiles share its Provider records, credentials, catalog and internal gateway key. Profile files retain import provenance and runtime model selections only.
 
 ## Server Structure
 
@@ -50,6 +51,9 @@ ownership decisions, allowed dependency matrix, and migration rules.
 - Module `services/` own reusable IO, domain behavior, processes, and integrations.
 - Studio `repositories/` and `infrastructure/` own application persistence.
 - Studio `middleware/legacy-app-api.ts` is the only released App and MCU firmware URL compatibility map.
+- Plugin Agent IDs use `plugin:<plugin-id>/<agent-id>` and retain that identity in chat, group chat, workflow and usage records. Studio owns registration, per-user/Profile run contexts and transport; plugins own their engine and settings UI. Bootstrap adapts existing Coding Agent management and model proxies into the shared Studio registry, preserving native runtime dispatch and released APIs. See `docs/plugins.md` for the runtime contract.
+- Independent plugin projects are registered by `ekko-studio plugins` under the Web UI home in `plugins/development`. Registration does not execute code. Administrator activation starts host-owned source watching, optional builds and snapshot replacement through the ordinary PluginManager; project sources stay outside the Studio checkout. See `docs/plugins.md`.
+- Studio does not bundle or automatically install OMP. It is installed and updated independently through the plugin center or a development link. Existing installations keep their package snapshots and data. The generic `plugins/builtin` catalog is currently empty; demo packages live only in `tests/fixtures/plugins`. Stable `ctx.paths.dataDir` holds plugin-owned engine files independently of package versions, and Studio supplies scoped model proxies through the existing Agent contract.
 
 Architecture rules:
 
@@ -78,7 +82,7 @@ Frontend rules:
 
 Desktop packaging is intentionally split:
 
-- Pull requests run the web UI build and tests in `.github/workflows/build.yml`.
+- Pull requests run the repository harness and web UI build in `.github/workflows/build.yml`.
 - Published GitHub Releases run Web UI artifact packaging and Docker image publishing without
   marking the release as GitHub latest.
 - Manual dispatches run full desktop artifact packaging in `.github/workflows/desktop-release.yml`.
@@ -126,6 +130,8 @@ python/                 Hermes Agent Git checkout and source root
   agent-browser/
   node/                  browser CLI npm prefix
   ms-playwright/
+  manifest.json         Hermes PM payload paths on newer runtimes
+  runtime-tools/        PM-pinned Chromium on newer runtimes
 node/                    bundled Node.js
 git/                     bundled MinGit on Windows
 runtime-manifest.json
@@ -144,13 +150,45 @@ patch tracked Hermes source during this build:
 Studio-specific integration belongs in Studio, and the clean checkout is what
 allows users to run the upstream `hermes update` command directly.
 
+Hermes 0.23 runtime builds use Python 3.14.7 and Node.js 26.13.0 by default.
+Fetch steps reject cached interpreters from another pinned version before reuse.
+When the source exposes the native `tools.browser_launcher`, the build stages Chromium
+through PM's build-owned `prepare_tools` operation and writes a relative payload
+manifest. PM can then find the bundled executable after extraction without a
+profile-specific path or a first-use download. Older runtimes retain the
+agent-browser packaging path. Generated PM files are excluded through Git's
+local `info/exclude`; tracked upstream files remain unchanged. Packaging checks
+the PM-selected browser again after moving the source into its staging directory.
+
+Studio owns imported Provider configuration under the authenticated user's
+`providers/users/<id>` directory in the application home. Hermes receives an
+`ekkostudio` Provider and qualified model IDs for primary inference. Existing
+auxiliary, MoA, fallback and delegation settings retain their native configuration
+and credentials; only slots edited in Studio are projected to the gateway. The
+page continues to use logical Provider/model names. See [Model API](docs/model-api.md)
+for routing, migration boundaries and protocol support.
+
+Hermes, Ekko and scoped Coding/plugin Agents share the model gateway. Ingress
+adapters handle Responses, Chat Completions, Anthropic Messages and Gemini
+Contents. Bootstrap composes the existing protocol codecs with the Studio account
+store, upstream authentication and transport. Run credentials never authenticate
+management APIs. Studio exchanges Copilot OAuth credentials itself, without
+installing a Hermes plugin for the gateway's inference path. Native configurations
+kept for untouched auxiliary models retain their previous behavior.
+
 ## Validation Surface
 
 The minimum mechanical harness is:
 
 - `npm run harness:check` for repository docs, workflow, and package-script invariants.
-- `npm run test` or focused Vitest tests for local logic.
-- `npm run test:e2e` for browser-visible routing/auth/chat regressions.
+- Focused `npm run test -- <file>` for each new feature's logic.
+- Focused `npm run test:e2e -- <file>` for new browser journeys.
+- Independent Test (`test.yml`) and E2E (`playwright.yml`) workflows run all
+  current Vitest and Playwright tests. Build (`build.yml`) runs the harness and
+  production build. Each workflow reports its own status and can fail independently.
+- Empty suites are allowed during the reset, without waiving the requirement to
+  test new features.
+- CI does not require blanket coverage or browser shards.
 - `npm run build` for type checking and production bundles.
 
 See `docs/harness/validation.md` for change-specific commands.
