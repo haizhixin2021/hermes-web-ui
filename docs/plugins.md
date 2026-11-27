@@ -277,6 +277,7 @@ export function apply(ctx) {
 | `ctx.extensions.rpc.register` | 为前端注册后端函数 |
 | `ctx.events.on(type, handler)` | 订阅 Studio 业务事件，支持精确名称、`chat.*`、`chat.run.*` 等前缀及 `*` |
 | `ctx.extensions.hooks.register` | 注册 Ekko 输入、上下文与工具拦截钩子 |
+| `ctx.extensions.compression.register` | 注册 Hermes / Ekko 普通单聊的摘要函数，随插件启用 |
 | `ctx.extensions.actions.register / ctx.scheduler.every` | 工作流可用动作、非重叠定时执行 |
 | `ctx.lifecycle.acquire / add` | 追踪异步资源获取与清理 |
 | `ctx.log` | 写入管理页可查看的最近 200 条插件日志 |
@@ -500,6 +501,23 @@ Studio 会将插件变更通知所有已启动的 Hermes Worker，包括群聊�
 结果保存到节点会话。调度工作流使用调度创建者身份；没有有效用户身份的任务不能调用插件。
 外部系统可通过已认证的 `POST /api/studio/plugins/:id/invoke` 调用动作。
 
+## 单聊压缩摘要
+
+插件声明 `compression` 权限并在 `apply(ctx)` 注册摘要函数：
+
+```js
+import { summarize } from './summarize.mjs'
+
+export function apply(ctx) {
+  ctx.extensions.compression.register(summarize)
+}
+```
+
+在插件中心启用后，所有 Profile 的普通单聊在自动或手动压缩时都会使用摘要插件。函数接收同一待压缩片段的
+文本 `transcript` 和结构化消息 `history`、可选上一版摘要及 token 预算，并返回摘要正文。Studio 校验摘要后写入原有快照。
+多个摘要插件同时启用时，按插件 ID 排序选第一个可用插件。插件不可用或调用失败时使用内置摘要器。
+接口细节见 [SDK 上下文与能力](../packages/plugin-sdk/docs/STUDIO_CTX.md#单聊压缩摘要)。
+
 ## 入站 HTTP 拦截与改写
 
 插件声明 `http` 权限，使用 `ctx.extensions.http.register({ name, priority?, onRequest?, onResponse? })`。
@@ -576,6 +594,7 @@ export function apply(ctx) {
 
 `getStatus` 返回 `{installed, version, source?, path?, error?}`。普通目录不暴露安装路径。
 管理页的操作绑定 `management.settings/checkUpdate/upgrade/remove`；未提供的操作不显示。
+外部安装的引擎可声明 `management.installGuideUrl`。状态为 `installed:false`、`source:'not-installed'` 时，Agent 卡片提供直达安装文档的链接。
 同时提供 `checkUpdate/upgrade` 的插件 Agent，在 `installed:false` 时显示“安装”。点击后宿主先调用 `checkUpdate` 获取准确版本，再调用 `upgrade` 完成首次安装；安装期间禁用重复操作，成功后刷新状态。已安装时显示“检查更新”及可用的版本升级操作。
 设置回调返回本插件清单中 `slot: 'agent-settings'`的 `viewId` 和可选查询参数；宿主拒绝跨插件页面。该回调与两类全局导航独立，三个 Agent 页面可只声明 agent-settings 与命名 icon，不注册 navigation。
 页面继续通过 `client.mjs` 的 `mount(root, ctx)` 和服务端 `ctx.extensions.rpc.register` 实现。

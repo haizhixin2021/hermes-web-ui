@@ -261,13 +261,18 @@ export class AgentBridgeError extends Error {
 }
 
 export class AgentBridgeClient {
-  readonly endpoint: string
+  private readonly configuredEndpoint?: string
+  get endpoint(): string {
+    return this.configuredEndpoint || process.env.HERMES_AGENT_BRIDGE_ENDPOINT || DEFAULT_AGENT_BRIDGE_ENDPOINT
+  }
   readonly timeoutMs: number
   readonly connectRetryMs: number
   private lock: Promise<unknown> = Promise.resolve()
 
   constructor(options: AgentBridgeOptions = {}) {
-    this.endpoint = options.endpoint || process.env.HERMES_AGENT_BRIDGE_ENDPOINT || DEFAULT_AGENT_BRIDGE_ENDPOINT
+    // Desktop creates chat clients before the manager selects its broker.
+    // Explicit endpoints stay pinned; default clients follow that selection.
+    this.configuredEndpoint = options.endpoint
     this.timeoutMs = options.timeoutMs ?? envPositiveInt('HERMES_AGENT_BRIDGE_TIMEOUT_MS') ?? DEFAULT_AGENT_BRIDGE_TIMEOUT_MS
     this.connectRetryMs = options.connectRetryMs ?? envPositiveInt('HERMES_AGENT_BRIDGE_CONNECT_RETRY_MS') ?? 5000
   }
@@ -451,7 +456,8 @@ export class AgentBridgeClient {
       const startedAt = Date.now()
       const action = String(payload.action || '')
       if (['chat', 'context_estimate', 'switch_session_model'].includes(action) && payload.model && payload.provider) {
-        payload = { ...payload, ...await hermesGatewaySelection(String(payload.profile || 'default'), String(payload.provider), String(payload.model)) }
+        const sessionId = typeof payload.session_id === 'string' ? payload.session_id.trim() : undefined
+        payload = { ...payload, ...await hermesGatewaySelection(String(payload.profile || 'default'), String(payload.provider), String(payload.model), sessionId) }
       }
       const shouldLogRequest = action !== 'get_output' && action !== 'background_poll'
       const runtimeContext = shouldLogRequest ? this.runtimeContext(payload) : undefined

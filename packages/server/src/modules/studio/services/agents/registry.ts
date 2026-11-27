@@ -5,6 +5,7 @@ import { PluginError } from '../plugins/errors'
 
 export { isPluginAgentId } from '../plugins/agent-runtime'
 export interface AgentDescriptor {
+  installGuideUrl?: string
   id: string; name: string; vendor: string; description: string; icon: string; origin: 'builtin' | 'plugin'; pluginId?: string
   modes: AgentMode[]; surfaces: string[]; actions: { settings: boolean; checkUpdate: boolean; upgrade: boolean; remove?: boolean; autoUpdate?: boolean }
 }
@@ -40,8 +41,8 @@ function core(id: string) {
   if (!builtin || !builtin.list().some(agent => agent.id === id)) throw new PluginError('Unknown Agent', 'AGENT_NOT_FOUND', 404)
   return builtin
 }
-export async function agentStatus(id: string, identity: PluginIdentity): Promise<AgentStatus> {
-  return isPluginAgentId(id) ? pluginAgent(id).status(identity) : core(id).status(id)
+export async function agentStatus(id: string, identity: PluginIdentity, signal?: AbortSignal): Promise<AgentStatus> {
+  return isPluginAgentId(id) ? pluginAgent(id).status(identity, signal) : core(id).status(id)
 }
 export async function agentModels(id: string, identity: PluginIdentity, refresh = false) {
   return isPluginAgentId(id) ? pluginAgent(id).models(identity, refresh) : core(id).models(id, refresh)

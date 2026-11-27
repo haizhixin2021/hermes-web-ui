@@ -6,6 +6,7 @@ import { Readable } from 'stream'
 import type { Context } from 'koa'
 import { config } from '../../../studio/public/config'
 import { gatewayToken } from '../../../studio/public/model-gateway-adapters'
+import type { ProviderRequestAffinity } from '../../../studio/public/provider-http'
 import {
   anthropicMessagesUrl as resolveAnthropicMessagesUrl,
   chatCompletionsUrl as resolveChatCompletionsUrl,
@@ -31,7 +32,7 @@ import {
   openAiResponsesSseToResponsesEvents,
   type CanonicalResponsesEvent,
 } from '../../protocol/adapters/responses-stream'
-import { agentRunGateway } from '../../protocol/gateway'
+import { agentRunGateway, providerRequestAffinity } from '../../protocol/gateway'
 import { codingAgentRunManager } from '../runtime/run-manager'
 import { codingAgentOutputLimit } from '../context-policy'
 import { normalizeTokenUsage } from '../../../studio/public/usage'
@@ -40,7 +41,7 @@ export interface CodexProxyTargetInput extends AgentTargetInput {
   profile: string
 }
 
-type CodexProxyTarget = RegisteredAgentTarget<CodexProxyTargetInput>
+type CodexProxyTarget = RegisteredAgentTarget<CodexProxyTargetInput> & { affinity?: ProviderRequestAffinity }
 
 function recordTargetUsage(target: CodexProxyTarget, event: CanonicalResponsesEvent, apiDuration?: number, baseUrl?: string) {
   if (target.onUsageEvent) target.onUsageEvent(event, apiDuration, baseUrl)
@@ -82,7 +83,8 @@ function requireTarget(ctx: Context): CodexProxyTarget | null {
     ctx.body = { error: { type: 'authentication_error', message: 'Invalid Codex proxy token' } }
     return null
   }
-  return { ...target, reasoningCodec: (ctx.state as any).modelGatewayReasoningCodec, requestHeaders: { ...(ctx.get('anthropic-beta') ? { 'anthropic-beta': ctx.get('anthropic-beta') } : {}), ...(ctx.get('anthropic-version') ? { 'anthropic-version': ctx.get('anthropic-version') } : {}) }, signal: (ctx.state as any).modelGatewaySignal || target.signal }
+  return { ...target, reasoningCodec: (ctx.state as any).modelGatewayReasoningCodec, requestHeaders: { ...(ctx.get('anthropic-beta') ? { 'anthropic-beta': ctx.get('anthropic-beta') } : {}), ...(ctx.get('anthropic-version') ? { 'anthropic-version': ctx.get('anthropic-version') } : {}) }, signal: (ctx.state as any).modelGatewaySignal || target.signal,
+    affinity: providerRequestAffinity(ctx, target) }
 }
 
 function chatCompletionsUrl(target: CodexProxyTarget): string {
@@ -111,9 +113,23 @@ function needsPortableResponses(target: CodexProxyTarget): boolean {
   return target.provider === 'xai-oauth' || /^https:\/\/api\.x\.ai(?:\/|$)/i.test(target.baseUrl)
 }
 
+function withoutNullReasoningContent(body: any): any {
+  if (!Array.isArray(body?.input)) return body
+  const input = body.input.map((item: any) => {
+    if (item?.type !== 'reasoning' || item.content !== null) return item
+    // Grok rejects encrypted reasoning replay when the optional content field is null.
+    const { content: _content, ...reasoning } = item
+    return reasoning
+  })
+  return { ...body, input }
+}
+
 function nativeResponsesBody(target: CodexProxyTarget, body: any, stream?: boolean): any {
   const original = target.agentId === 'grok' ? normalizeGrokResponsesRequest(body) : body
-  const normalized = needsPortableResponses(target) ? portableResponsesRequest(original) : original
+  const portable = needsPortableResponses(target)
+  const grok = portable || target.provider === 'xai' || /(?:^|\/)grok-[^/]+$/i.test(target.model)
+  const upstreamBody = grok ? withoutNullReasoningContent(original) : original
+  const normalized = portable ? portableResponsesRequest(upstreamBody) : upstreamBody
   const reasoningEffort = targetReasoningEffort(target)
   const routed = {
     ...normalized,
@@ -139,8 +155,9 @@ async function callOpenAiChat(target: CodexProxyTarget, body: any, signal?: Abor
     url: chatCompletionsUrl(target),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
+    translatedTo: 'chat_completions',
     body: chatBody,
     signal: signal || target.signal,
   })
@@ -160,13 +177,14 @@ async function callAnthropicMessages(target: CodexProxyTarget, body: any, signal
     url: anthropicMessagesUrl(target),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
     headers: {
       ...(target.apiKey ? { 'x-api-key': target.apiKey } : {}),
       'anthropic-version': '2023-06-01',
       ...target.requestHeaders,
     },
+    translatedTo: 'anthropic_messages',
     body: anthropicBody,
     signal: signal || target.signal,
   })
@@ -186,7 +204,7 @@ async function callOpenAiResponses(target: CodexProxyTarget, body: any, signal?:
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
     body: responsesBody,
     signal: signal || target.signal,
@@ -224,7 +242,8 @@ function responsesClientUsage(target: CodexProxyTarget, usage: unknown): Record<
   const inputTokens = normalized.inputTokens + normalized.cacheReadTokens + normalized.cacheWriteTokens
   return {
     input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: normalized.cacheReadTokens },
+    input_tokens_details: { cached_tokens: normalized.cacheReadTokens,
+      ...(normalized.cacheWriteTokens ? { cache_write_tokens: normalized.cacheWriteTokens } : {}) },
     output_tokens: normalized.outputTokens,
     output_tokens_details: { reasoning_tokens: normalized.reasoningTokens },
     total_tokens: inputTokens + normalized.outputTokens,
@@ -288,8 +307,9 @@ async function openAiChatToResponsesSseStream(target: CodexProxyTarget, body: an
     url: chatCompletionsUrl(target),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
+    translatedTo: 'chat_completions',
     body: chatBody,
     signal: target.signal,
   })
@@ -312,13 +332,14 @@ async function anthropicMessagesToResponsesSseStream(target: CodexProxyTarget, b
     url: anthropicMessagesUrl(target),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
     headers: {
       ...(target.apiKey ? { 'x-api-key': target.apiKey } : {}),
       'anthropic-version': '2023-06-01',
       ...target.requestHeaders,
     },
+    translatedTo: 'anthropic_messages',
     body: anthropicBody,
     signal: target.signal,
   })
@@ -341,7 +362,7 @@ async function openAiResponsesSseStream(target: CodexProxyTarget, body: any, sta
     url: resolveResponsesUrl(target.baseUrl),
     apiKey: target.apiKey,
     ownerUserId: target.ownerUserId, profile: target.profile, model: target.model,
-    sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+    affinity: target.affinity,
     provider: target.provider,
     body: responsesBody,
     signal: target.signal,
@@ -352,7 +373,10 @@ async function openAiResponsesSseStream(target: CodexProxyTarget, body: any, sta
 
 export async function codexProxyResponses(ctx: Context) {
   const target = requireTarget(ctx)
-  if (!target) return
+  if (target) await respondWithCodexTarget(ctx, target)
+}
+
+async function respondWithCodexTarget(ctx: Context, target: CodexProxyTarget) {
   try {
     // Sanitize once before API-mode dispatch so native Responses, Chat
     // Completions, and Anthropic adapters all receive the same bounded history.
@@ -398,7 +422,7 @@ export async function codingAgentProxyChatCompletions(ctx: Context) {
       const nativeBody = { ...requestBody, model: target.model }
       const request = { url: chatCompletionsUrl(target), apiKey: target.apiKey,
         ownerUserId: target.ownerUserId, profile: target.profile, model: target.model, provider: target.provider,
-        sessionId: target.chatSessionId || target.agentSessionId || target.routeKey,
+        affinity: target.affinity,
         body: nativeBody, signal: target.signal }
       if (requestBody.stream === true) {
         const source = await agentRunGateway.streamBytes(request)
@@ -432,7 +456,7 @@ export async function codingAgentProxyChatCompletions(ctx: Context) {
       return
     }
     ctx.request.body = chatCompletionsToResponses(requestBody)
-    await codexProxyResponses(ctx)
+    await respondWithCodexTarget(ctx, target)
     if (ctx.status >= 400) return
     if (requestBody.stream === true) {
       const source = ctx.body as AsyncIterable<Uint8Array | string>

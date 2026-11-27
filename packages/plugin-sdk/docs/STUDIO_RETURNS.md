@@ -19,6 +19,7 @@
 | 聊天命令 execute | JSON 或 void；输入是原始参数字符串。 |
 | 自动化动作 execute | JSON，结构应在插件契约中声明，供工作流消费。 |
 | hooks handler | `{ value?: Json, deny?: string }`；value 替换内容，deny 拒绝；不用修改时返回空对象。 |
+| compression handler | 返回非空摘要正文，token 数须在 `summaryBudget` 内。返回 `null` 交由内置摘要器处理。Studio 校验后自行组装上下文及写入快照。 |
 | HTTP onRequest | 原地修改 request 后返回 void 继续；返回 `{status,headers,body}` 直接响应并停止后续请求回调和路由。 |
 | HTTP onResponse | 在发送响应前原地修改 response，返回 void/Promise<void>；不返回替代对象。网关 SSE 的 body 为 Readable，可接 Transform；此回调不是流传输结束通知。 |
 | 业务观察 handler | void/Promise<void>；事件不能通过返回值修改原业务。 |
@@ -57,6 +58,8 @@ return { ok: false, content: '无法保存', error: '目标记录不存在' }
 | runtime.createSession | `{ run, dispose, checkpoint? }`；声明 resume=true 时必须实现 checkpoint。 |
 | checkpoint | `{ schemaVersion: 正整数, data: Json }`，变更格式需要兼容或迁移说明。 |
 | session.dispose | void/Promise<void>，释放引擎进程、监听、连接和缓存句柄。 |
+
+外部安装的引擎可声明 `management.installGuideUrl`。CLI 缺失时，返回 `installed: false` 和 `source: 'not-installed'`，卡片即可直接打开安装指引。返回列表或点击卡片上的「刷新」会重新检测。旧宿主忽略此可选字段。
 
 ## Agent 运行的事件与最终结果
 
